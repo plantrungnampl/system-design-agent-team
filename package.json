@@ -1,0 +1,18 @@
+{
+  "name": "system-design-agent-team",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "workspaces": ["packages/*"],
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "build": "tsc -b",
+    "pretest": "npm run build",
+    "test": "node --test",
+    "check": "npm run build && npm test"
+  },
+  "devDependencies": {
+    "@types/node": "^20.17.0",
+    "typescript": "^5.8.0"
+  }
+}
