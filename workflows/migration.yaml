@@ -1,0 +1,22 @@
+id: migration-standard
+version: 1.0.0
+mode: migration
+phases:
+  - id: intake
+    owner: lead-orchestrator
+    reviewer: documentation-reviewer
+    gate: G0
+    depends_on: []
+    required_plugins: [plugin://superpowers@openai-curated-remote]
+  - id: requirements
+    owner: business-analyst
+    reviewer: requirements-reviewer
+    gate: G2
+    depends_on: [intake]
+    required_plugins: [plugin://superpowers@openai-curated-remote]
+  - id: product
+    owner: product-owner
+    reviewer: requirements-reviewer
+    gate: G3
+    depends_on: [requirements]
+    required_plugins: [plugin://superpowers@openai-curated-remote]

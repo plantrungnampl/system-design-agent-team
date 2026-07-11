@@ -1,0 +1,5 @@
+from_agent: source-agent
+to_agent: destination-agent
+approved_inputs: []
+expected_outputs: []
+acceptance_conditions: []

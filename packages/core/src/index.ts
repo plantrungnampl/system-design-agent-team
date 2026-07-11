@@ -23,6 +23,28 @@ export const PhaseStatusSchema = z.enum([
 export const ProjectModeSchema = z.enum(["greenfield", "existing_system", "migration"]);
 export const ProjectProfileSchema = z.enum(["small", "standard", "enterprise", "regulated", "custom"]);
 
+const VersionedReferenceSchema = z.object({
+  id: z.string().min(1),
+  version: z.string().min(1),
+});
+
+export const ProjectConfigSchema = z.object({
+  schema_version: z.number().int().positive(),
+  project: z.object({
+    id: z.string().min(1),
+    name: z.string().min(1),
+    mode: ProjectModeSchema,
+    profile: ProjectProfileSchema,
+  }),
+  framework: z.object({ version: z.string().min(1) }),
+  workflow: VersionedReferenceSchema,
+});
+
+export const FrameworkLockSchema = z.object({
+  framework: z.object({ version: z.string().min(1) }),
+  workflow: VersionedReferenceSchema,
+});
+
 export const WorkflowPhaseSchema = z.object({
   id: z.string().min(1),
   owner: z.string().min(1),
@@ -98,6 +120,10 @@ export const PluginStatusRecordSchema = z.object({
   skills: z.array(z.string()).default([]),
 });
 
+export const PluginStatusListSchema = z.object({
+  plugins: z.array(PluginStatusRecordSchema),
+});
+
 export const ApprovalDecisionSchema = z.enum([
   "approved",
   "approved_with_conditions",
@@ -118,6 +144,36 @@ export const ApprovalRecordSchema = z.object({
   timestamp: z.string().min(1),
 });
 
+export const ApprovalListSchema = z.object({
+  approvals: z.array(ApprovalRecordSchema),
+});
+
+export const ArtifactStatusSchema = z.enum([
+  "draft",
+  "in_review",
+  "revision_required",
+  "approved",
+  "approved_with_conditions",
+  "stale",
+  "superseded",
+  "archived",
+  "rejected",
+]);
+
+export const ArtifactRecordSchema = z.object({
+  id: z.string().min(1),
+  path: z.string().min(1),
+  version: z.number().int().positive(),
+  status: ArtifactStatusSchema,
+  owner: z.string().min(1),
+  reviewer: z.string().min(1),
+  required_gate: GateIdSchema,
+});
+
+export const ArtifactRegistrySchema = z.object({
+  artifacts: z.array(ArtifactRecordSchema),
+});
+
 export const HandoverRecordSchema = z.object({
   from_agent: z.string().min(1),
   to_agent: z.string().min(1),
@@ -128,11 +184,17 @@ export const HandoverRecordSchema = z.object({
 
 export type ProjectMode = z.infer<typeof ProjectModeSchema>;
 export type ProjectProfile = z.infer<typeof ProjectProfileSchema>;
+export type ProjectConfig = z.infer<typeof ProjectConfigSchema>;
+export type FrameworkLock = z.infer<typeof FrameworkLockSchema>;
 export type GateId = z.infer<typeof GateIdSchema>;
 export type PhaseStatus = z.infer<typeof PhaseStatusSchema>;
 export type WorkflowDefinition = z.infer<typeof WorkflowDefinitionSchema>;
 export type WorkflowState = z.infer<typeof WorkflowStateSchema>;
 export type AgentManifest = z.infer<typeof AgentManifestSchema>;
 export type PluginStatusRecord = z.infer<typeof PluginStatusRecordSchema>;
+export type PluginStatusList = z.infer<typeof PluginStatusListSchema>;
 export type ApprovalRecord = z.infer<typeof ApprovalRecordSchema>;
+export type ApprovalList = z.infer<typeof ApprovalListSchema>;
+export type ArtifactRecord = z.infer<typeof ArtifactRecordSchema>;
+export type ArtifactRegistry = z.infer<typeof ArtifactRegistrySchema>;
 export type HandoverRecord = z.infer<typeof HandoverRecordSchema>;

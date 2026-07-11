@@ -7,6 +7,7 @@
     { "path": "packages/artifact-validator" },
     { "path": "packages/traceability" },
     { "path": "packages/plugin-registry" },
-    { "path": "packages/codex-adapter" }
+    { "path": "packages/codex-adapter" },
+    { "path": "packages/cli" }
   ]
 }

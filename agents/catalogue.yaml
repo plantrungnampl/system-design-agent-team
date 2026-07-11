@@ -1,0 +1,29 @@
+- id: lead-orchestrator
+  version: 1.0.0
+  reviewer: documentation-reviewer
+  required_plugins:
+    - uri: plugin://superpowers@openai-curated-remote
+      required_skills: [brainstorming]
+      fallback_policy: block
+- id: documentation-reviewer
+  version: 1.0.0
+  reviewer: requirements-reviewer
+  required_plugins: []
+- id: business-analyst
+  version: 1.0.0
+  reviewer: requirements-reviewer
+  required_plugins:
+    - uri: plugin://superpowers@openai-curated-remote
+      required_skills: [brainstorming]
+      fallback_policy: block
+- id: requirements-reviewer
+  version: 1.0.0
+  reviewer: documentation-reviewer
+  required_plugins: []
+- id: product-owner
+  version: 1.0.0
+  reviewer: requirements-reviewer
+  required_plugins:
+    - uri: plugin://superpowers@openai-curated-remote
+      required_skills: [brainstorming]
+      fallback_policy: block
