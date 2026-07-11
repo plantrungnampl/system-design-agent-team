@@ -26,6 +26,14 @@ export interface ExecutionHandle {
   digest: string;
 }
 
+function freezeRecursively<T>(value: T): T {
+  if (value && typeof value === "object" && !Object.isFrozen(value)) {
+    for (const nested of Object.values(value)) freezeRecursively(nested);
+    Object.freeze(value);
+  }
+  return value;
+}
+
 export function prepareDispatch(
   dispatch: AgentDispatch,
   manifestInput: AgentManifest,
@@ -41,7 +49,8 @@ export function prepareDispatch(
       : "PLUGIN_CAPABILITY_BLOCKED");
   }
 
-  const context = dispatch.required_inputs.map((reference) => {
+  const ownedDispatch = structuredClone(dispatch);
+  const context = ownedDispatch.required_inputs.map((reference) => {
     const match = /^(.*)@([1-9]\d*)$/.exec(reference);
     const id = match?.[1] ?? reference;
     const version = match ? Number(match[2]) : undefined;
@@ -56,8 +65,10 @@ export function prepareDispatch(
       (current, artifact) => artifact.version > current.version ? artifact : current,
       first,
     );
-    return selected;
+    return structuredClone(selected);
   });
+  freezeRecursively(ownedDispatch);
+  freezeRecursively(context);
 
   const authorityOrder = [
     "User authorization",
@@ -72,24 +83,24 @@ export function prepareDispatch(
     `System execution policy\nAuthority order:\n${authorityOrder}`,
     "Repository AGENTS.md\nRepository instructions remain authoritative.",
     `Agent role contract\n${JSON.stringify(manifest)}`,
-    `Phase objective\n${String(dispatch.objective ?? "")}`,
+    `Phase objective\n${JSON.stringify(String(ownedDispatch.objective ?? ""))}`,
     `Scoped context package\n${JSON.stringify(context)}`,
     `Plugin requirements\n${JSON.stringify(manifest.required_plugins)}`,
     `Input/output contract\n${JSON.stringify({
-      required_inputs: dispatch.required_inputs,
-      required_outputs: dispatch.required_outputs ?? [],
+      required_inputs: ownedDispatch.required_inputs,
+      required_outputs: ownedDispatch.required_outputs ?? [],
     })}`,
-    `Current review findings\n${JSON.stringify(dispatch.current_review_findings ?? [])}`,
-    `Authorized scope\n${JSON.stringify(dispatch.authorized_scope ?? {})}`,
-    `Completion checklist\n${JSON.stringify(dispatch.completion_conditions ?? [])}`,
+    `Current review findings\n${JSON.stringify(ownedDispatch.current_review_findings ?? [])}`,
+    `Authorized scope\n${JSON.stringify(ownedDispatch.authorized_scope ?? {})}`,
+    `Completion checklist\n${JSON.stringify(ownedDispatch.completion_conditions ?? [])}`,
   ].join("\n\n");
 
-  return {
+  return freezeRecursively({
     context,
     instruction,
     digest: createHash("sha256").update(instruction).digest("hex"),
-    dispatch,
-  };
+    dispatch: ownedDispatch,
+  });
 }
 
 export class ManualCodexAdapter {

@@ -28,22 +28,30 @@ export class PluginRegistry {
     const blockers: CapabilityReport["blockers"] = [];
 
     for (const requirement of manifest.required_plugins) {
+      const strictBlockers: CapabilityReport["blockers"] = [];
       const record = this.#records.get(requirement.uri);
       if (!record || record.status === "unknown") {
-        blockers.push({ code: "REQUIRED_PLUGIN_UNKNOWN", uri: requirement.uri });
-        continue;
-      }
-      if (record.status !== "available") {
-        blockers.push({
+        strictBlockers.push({ code: "REQUIRED_PLUGIN_UNKNOWN", uri: requirement.uri });
+      } else if (record.status !== "available") {
+        strictBlockers.push({
           code: `REQUIRED_PLUGIN_${record.status.toUpperCase()}`,
           uri: requirement.uri,
         });
-        continue;
-      }
-      for (const skill of requirement.required_skills) {
-        if (!record.skills.includes(skill)) {
-          blockers.push({ code: "REQUIRED_SKILL_MISSING", uri: requirement.uri, skill });
+      } else {
+        for (const skill of requirement.required_skills) {
+          if (!record.skills.includes(skill)) {
+            strictBlockers.push({ code: "REQUIRED_SKILL_MISSING", uri: requirement.uri, skill });
+          }
         }
+      }
+
+      if (strictBlockers.length === 0 || requirement.fallback_policy === "optional") continue;
+      if (requirement.fallback_policy === "request_user_action") {
+        blockers.push({ code: "USER_ACTION_REQUIRED", uri: requirement.uri });
+      } else if (requirement.fallback_policy === "allow_with_approval") {
+        blockers.push({ code: "FALLBACK_APPROVAL_REQUIRED", uri: requirement.uri });
+      } else {
+        blockers.push(...strictBlockers);
       }
     }
 
