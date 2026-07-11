@@ -1,5 +1,16 @@
 import { randomUUID } from "node:crypto";
-import { appendFile, lstat, mkdir, readFile, realpath, rename, writeFile } from "node:fs/promises";
+import {
+  appendFile,
+  type FileHandle,
+  lstat,
+  mkdir,
+  open,
+  readFile,
+  realpath,
+  rename,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { WorkflowStateSchema, type WorkflowState } from "@system-design-team/core";
 import { parse, stringify } from "yaml";
@@ -7,6 +18,7 @@ import { parse, stringify } from "yaml";
 type Schema<T> = { parse(value: unknown): T };
 type ProjectStoreErrorCode =
   | "PATH_OUTSIDE_PROJECT"
+  | "STATE_LOCKED"
   | "STATE_VERSION_CONFLICT"
   | "STATE_VERSION_INVALID";
 
@@ -57,8 +69,12 @@ async function prepareParent(root: string, target: string): Promise<string> {
 async function atomicWrite(root: string, path: string, content: string): Promise<void> {
   await prepareParent(root, path);
   const temporary = `${path}.${randomUUID()}.tmp`;
-  await writeFile(temporary, content, { encoding: "utf8", flag: "wx" });
-  await rename(temporary, path);
+  try {
+    await writeFile(temporary, content, { encoding: "utf8", flag: "wx" });
+    await rename(temporary, path);
+  } finally {
+    await rm(temporary, { force: true });
+  }
 }
 
 const sensitiveKey = /password|passphrase|token|secret|api.?key|private.?key|connection.?string|cookie|authorization/i;
@@ -98,30 +114,60 @@ export class ProjectStore {
     expectedVersion: number,
     reducer: (state: WorkflowState) => WorkflowState,
   ): Promise<WorkflowState> {
-    const current = await this.readWorkflowState();
-    if (current.state_version !== expectedVersion) {
-      throw new ProjectStoreError("STATE_VERSION_CONFLICT");
+    const lockPath = targetPath(this.root, ".agent-team/workflow-state.lock");
+    await prepareParent(this.root, lockPath);
+    let lock: FileHandle;
+    try {
+      lock = await open(lockPath, "wx");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+        throw new ProjectStoreError("STATE_LOCKED");
+      }
+      throw error;
     }
 
-    const requiredVersion = current.state_version + 1;
-    const next = reducer(current);
-    if (next.state_version !== requiredVersion) {
-      throw new ProjectStoreError("STATE_VERSION_INVALID");
-    }
+    try {
+      const current = await this.readWorkflowState();
+      if (current.state_version !== expectedVersion) {
+        throw new ProjectStoreError("STATE_VERSION_CONFLICT");
+      }
 
-    const validated = WorkflowStateSchema.parse(next);
-    await this.writeYamlAtomic(".agent-team/workflow-state.yaml", validated);
-    return validated;
+      const requiredVersion = current.state_version + 1;
+      const next = reducer(current);
+      if (next.state_version !== requiredVersion) {
+        throw new ProjectStoreError("STATE_VERSION_INVALID");
+      }
+
+      const validated = WorkflowStateSchema.parse(next);
+      await this.writeYamlAtomic(".agent-team/workflow-state.yaml", validated);
+      return validated;
+    } finally {
+      try {
+        await lock.close();
+      } finally {
+        await rm(lockPath, { force: true });
+      }
+    }
   }
 
   async appendAudit(event: Record<string, unknown>): Promise<void> {
     const target = targetPath(this.root, ".agent-team/audit/events.jsonl");
     const realRoot = await prepareParent(this.root, target);
+    let exists = true;
     try {
       await lstat(target);
-      requireInside(realRoot, await realpath(target));
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      exists = false;
+    }
+    if (exists) {
+      let realTarget: string;
+      try {
+        realTarget = await realpath(target);
+      } catch {
+        throw new ProjectStoreError("PATH_OUTSIDE_PROJECT");
+      }
+      requireInside(realRoot, realTarget);
     }
     await appendFile(target, `${JSON.stringify(redact(event))}\n`, "utf8");
   }

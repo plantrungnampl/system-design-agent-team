@@ -84,6 +84,15 @@ test("atomically replaces YAML without leaving a temporary file", async (t) => {
   assert.deepEqual((await readdir(root)).filter((name) => name.endsWith(".tmp")), []);
 });
 
+test("cleans the temporary file after atomic replacement fails", async (t) => {
+  const root = await temporaryDirectory(t, "project-store-");
+  await mkdir(join(root, "occupied"));
+  const store = ProjectStore.open(root);
+
+  await assert.rejects(() => store.writeYamlAtomic("occupied", { value: "new" }));
+  assert.deepEqual((await readdir(root)).filter((name) => name.endsWith(".tmp")), []);
+});
+
 test("requires the next state version before replacing workflow state", async (t) => {
   const root = await projectWithState(t);
   const store = ProjectStore.open(root);
@@ -102,6 +111,32 @@ test("requires the next state version before replacing workflow state", async (t
   assert.equal(next.state_version, before.state_version + 1);
 });
 
+test("allows exactly one concurrent update for the same state version", async (t) => {
+  const root = await projectWithState(t);
+  const before = await ProjectStore.open(root).readWorkflowState();
+  const update = (operation) => ProjectStore.open(root).updateWorkflowState(
+    before.state_version,
+    (value) => ({
+      ...value,
+      state_version: value.state_version + 1,
+      completed_operations: [...value.completed_operations, operation],
+    }),
+  );
+
+  const results = await Promise.allSettled([update("first"), update("second")]);
+  const fulfilled = results.filter((result) => result.status === "fulfilled");
+  const rejected = results.filter((result) => result.status === "rejected");
+
+  assert.equal(fulfilled.length, 1);
+  assert.equal(rejected.length, 1);
+  assert.match(String(rejected[0].reason), /STATE_LOCKED|STATE_VERSION_CONFLICT/);
+  assert.equal((await ProjectStore.open(root).readWorkflowState()).state_version, before.state_version + 1);
+  await assert.rejects(
+    () => access(join(root, ".agent-team", "workflow-state.lock")),
+    { code: "ENOENT" },
+  );
+});
+
 test("appends one redacted audit JSON object per line", async (t) => {
   const root = await temporaryDirectory(t, "project-store-");
   const store = ProjectStore.open(root);
@@ -117,4 +152,29 @@ test("appends one redacted audit JSON object per line", async (t) => {
     { action: "dispatch", token: "[REDACTED]" },
     { action: "review", nested: { password: "[REDACTED]" } },
   ]);
+});
+
+test("rejects a dangling audit symlink or junction", async (t) => {
+  const root = await temporaryDirectory(t, "project-store-");
+  const outside = await temporaryDirectory(t, "project-store-outside-");
+  const auditDirectory = join(root, ".agent-team", "audit");
+  const auditPath = join(auditDirectory, "events.jsonl");
+  await mkdir(auditDirectory, { recursive: true });
+
+  try {
+    await symlink(outside, auditPath, process.platform === "win32" ? "junction" : "dir");
+  } catch (error) {
+    if (["EACCES", "EPERM", "ENOSYS", "UNKNOWN"].includes(error?.code)) {
+      t.skip(`link creation unavailable: ${error.code}`);
+      return;
+    }
+    throw error;
+  }
+  await rm(outside, { force: true, recursive: true });
+
+  await assert.rejects(
+    () => ProjectStore.open(root).appendAudit({ action: "dispatch" }),
+    /PATH_OUTSIDE_PROJECT/,
+  );
+  await assert.rejects(() => access(outside), { code: "ENOENT" });
 });
