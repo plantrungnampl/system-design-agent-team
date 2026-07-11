@@ -57,6 +57,25 @@ test("blocks standalone placeholder markers in review-ready artifacts", () => {
   }
 });
 
+test("blocks Markdown-prefixed standalone placeholder markers", () => {
+  const placeholders = [
+    "## TODO: permissions",
+    "- [ ] TODO: permissions",
+    "* [x] TBD: retention",
+    "1. to be defined later: recovery targets",
+    "2) sample requirement",
+    "###### placeholder architecture",
+  ];
+
+  for (const placeholder of placeholders) {
+    assert.equal(
+      validateReviewReadyArtifact(`---\nstatus: approved\n---\n${placeholder}`).valid,
+      false,
+      placeholder,
+    );
+  }
+});
+
 test("allows explicit placeholders in drafts and returns stable parse diagnostics", () => {
   assert.deepEqual(validateReviewReadyArtifact("---\nstatus: draft\n---\nTODO: permissions"), {
     valid: true,
