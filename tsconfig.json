@@ -3,6 +3,8 @@
   "references": [
     { "path": "packages/core" },
     { "path": "packages/workflow-engine" },
-    { "path": "packages/project-store" }
+    { "path": "packages/project-store" },
+    { "path": "packages/artifact-validator" },
+    { "path": "packages/traceability" }
   ]
 }
