@@ -29,6 +29,34 @@ test("blocks prohibited placeholders in review-ready artifacts", () => {
   assert.equal(result.findings[0].code, "PROHIBITED_PLACEHOLDER");
 });
 
+test("allows review-ready prose that discusses placeholders", () => {
+  const result = validateReviewReadyArtifact(`---
+status: approved
+---
+All sample requirements were removed before review.
+No silent fallback behavior is permitted.
+The TODO list is empty, and the value is not marked TBD.
+The phrase to be defined later is prohibited.`);
+
+  assert.deepEqual(result, { valid: true, findings: [] });
+});
+
+test("blocks standalone placeholder markers in review-ready artifacts", () => {
+  const placeholders = [
+    "TODO: permissions",
+    "- TBD: retention",
+    "to be defined later: recovery targets",
+    "sample requirement",
+    "- sample requirements",
+    "placeholder architecture",
+    "Lorem ipsum dolor sit amet",
+  ];
+
+  for (const placeholder of placeholders) {
+    assert.equal(validateReviewReadyArtifact(`---\nstatus: approved\n---\n${placeholder}`).valid, false);
+  }
+});
+
 test("allows explicit placeholders in drafts and returns stable parse diagnostics", () => {
   assert.deepEqual(validateReviewReadyArtifact("---\nstatus: draft\n---\nTODO: permissions"), {
     valid: true,

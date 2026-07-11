@@ -19,12 +19,11 @@ const reviewReadyStatuses = new Set(["in_review", "approved", "approved_with_con
 const prohibitedPlaceholders = [
   ["Fake test evidence", /fake test evidence/i],
   ["Lorem ipsum", /lorem ipsum/i],
-  ["Placeholder architecture", /placeholder architecture/i],
-  ["Sample requirements", /sample requirements?/i],
-  ["Silent fallback behavior", /silent fallback behavior/i],
-  ["TBD", /\bTBD\b/i],
-  ["TODO", /\bTODO\b/i],
-  ["To be defined later", /to be defined later/i],
+  ["Placeholder architecture", /^[ \t]*(?:[-*+][ \t]+)?placeholder architecture[ \t]*$/im],
+  ["Sample requirements", /^[ \t]*(?:[-*+][ \t]+)?sample requirements?[ \t]*$/im],
+  ["TBD", /^[ \t]*(?:[-*+][ \t]+)?TBD(?:[ \t]*:[^\r\n]*)?[ \t]*$/im],
+  ["TODO", /^[ \t]*(?:[-*+][ \t]+)?TODO(?:[ \t]*:[^\r\n]*)?[ \t]*$/im],
+  ["To be defined later", /^[ \t]*(?:[-*+][ \t]+)?to be defined later(?:[ \t]*:[^\r\n]*)?[ \t]*$/im],
 ] as const;
 
 function boundedFrontMatter(text: string): { yaml: string; body: string } | undefined {
