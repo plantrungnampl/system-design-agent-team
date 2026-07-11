@@ -116,6 +116,35 @@ test("prevents approval without an approval record", () => {
   }), /APPROVAL_REQUIRED/);
 });
 
+test("rejects a forged approval id on the public transition API", () => {
+  const awaiting = withPhase(state, "requirements", "awaiting_approval");
+  const forged = {
+    ...awaiting,
+    phases: {
+      ...awaiting.phases,
+      requirements: { ...awaiting.phases.requirements, approval_id: "APR-FORGED" },
+    },
+  };
+
+  assert.throws(() => transitionPhase(forged, workflow, {
+    phase: "requirements",
+    to: "approved",
+    operation_id: "OP-FORGED",
+  }), /APPROVAL_REQUIRED/);
+});
+
+test("rejects human self-approval by the phase owner", () => {
+  const awaiting = withPhase(state, "requirements", "awaiting_approval");
+  assert.throws(() => approveGate(awaiting, workflow, {
+    id: "APR-SELF",
+    gate: "G2",
+    decision: "approved",
+    approved_by: { type: "human", identifier: "business-analyst" },
+    artifact_versions: { SRS: 1 },
+    timestamp: "2026-07-11T00:00:00Z",
+  }), /SELF_APPROVAL_FORBIDDEN/);
+});
+
 test("approves the awaiting phase when a gate is shared", () => {
   const definition = {
     ...workflow,

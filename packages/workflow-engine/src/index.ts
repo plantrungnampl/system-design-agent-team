@@ -36,10 +36,11 @@ const transitions: Record<PhaseStatus, readonly PhaseStatus[]> = {
 
 const approvedStatuses: readonly PhaseStatus[] = ["approved", "handed_over"];
 
-export function transitionPhase(
+function applyTransition(
   state: WorkflowState,
   workflow: WorkflowDefinition,
   request: TransitionRequest,
+  allowApproval = false,
 ): WorkflowState {
   if (state.completed_operations.includes(request.operation_id)) return state;
 
@@ -49,7 +50,7 @@ export function transitionPhase(
   if (!current || !transitions[current.status].includes(request.to)) {
     throw new Error("INVALID_TRANSITION");
   }
-  if (request.to === "approved" && !current.approval_id) {
+  if (request.to === "approved" && (!allowApproval || !current.approval_id)) {
     throw new Error("APPROVAL_REQUIRED");
   }
   if (request.to === "ready") {
@@ -73,6 +74,14 @@ export function transitionPhase(
   };
 }
 
+export function transitionPhase(
+  state: WorkflowState,
+  workflow: WorkflowDefinition,
+  request: TransitionRequest,
+): WorkflowState {
+  return applyTransition(state, workflow, request);
+}
+
 export function approveGate(
   state: WorkflowState,
   workflow: WorkflowDefinition,
@@ -93,11 +102,14 @@ export function approveGate(
   if (approval.gate === "G2" && approval.approved_by.type !== "human") {
     throw new Error("HUMAN_APPROVAL_REQUIRED");
   }
+  if (approval.approved_by.identifier === definition.owner) {
+    throw new Error("SELF_APPROVAL_FORBIDDEN");
+  }
   if (approval.decision !== "approved" && approval.decision !== "approved_with_conditions") {
     throw new Error("APPROVAL_NOT_GRANTED");
   }
 
-  return transitionPhase({
+  return applyTransition({
     ...state,
     phases: {
       ...state.phases,
@@ -107,7 +119,7 @@ export function approveGate(
     phase: definition.id,
     to: "approved",
     operation_id: approval.id,
-  });
+  }, true);
 }
 
 export function gateReadiness(
