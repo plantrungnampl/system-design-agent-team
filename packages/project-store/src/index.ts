@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   appendFile,
   type FileHandle,
@@ -6,6 +6,7 @@ import {
   mkdir,
   open,
   readFile,
+  readdir,
   realpath,
   rename,
   rm,
@@ -13,7 +14,12 @@ import {
 } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { hostname } from "node:os";
-import { WorkflowStateSchema, type WorkflowState } from "@system-design-team/core";
+import {
+  AuditEventSchema,
+  WorkflowStateSchema,
+  type AuditEvent,
+  type WorkflowState,
+} from "@system-design-team/core";
 import { parse, stringify } from "yaml";
 
 type Schema<T> = { parse(value: unknown): T };
@@ -42,6 +48,23 @@ export const GENERATED_LOCK_PATHS = [
 export interface LockInspection {
   path: string;
   status: "missing" | "abandoned" | "locked";
+}
+
+export interface TransactionWrite {
+  path: string;
+  content: string;
+}
+
+export type TransactionFaultPoint =
+  | "before_journal_commit"
+  | "after_evidence_write"
+  | "after_state_write"
+  | "before_audit_append";
+
+interface TransactionJournal {
+  operationId: string;
+  writes: TransactionWrite[];
+  auditEvent: AuditEvent;
 }
 
 function inside(root: string, target: string): boolean {
@@ -99,7 +122,7 @@ function redact(value: unknown): unknown {
   if (!value || typeof value !== "object") return value;
   return Object.fromEntries(Object.entries(value).map(([key, item]) => [
     key,
-    sensitiveKey.test(key) ? "[REDACTED]" : redact(item),
+    sensitiveKey.test(key) && key !== "authorization_source" ? "[REDACTED]" : redact(item),
   ]));
 }
 
@@ -125,10 +148,89 @@ async function abandonedLocalLock(path: string): Promise<boolean> {
 }
 
 export class ProjectStore {
-  private constructor(private readonly root: string) {}
+  private constructor(
+    private readonly root: string,
+    private readonly transactionFault?: (point: TransactionFaultPoint) => void,
+  ) {}
 
-  static open(root: string): ProjectStore {
-    return new ProjectStore(resolve(root));
+  static open(
+    root: string,
+    options: { transactionFault?: (point: TransactionFaultPoint) => void } = {},
+  ): ProjectStore {
+    return new ProjectStore(resolve(root), options.transactionFault);
+  }
+
+  private journalPath(operationId: string): string {
+    const name = createHash("sha256").update(operationId).digest("hex");
+    return `.agent-team/transactions/${name}.json`;
+  }
+
+  private async applyJournal(journal: TransactionJournal): Promise<void> {
+    for (const [index, write] of journal.writes.entries()) {
+      await this.writeTextAtomic(write.path, write.content);
+      if (index === 0) this.transactionFault?.("after_evidence_write");
+      if (index === 1) this.transactionFault?.("after_state_write");
+    }
+    this.transactionFault?.("before_audit_append");
+    await this.appendAuditOnce(journal.auditEvent);
+  }
+
+  async transaction(
+    operationId: string,
+    writes: readonly TransactionWrite[],
+    auditEvent: AuditEvent,
+  ): Promise<void> {
+    if (!operationId) throw new Error("OPERATION_ID_REQUIRED");
+    const journal: TransactionJournal = {
+      operationId,
+      writes: writes.map(({ path, content }) => ({ path, content })),
+      auditEvent: AuditEventSchema.parse(auditEvent),
+    };
+    const relativeJournal = this.journalPath(operationId);
+    this.transactionFault?.("before_journal_commit");
+    await this.writeTextAtomic(relativeJournal, JSON.stringify(journal));
+    await this.applyJournal(journal);
+    await rm(targetPath(this.root, relativeJournal));
+  }
+
+  async inspectTransactions(): Promise<string[]> {
+    const directory = targetPath(this.root, ".agent-team/transactions");
+    let files: string[];
+    try {
+      requireInside(await realpath(this.root), await realpath(directory));
+      files = await readdir(directory);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+      throw error;
+    }
+    const operations: string[] = [];
+    for (const file of files.filter((name) => name.endsWith(".json")).sort()) {
+      const raw = JSON.parse(await readFile(targetPath(this.root, `.agent-team/transactions/${file}`), "utf8")) as TransactionJournal;
+      operations.push(raw.operationId);
+    }
+    return operations;
+  }
+
+  async repairTransactions(): Promise<string[]> {
+    const directory = targetPath(this.root, ".agent-team/transactions");
+    let files: string[];
+    try {
+      requireInside(await realpath(this.root), await realpath(directory));
+      files = await readdir(directory);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+      throw error;
+    }
+    const repaired: string[] = [];
+    for (const file of files.filter((name) => name.endsWith(".json")).sort()) {
+      const path = `.agent-team/transactions/${file}`;
+      const raw = JSON.parse(await readFile(targetPath(this.root, path), "utf8")) as TransactionJournal;
+      const journal = { ...raw, auditEvent: AuditEventSchema.parse(raw.auditEvent) };
+      await this.applyJournal(journal);
+      await rm(targetPath(this.root, path));
+      repaired.push(journal.operationId);
+    }
+    return repaired;
   }
 
   async readYaml<T>(relativePath: string, schema: Schema<T>): Promise<T> {

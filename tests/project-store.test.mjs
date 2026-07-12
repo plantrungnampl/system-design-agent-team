@@ -5,6 +5,7 @@ import { access, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } fro
 import { hostname, tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import test from "node:test";
+import { AuditEventSchema } from "@system-design-team/core";
 import { ProjectStore } from "@system-design-team/project-store";
 
 const workflowStateYaml = `schema_version: 1
@@ -284,4 +285,70 @@ test("rejects a dangling audit symlink or junction", async (t) => {
     /PATH_OUTSIDE_PROJECT/,
   );
   await assert.rejects(() => access(outside), { code: "ENOENT" });
+});
+
+const auditEvent = (id) => AuditEventSchema.parse({
+  id,
+  action: "review",
+  target: "intake",
+  actor: { type: "agent", identifier: "documentation-reviewer" },
+  authorization_source: "workflow",
+  agent_id: "documentation-reviewer",
+  permission_profile: "standard",
+  artifact_versions: { "PROJECT-CHARTER": 1 },
+  result: "success",
+  timestamp: "2026-07-12T00:00:00.000Z",
+});
+
+for (const [fault, expected] of [
+  ["before_journal_commit", "old"],
+  ["after_evidence_write", "new"],
+  ["after_state_write", "new"],
+  ["before_audit_append", "new"],
+]) {
+  test(`recovers ${expected} state after interruption ${fault}`, async (t) => {
+    const root = await temporaryDirectory(t, "project-store-transaction-");
+    await mkdir(join(root, ".agent-team"), { recursive: true });
+    await writeFile(join(root, ".agent-team/evidence.yaml"), "value: old\n");
+    await writeFile(join(root, ".agent-team/state.yaml"), "value: old\n");
+    const interrupted = ProjectStore.open(root, {
+      transactionFault: (point) => {
+        if (point === fault) throw new Error(`INTERRUPTED_${point}`);
+      },
+    });
+
+    await assert.rejects(() => interrupted.transaction("OP-TRANSACTION", [
+      { path: ".agent-team/evidence.yaml", content: "value: new\n" },
+      { path: ".agent-team/state.yaml", content: "value: new\n" },
+    ], auditEvent("OP-TRANSACTION")), new RegExp(`INTERRUPTED_${fault}`));
+
+    const store = ProjectStore.open(root);
+    const pending = await store.inspectTransactions();
+    assert.equal(pending.length, expected === "new" ? 1 : 0);
+    await store.repairTransactions();
+    assert.equal(await readFile(join(root, ".agent-team/evidence.yaml"), "utf8"), `value: ${expected}\n`);
+    assert.equal(await readFile(join(root, ".agent-team/state.yaml"), "utf8"), `value: ${expected}\n`);
+    if (expected === "new") {
+      const events = (await readFile(join(root, ".agent-team/audit/events.jsonl"), "utf8"))
+        .trim().split("\n").map(JSON.parse);
+      assert.deepEqual(events, [auditEvent("OP-TRANSACTION")]);
+    } else {
+      await assert.rejects(() => access(join(root, ".agent-team/audit/events.jsonl")), { code: "ENOENT" });
+    }
+    assert.deepEqual(await store.inspectTransactions(), []);
+  });
+}
+
+test("transaction replay is idempotent", async (t) => {
+  const root = await temporaryDirectory(t, "project-store-transaction-");
+  const store = ProjectStore.open(root);
+  const writes = [{ path: ".agent-team/evidence.yaml", content: "value: new\n" }];
+  const event = auditEvent("OP-IDEMPOTENT");
+
+  await store.transaction("OP-IDEMPOTENT", writes, event);
+  await store.transaction("OP-IDEMPOTENT", writes, event);
+
+  const events = (await readFile(join(root, ".agent-team/audit/events.jsonl"), "utf8"))
+    .trim().split("\n").map(JSON.parse);
+  assert.deepEqual(events, [event]);
 });

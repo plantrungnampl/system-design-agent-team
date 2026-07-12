@@ -301,6 +301,23 @@ export const HandoverRecordSchema = z.object({
   acceptance_conditions: z.array(z.string()),
 });
 
+export const AuditEventSchema = z.object({
+  id: z.string().min(1),
+  action: z.string().min(1),
+  target: z.string().min(1),
+  actor: z.object({
+    type: z.enum(["human", "agent", "system"]),
+    identifier: z.string().min(1),
+  }),
+  authorization_source: z.string().min(1),
+  agent_id: z.string().min(1).optional(),
+  adapter_id: z.string().min(1).optional(),
+  permission_profile: z.string().min(1),
+  artifact_versions: z.record(z.string().min(1), z.number().int().positive()),
+  result: z.enum(["success", "failure"]),
+  timestamp: z.string().datetime(),
+});
+
 export type ProjectMode = z.infer<typeof ProjectModeSchema>;
 export type ProjectProfile = z.infer<typeof ProjectProfileSchema>;
 export type ProjectConfig = z.infer<typeof ProjectConfigSchema>;
@@ -323,3 +340,4 @@ export type ReviewVerdict = z.infer<typeof ReviewVerdictSchema>;
 export type ReviewRecord = z.infer<typeof ReviewRecordSchema>;
 export type ReviewList = z.infer<typeof ReviewListSchema>;
 export type HandoverRecord = z.infer<typeof HandoverRecordSchema>;
+export type AuditEvent = z.infer<typeof AuditEventSchema>;

@@ -7,6 +7,7 @@ import { promisify } from "node:util";
 import { parseArtifact, validateReviewReadyArtifact } from "@system-design-team/artifact-validator";
 import {
   AgentManifestSchema,
+  AuditEventSchema,
   ApprovalListSchema,
   ApprovalRecordSchema,
   ArtifactRegistrySchema,
@@ -23,6 +24,7 @@ import {
   WorkflowDefinitionSchema,
   WorkflowStateSchema,
   type AgentManifest,
+  type AuditEvent,
   type ArtifactRecord,
   type ChangeRequest,
   type GateId,
@@ -39,7 +41,7 @@ import { PluginRegistry } from "@system-design-team/plugin-registry";
 import { GENERATED_LOCK_PATHS, ProjectStore } from "@system-design-team/project-store";
 import { propagateStaleness, traceCoverage, validateTraceability } from "@system-design-team/traceability";
 import { approveGate, transitionPhase } from "@system-design-team/workflow-engine";
-import { parse } from "yaml";
+import { parse, stringify } from "yaml";
 
 export interface InitOptions {
   id: string;
@@ -278,26 +280,29 @@ export async function initProject(root: string, options: InitOptions): Promise<P
   }
 
   try {
-    await store.writeYamlAtomic(".agent-team/project.yaml", project);
-    await store.writeYamlAtomic(".agent-team/workflow-state.yaml", state);
-    await store.writeYamlAtomic(".agent-team/plugin-status.yaml", plugins);
-    await store.writeYamlAtomic(".agent-team/approvals.yaml", approvals);
-    await store.writeYamlAtomic(".agent-team/reviews.yaml", reviews);
-    await store.writeYamlAtomic(".agent-team/artifact-registry.yaml", registry);
-    await store.writeYamlAtomic(".agent-team/traceability.yaml", traceability);
-    await store.writeYamlAtomic(".agent-team/framework-lock.yaml", lock);
-    for (const phase of workflow.phases) {
-      await store.writeTextAtomic(
-        `.agent-team/${phase.artifact.path}`,
-        artifactTexts.get(phase.id)!,
-      );
-    }
-    await store.writeTextAtomic(".agent-team/handovers/.gitkeep", "");
-    await appendOperationAudit(store, operationKey("init", options.id, "bootstrap"), "init", options.id);
-    for (const agent of catalogue) {
-      await store.writeTextAtomic(`.codex/agents/${agent.id}.md`, renderAgentInstruction(agent));
-    }
-    if (!preserveCodexKeep) await store.writeTextAtomic(".codex/generated/.gitkeep", "");
+    const id = operationKey("init", options.id, "bootstrap");
+    await store.transaction(id, [
+      { path: ".agent-team/project.yaml", content: stringify(project) },
+      { path: ".agent-team/workflow-state.yaml", content: stringify(state) },
+      { path: ".agent-team/plugin-status.yaml", content: stringify(plugins) },
+      { path: ".agent-team/approvals.yaml", content: stringify(approvals) },
+      { path: ".agent-team/reviews.yaml", content: stringify(reviews) },
+      { path: ".agent-team/artifact-registry.yaml", content: stringify(registry) },
+      { path: ".agent-team/traceability.yaml", content: stringify(traceability) },
+      { path: ".agent-team/framework-lock.yaml", content: stringify(lock) },
+      ...workflow.phases.map((phase) => ({
+        path: `.agent-team/${phase.artifact.path}`,
+        content: artifactTexts.get(phase.id)!,
+      })),
+      { path: ".agent-team/handovers/.gitkeep", content: "" },
+      ...catalogue.map((agent) => ({
+        path: `.codex/agents/${agent.id}.md`,
+        content: renderAgentInstruction(agent),
+      })),
+      ...(preserveCodexKeep ? [] : [{ path: ".codex/generated/.gitkeep", content: "" }]),
+    ], makeAuditEvent(id, "init", options.id, options.profile, {
+      authorizationSource: "bootstrap",
+    }));
     return project;
   } catch (error) {
     await removeNewAgentTeam(projectRoot);
@@ -347,8 +352,43 @@ async function appendOperationAudit(
   id: string,
   action: string,
   target: string,
+  options: {
+    actor?: AuditEvent["actor"];
+    authorizationSource?: string;
+    artifactVersions?: Record<string, number>;
+    adapterId?: string;
+  } = {},
 ): Promise<void> {
-  await store.appendAuditOnce({ id, action, target });
+  const { project } = await projectConfig(store);
+  await store.appendAuditOnce(makeAuditEvent(id, action, target, project.profile, options));
+}
+
+function makeAuditEvent(
+  id: string,
+  action: string,
+  target: string,
+  permissionProfile: string,
+  options: {
+    actor?: AuditEvent["actor"];
+    authorizationSource?: string;
+    artifactVersions?: Record<string, number>;
+    adapterId?: string;
+  } = {},
+): AuditEvent {
+  const actor = options.actor ?? { type: "system" as const, identifier: "system-design-team" };
+  return AuditEventSchema.parse({
+    id,
+    action,
+    target,
+    actor,
+    authorization_source: options.authorizationSource ?? "workflow",
+    ...(actor.type === "agent" ? { agent_id: actor.identifier } : {}),
+    ...(options.adapterId ? { adapter_id: options.adapterId } : {}),
+    permission_profile: permissionProfile,
+    artifact_versions: options.artifactVersions ?? {},
+    result: "success",
+    timestamp: new Date().toISOString(),
+  });
 }
 
 export async function setPluginStatus(
@@ -367,7 +407,14 @@ export async function setPluginStatus(
   const next = PluginStatusListSchema.parse({
     plugins: plugins.sort((left, right) => left.uri.localeCompare(right.uri)),
   });
-  await store.writeYamlAtomic(".agent-team/plugin-status.yaml", next);
+  const id = operationKey("plugin", uri, JSON.stringify([status, skills]));
+  const { project } = await projectConfig(store);
+  await store.transaction(id, [
+    { path: ".agent-team/plugin-status.yaml", content: stringify(next) },
+  ], makeAuditEvent(id, "plugin", uri, project.profile, {
+    authorizationSource: "operator",
+    adapterId: uri,
+  }));
   return next;
   });
 }
@@ -591,16 +638,12 @@ export async function createChange(
         staleIds.has(node.id) ? { ...node, status: "stale" } : node),
     });
 
-    await store.writeYamlAtomic(`.agent-team/changes/${change.id}.yaml`, change);
-    await store.writeYamlAtomic(".agent-team/artifact-registry.yaml", nextRegistry);
-    await store.writeYamlAtomic(".agent-team/approvals.yaml", nextApprovals);
-    await store.writeYamlAtomic(".agent-team/traceability.yaml", nextTraceability);
-    await store.updateWorkflowState(state.state_version, (current) => ({
-      ...current,
-      state_version: current.state_version + 1,
-      current_phase: workflow.phases.find(({ id }) => reopenedPhases.has(id))?.id ?? current.current_phase,
-      completed_operations: [...current.completed_operations, scopedOperation],
-      phases: Object.fromEntries(Object.entries(current.phases).map(([id, phaseState]) => {
+    const nextState = WorkflowStateSchema.parse({
+      ...state,
+      state_version: state.state_version + 1,
+      current_phase: workflow.phases.find(({ id }) => reopenedPhases.has(id))?.id ?? state.current_phase,
+      completed_operations: [...state.completed_operations, scopedOperation],
+      phases: Object.fromEntries(Object.entries(state.phases).map(([id, phaseState]) => {
         if (!reopenedPhases.has(id)) return [id, phaseState];
         const {
           review_id: _reviewId,
@@ -611,8 +654,20 @@ export async function createChange(
         } = phaseState;
         return [id, { ...reopened, status: "revision_required" }];
       })),
+    });
+    const { project } = await projectConfig(store);
+    await store.transaction(scopedOperation, [
+      { path: `.agent-team/changes/${change.id}.yaml`, content: stringify(change) },
+      { path: ".agent-team/artifact-registry.yaml", content: stringify(nextRegistry) },
+      { path: ".agent-team/approvals.yaml", content: stringify(nextApprovals) },
+      { path: ".agent-team/traceability.yaml", content: stringify(nextTraceability) },
+      { path: ".agent-team/workflow-state.yaml", content: stringify(nextState) },
+    ], makeAuditEvent(scopedOperation, "change", change.id, project.profile, {
+      actor: { type: "human", identifier: change.requested_by },
+      authorizationSource: "change_request",
+      artifactVersions: Object.fromEntries(registry.artifacts
+        .filter(({ id }) => staleIds.has(id)).map(({ id, version }) => [id, version])),
     }));
-    await appendOperationAudit(store, scopedOperation, "change", change.id);
     return { change, stale_artifacts: staleArtifacts };
   });
 }
@@ -770,34 +825,19 @@ export async function reviewPhase(
       operation_id: verdictId,
     });
   }
-  if (!existing) {
-    await store.writeYamlAtomic(
-      ".agent-team/reviews.yaml",
-      ReviewListSchema.parse({ reviews: [...reviews.reviews, review] }),
-    );
-  }
-
-  let current = state;
-  if (!current.completed_operations.includes(underReviewId)) {
-    current = await store.updateWorkflowState(current.state_version, (value) => transitionPhase(
-      bindReview(value),
-      workflow,
-      { phase, to: "under_review", operation_id: underReviewId },
-    ));
-  }
-  if (!current.completed_operations.includes(verdictId)) {
-    current = await store.updateWorkflowState(current.state_version, (value) => transitionPhase(
-      bindReview(value),
-      workflow,
-      {
-        phase,
-        to: verdict === "approved" ? "awaiting_approval" : "revision_required",
-        operation_id: verdictId,
-      },
-    ));
-  }
-  await appendOperationAudit(store, evidenceId, "review", phase);
-  return current;
+  const nextReviews = ReviewListSchema.parse({
+    reviews: existing ? reviews.reviews : [...reviews.reviews, review],
+  });
+  const { project } = await projectConfig(store);
+  await store.transaction(evidenceId, [
+    { path: ".agent-team/reviews.yaml", content: stringify(nextReviews) },
+    { path: ".agent-team/workflow-state.yaml", content: stringify(preview) },
+  ], makeAuditEvent(evidenceId, "review", phase, project.profile, {
+    actor: { type: "agent", identifier: reviewerId },
+    authorizationSource: "agent_manifest",
+    artifactVersions: review.artifact_versions,
+  }));
+  return preview;
   });
 }
 
@@ -871,14 +911,19 @@ export async function approve(
     throw new Error("OPERATION_ID_CONFLICT");
   }
 
-  approveGate(state, workflow, approval);
-  if (!existing) {
-    const next = ApprovalListSchema.parse({ approvals: [...approvals.approvals, approval] });
-    await store.writeYamlAtomic(".agent-team/approvals.yaml", next);
-  }
-  const nextState = await store.updateWorkflowState(state.state_version, (current) =>
-    approveGate(current, workflow, approval));
-  await appendOperationAudit(store, scopedOperation, "approve", gate);
+  const nextApprovals = ApprovalListSchema.parse({
+    approvals: existing ? approvals.approvals : [...approvals.approvals, approval],
+  });
+  const nextState = approveGate(state, workflow, approval);
+  const { project } = await projectConfig(store);
+  await store.transaction(scopedOperation, [
+    { path: ".agent-team/approvals.yaml", content: stringify(nextApprovals) },
+    { path: ".agent-team/workflow-state.yaml", content: stringify(nextState) },
+  ], makeAuditEvent(scopedOperation, "approve", gate, project.profile, {
+    actor: { type: "human", identifier: approver },
+    authorizationSource: "gate_policy",
+    artifactVersions: versions,
+  }));
   return nextState;
   });
 }
@@ -977,22 +1022,30 @@ export async function handover(
       to: "handed_over",
       operation_id: scopedOperation,
     });
-    if (!stored) await store.writeYamlAtomic(relativeRecord, proposed);
-    state = await store.updateWorkflowState(state.state_version, (current) => {
-      const currentPhase = current.phases[phase];
-      if (!currentPhase) throw new Error("INVALID_HANDOVER_STATE");
-      return transitionPhase({
-        ...current,
-        phases: {
-          ...current.phases,
-          [phase]: { ...currentPhase, handover_id: scopedOperation, handover_digest: digest },
-        },
-      }, workflow, {
-        phase,
-        to: "handed_over",
-        operation_id: scopedOperation,
-      });
+    state = transitionPhase(withId, workflow, {
+      phase,
+      to: "handed_over",
+      operation_id: scopedOperation,
     });
+    for (const dependent of dependents) {
+      const readinessId = operationKey("handover-ready", `${phase}->${dependent.id}`, operationId);
+      if (!state.completed_operations.includes(readinessId)) {
+        state = transitionPhase(state, workflow, {
+          phase: dependent.id,
+          to: "ready",
+          operation_id: readinessId,
+        });
+      }
+    }
+    const { project } = await projectConfig(store);
+    await store.transaction(scopedOperation, [
+      { path: relativeRecord, content: stringify(proposed) },
+      { path: ".agent-team/workflow-state.yaml", content: stringify(state) },
+    ], makeAuditEvent(scopedOperation, "handover", phase, project.profile, {
+      actor: { type: "agent", identifier: definition.owner },
+      authorizationSource: "approved_gate",
+      artifactVersions: approval.artifact_versions,
+    }));
   }
 
   for (const dependent of dependents) {
@@ -1005,7 +1058,10 @@ export async function handover(
       { phase: dependent.id, to: "ready", operation_id: readinessId },
     ));
   }
-  await appendOperationAudit(store, scopedOperation, "handover", phase);
+  await appendOperationAudit(store, scopedOperation, "handover", phase, {
+    actor: { type: "agent", identifier: definition.owner },
+    authorizationSource: "approved_gate",
+  });
   return state;
   });
 }
@@ -1037,7 +1093,7 @@ export async function repair(
   const store = ProjectStore.open(root);
   const inspections = await Promise.all(GENERATED_LOCK_PATHS.map((path) => store.inspectLock(path)));
   if (inspections.some(({ status }) => status === "locked")) throw new Error("STATE_LOCKED");
-  const repaired: string[] = [];
+  const repaired = (await store.repairTransactions()).map((id) => `transaction:${id}`);
   for (const { path, status } of inspections) {
     if (status === "missing") continue;
     if (await store.repairLock(path, { confirmedQuiescent: true })) repaired.push(path);
@@ -1048,6 +1104,16 @@ export async function repair(
 export async function doctor(root: string) {
   const store = ProjectStore.open(root);
   const checks: { name: string; ok: boolean; detail: string }[] = [];
+  try {
+    const transactions = await store.inspectTransactions();
+    checks.push({
+      name: "transactions",
+      ok: transactions.length === 0,
+      detail: transactions.length === 0 ? "none pending" : `${transactions.length} pending; run repair --locks --yes`,
+    });
+  } catch (error) {
+    checks.push({ name: "transactions", ok: false, detail: error instanceof Error ? error.message : String(error) });
+  }
   try {
     const { stdout } = await execFileAsync("git", ["rev-parse", "--is-inside-work-tree"], { cwd: root });
     checks.push({ name: "git", ok: stdout.trim() === "true", detail: stdout.trim() });

@@ -37,6 +37,7 @@ import {
 } from "@system-design-team/cli";
 import {
   AgentManifestSchema,
+  AuditEventSchema,
   HandoverRecordSchema,
   WorkflowDefinitionSchema,
 } from "@system-design-team/core";
@@ -165,6 +166,24 @@ test("init creates a valid project without overwriting source", async () => {
   assert.equal(await readFile(join(root, ".codex/generated/existing.txt"), "utf8"), "keep\n");
   assert.equal(await readFile(join(root, ".codex/generated/.gitkeep"), "utf8"), "");
   await assert.rejects(readFile(join(root, "src")), /ENOENT/);
+});
+
+test("lifecycle audit records carry authorization and artifact context", async () => {
+  const root = await temporaryGitRepository();
+  await initProject(root, {
+    id: "leave-system",
+    name: "Leave System",
+    mode: "greenfield",
+    profile: "standard",
+  });
+
+  const [event] = (await readFile(join(root, ".agent-team/audit/events.jsonl"), "utf8"))
+    .trim().split("\n").map(JSON.parse);
+  assert.deepEqual(AuditEventSchema.parse(event), event);
+  assert.equal(event.actor.type, "system");
+  assert.equal(event.authorization_source, "bootstrap");
+  assert.equal(event.permission_profile, "standard");
+  assert.deepEqual(event.artifact_versions, {});
 });
 
 test("init materializes complete workflow assets and Codex agent instructions", async () => {
@@ -931,6 +950,7 @@ test("status and doctor return structured project diagnostics", async () => {
 
   const diagnostics = await doctor(root);
   assert.deepEqual(diagnostics.checks.map(({ name }) => name), [
+    "transactions",
     "git",
     "node",
     "state_schema",
