@@ -594,55 +594,67 @@ export async function handover(
   const scopedOperation = operationKey("handover", phase, operationId);
   const store = ProjectStore.open(root);
   return store.withLock(".agent-team/lifecycle.lock", async () => {
-  const [workflow, approvals, registry] = await Promise.all([
+  const [workflow, initialState] = await Promise.all([
     configuredWorkflow(store),
-    store.readYaml(".agent-team/approvals.yaml", ApprovalListSchema),
-    artifactRegistry(store),
+    store.readWorkflowState(),
   ]);
   const definition = workflow.phases.find((candidate) => candidate.id === phase);
   if (!definition) throw new Error("PHASE_NOT_CONFIGURED");
   const dependents = workflow.phases.filter((candidate) => candidate.depends_on.includes(phase));
   const target = dependents[0];
   if (!target) throw new Error("HANDOVER_TARGET_REQUIRED");
-  let state = await store.readWorkflowState();
+  let state = initialState;
   const phaseState = state.phases[phase];
   if (!phaseState) throw new Error("INVALID_HANDOVER_STATE");
-  const approval = approvals.approvals.find((candidate) => candidate.id === phaseState.approval_id);
-  if (!approval
-    || (approval.decision !== "approved" && approval.decision !== "approved_with_conditions")) {
-    throw new Error("APPROVAL_EVIDENCE_MISSING");
-  }
-  const approvedArtifacts = registry.artifacts.filter(
-    (artifact) => artifact.required_gate === definition.gate && artifact.owner === definition.owner,
-  );
-  const [staleFinding] = await inspectArtifacts(root, approvedArtifacts);
-  if (staleFinding
-    || Object.keys(approval.artifact_versions).length === 0
-    || !sameArtifactVersions(approval.artifact_versions, artifactVersions(approvedArtifacts))) {
-    throw new Error("APPROVED_INPUT_STALE");
-  }
-  const proposed = HandoverRecordSchema.parse({
-    id: scopedOperation,
-    phase,
-    from_agent: definition.owner,
-    to_agent: target.owner,
-    approved_inputs: Object.entries(approval.artifact_versions)
-      .sort(([left], [right]) => left.localeCompare(right))
-      .map(([id, version]) => `${id}@${version}`),
-    expected_outputs: registry.artifacts.filter((artifact) => artifact.owner === target.owner)
-      .map((artifact) => artifact.id).sort(),
-    acceptance_conditions: ["Dependent work uses only the approved input versions."],
-  });
   const relativeRecord = `.agent-team/handovers/${phase}.yaml`;
   const recordExists = await exists(join(resolve(root), relativeRecord));
-  if (recordExists) {
-    const current = await store.readYaml(relativeRecord, HandoverRecordSchema);
-    if (JSON.stringify(current) !== JSON.stringify(proposed)) {
+  const stored = recordExists
+    ? await store.readYaml(relativeRecord, HandoverRecordSchema)
+    : undefined;
+
+  if (state.completed_operations.includes(scopedOperation)) {
+    if (!stored) throw new Error("HANDOVER_EVIDENCE_MISSING");
+    if (phaseState.handover_id !== scopedOperation
+      || stored.id !== scopedOperation
+      || stored.phase !== phase
+      || stored.from_agent !== definition.owner
+      || stored.to_agent !== target.owner) {
       throw new Error("HANDOVER_EVIDENCE_CONFLICT");
     }
-  }
-
-  if (!state.completed_operations.includes(scopedOperation)) {
+  } else {
+    const [approvals, registry] = await Promise.all([
+      store.readYaml(".agent-team/approvals.yaml", ApprovalListSchema),
+      artifactRegistry(store),
+    ]);
+    const approval = approvals.approvals.find((candidate) => candidate.id === phaseState.approval_id);
+    if (!approval
+      || (approval.decision !== "approved" && approval.decision !== "approved_with_conditions")) {
+      throw new Error("APPROVAL_EVIDENCE_MISSING");
+    }
+    const approvedArtifacts = registry.artifacts.filter(
+      (artifact) => artifact.required_gate === definition.gate && artifact.owner === definition.owner,
+    );
+    const [staleFinding] = await inspectArtifacts(root, approvedArtifacts);
+    if (staleFinding
+      || Object.keys(approval.artifact_versions).length === 0
+      || !sameArtifactVersions(approval.artifact_versions, artifactVersions(approvedArtifacts))) {
+      throw new Error("APPROVED_INPUT_STALE");
+    }
+    const proposed = HandoverRecordSchema.parse({
+      id: scopedOperation,
+      phase,
+      from_agent: definition.owner,
+      to_agent: target.owner,
+      approved_inputs: Object.entries(approval.artifact_versions)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([id, version]) => `${id}@${version}`),
+      expected_outputs: registry.artifacts.filter((artifact) => artifact.owner === target.owner)
+        .map((artifact) => artifact.id).sort(),
+      acceptance_conditions: ["Dependent work uses only the approved input versions."],
+    });
+    if (stored && JSON.stringify(stored) !== JSON.stringify(proposed)) {
+      throw new Error("HANDOVER_EVIDENCE_CONFLICT");
+    }
     if (phaseState.status !== "approved") throw new Error("INVALID_HANDOVER_STATE");
     const withId: WorkflowState = {
       ...state,
@@ -656,7 +668,7 @@ export async function handover(
       to: "handed_over",
       operation_id: scopedOperation,
     });
-    if (!recordExists) await store.writeYamlAtomic(relativeRecord, proposed);
+    if (!stored) await store.writeYamlAtomic(relativeRecord, proposed);
     state = await store.updateWorkflowState(state.state_version, (current) => {
       const currentPhase = current.phases[phase];
       if (!currentPhase) throw new Error("INVALID_HANDOVER_STATE");
@@ -672,8 +684,6 @@ export async function handover(
         operation_id: scopedOperation,
       });
     });
-  } else if (!recordExists) {
-    throw new Error("HANDOVER_EVIDENCE_MISSING");
   }
 
   for (const dependent of dependents) {

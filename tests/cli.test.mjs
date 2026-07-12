@@ -537,7 +537,26 @@ test("handover writes a valid record and advances each directly dependent phase 
   assert.equal(handedOver.phases.product.status, "ready");
   assert.equal(handedOver.state_version, approved.state_version + 2);
 
+  const auditPath = join(root, ".agent-team/audit/events.jsonl");
+  const handoverId = operationKey("handover", "requirements", "OP-HANDOVER-REQ");
+  const audit = (await readFile(auditPath, "utf8")).trim().split("\n").map(JSON.parse);
+  await ProjectStore.open(root).writeTextAtomic(
+    ".agent-team/audit/events.jsonl",
+    `${audit.filter(({ id }) => id !== handoverId).map(JSON.stringify).join("\n")}\n`,
+  );
+  await setArtifactStatus(root, "REQUIREMENTS", { version: 2 });
+
   assert.deepEqual(await handover(root, "requirements", "OP-HANDOVER-REQ"), handedOver);
+  assert.deepEqual(
+    (await readYaml(root, ".agent-team/handovers/requirements.yaml")).approved_inputs,
+    ["REQUIREMENTS@1"],
+  );
+  const repaired = (await readFile(auditPath, "utf8")).trim().split("\n").map(JSON.parse);
+  assert.equal(repaired.filter(({ id }) => id === handoverId).length, 1);
+  await assert.rejects(
+    () => handover(root, "requirements", "OP-HANDOVER-NEW"),
+    /APPROVED_INPUT_STALE/,
+  );
 });
 
 test("status and doctor return structured project diagnostics", async () => {

@@ -110,6 +110,38 @@ async function abandonedLocalLock(path: string): Promise<boolean> {
   }
 }
 
+async function recoverAbandonedLock(lockPath: string): Promise<FileHandle> {
+  const recoveryPath = `${lockPath}.recovery`;
+  let recovery: FileHandle;
+  try {
+    recovery = await open(recoveryPath, "wx");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+      // ponytail: abandoned recovery guards require manual removal; automate only with evidence it is needed.
+      throw new ProjectStoreError("STATE_LOCKED");
+    }
+    throw error;
+  }
+  try {
+    if (!await abandonedLocalLock(lockPath)) throw new ProjectStoreError("STATE_LOCKED");
+    await rm(lockPath, { force: true });
+    try {
+      return await open(lockPath, "wx");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+        throw new ProjectStoreError("STATE_LOCKED");
+      }
+      throw error;
+    }
+  } finally {
+    try {
+      await recovery.close();
+    } finally {
+      await rm(recoveryPath, { force: true });
+    }
+  }
+}
+
 export class ProjectStore {
   private constructor(private readonly root: string) {}
 
@@ -136,21 +168,14 @@ export class ProjectStore {
   async withLock<T>(relativeLockPath: string, callback: () => Promise<T> | T): Promise<T> {
     const lockPath = targetPath(this.root, relativeLockPath);
     await prepareParent(this.root, lockPath);
-    let lock: FileHandle | undefined;
-    for (let attempt = 0; attempt < 2; attempt += 1) {
-      try {
-        lock = await open(lockPath, "wx");
-        break;
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-        if (attempt === 0 && await abandonedLocalLock(lockPath)) {
-          await rm(lockPath, { force: true });
-          continue;
-        }
-        throw new ProjectStoreError("STATE_LOCKED");
-      }
+    let lock: FileHandle;
+    try {
+      lock = await open(lockPath, "wx");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      if (!await abandonedLocalLock(lockPath)) throw new ProjectStoreError("STATE_LOCKED");
+      lock = await recoverAbandonedLock(lockPath);
     }
-    if (!lock) throw new ProjectStoreError("STATE_LOCKED");
     try {
       await lock.writeFile(JSON.stringify({
         pid: process.pid,

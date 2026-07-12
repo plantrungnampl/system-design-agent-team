@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { access, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { access, mkdir, mkdtemp, open, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { hostname, tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import test from "node:test";
 import { ProjectStore } from "@system-design-team/project-store";
@@ -197,6 +197,70 @@ test("recovers a same-host lock after its owner process dies", async (t) => {
     () => access(join(root, ".agent-team", "lifecycle.lock")),
     { code: "ENOENT" },
   );
+});
+
+test("serializes simultaneous reclaimers of one abandoned lock", async (t) => {
+  const root = await projectWithState(t);
+  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"]);
+  child.kill();
+  await once(child, "exit");
+  const lockPath = join(root, ".agent-team/lifecycle.lock");
+  await writeFile(lockPath, JSON.stringify({
+    pid: child.pid,
+    hostname: hostname(),
+    created_at: new Date().toISOString(),
+    padding: "x".repeat(1024 * 1024),
+  }));
+  let entered = 0;
+  let firstEntered;
+  let secondEntered;
+  let release;
+  const firstEntry = new Promise((resolve) => { firstEntered = resolve; });
+  const secondEntry = new Promise((resolve) => { secondEntered = resolve; });
+  const held = new Promise((resolve) => { release = resolve; });
+  const contend = () => ProjectStore.open(root).withLock(".agent-team/lifecycle.lock", async () => {
+    entered += 1;
+    if (entered === 1) firstEntered();
+    if (entered === 2) secondEntered();
+    await held;
+  });
+  const attempts = [contend(), contend()];
+  const settlements = attempts.map((attempt) => attempt.then(() => "settled", () => "settled"));
+  await firstEntry;
+  const firstOutcome = await Promise.race([
+    ...settlements,
+    secondEntry.then(() => "second-entered"),
+  ]);
+  assert.equal(firstOutcome, "settled");
+  assert.equal(entered, 1);
+  release();
+  const results = await Promise.allSettled(attempts);
+  assert.equal(results.filter(({ status }) => status === "fulfilled").length, 1);
+  assert.equal(results.filter(({ status }) => status === "rejected").length, 1);
+  assert.match(String(results.find(({ status }) => status === "rejected")?.reason), /STATE_LOCKED/);
+});
+
+test("does not reclaim while another caller owns the recovery guard", async (t) => {
+  const root = await projectWithState(t);
+  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"]);
+  child.kill();
+  await once(child, "exit");
+  const lockPath = join(root, ".agent-team/lifecycle.lock");
+  await writeFile(lockPath, JSON.stringify({
+    pid: child.pid,
+    hostname: hostname(),
+    created_at: new Date().toISOString(),
+  }));
+  const recovery = await open(`${lockPath}.recovery`, "wx");
+  try {
+    await assert.rejects(
+      () => ProjectStore.open(root).withLock(".agent-team/lifecycle.lock", async () => {}),
+      /STATE_LOCKED/,
+    );
+  } finally {
+    await recovery.close();
+    await rm(`${lockPath}.recovery`, { force: true });
+  }
 });
 
 test("appends a redacted audit event only once per id", async (t) => {
