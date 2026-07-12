@@ -316,6 +316,14 @@ export const AuditEventSchema = z.object({
   artifact_versions: z.record(z.string().min(1), z.number().int().positive()),
   result: z.enum(["success", "failure"]),
   timestamp: z.string().datetime(),
+}).superRefine((event, context) => {
+  if (event.actor.type === "agent" && event.agent_id !== event.actor.identifier) {
+    context.addIssue({
+      code: "custom",
+      message: "Agent audit events must bind agent_id to the actor identifier",
+      path: ["agent_id"],
+    });
+  }
 });
 
 export type ProjectMode = z.infer<typeof ProjectModeSchema>;

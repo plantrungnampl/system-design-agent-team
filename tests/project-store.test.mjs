@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { once } from "node:events";
 import { access, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { hostname, tmpdir } from "node:os";
@@ -318,8 +319,8 @@ for (const [fault, expected] of [
     });
 
     await assert.rejects(() => interrupted.transaction("OP-TRANSACTION", [
-      { path: ".agent-team/evidence.yaml", content: "value: new\n" },
-      { path: ".agent-team/state.yaml", content: "value: new\n" },
+      { path: ".agent-team/evidence.yaml", content: "value: new\n", role: "evidence" },
+      { path: ".agent-team/state.yaml", content: "value: new\n", role: "state" },
     ], auditEvent("OP-TRANSACTION")), new RegExp(`INTERRUPTED_${fault}`));
 
     const store = ProjectStore.open(root);
@@ -351,4 +352,94 @@ test("transaction replay is idempotent", async (t) => {
   const events = (await readFile(join(root, ".agent-team/audit/events.jsonl"), "utf8"))
     .trim().split("\n").map(JSON.parse);
   assert.deepEqual(events, [event]);
+});
+
+test("completed operation ids are bound to the original payload", async (t) => {
+  const root = await temporaryDirectory(t, "project-store-receipt-");
+  const store = ProjectStore.open(root);
+  await store.transaction("OP-RECEIPT", [{ path: ".agent-team/value", content: "one" }], auditEvent("OP-RECEIPT"));
+
+  await assert.rejects(
+    () => store.transaction("OP-RECEIPT", [{ path: ".agent-team/value", content: "two" }], auditEvent("OP-RECEIPT")),
+    /OPERATION_ID_CONFLICT/,
+  );
+  assert.equal(await readFile(join(root, ".agent-team/value"), "utf8"), "one");
+  assert.equal((await readdir(join(root, ".agent-team/transactions/completed"))).length, 1);
+});
+
+test("a pending journal blocks ordinary mutations until repair", async (t) => {
+  const root = await temporaryDirectory(t, "project-store-pending-");
+  const interrupted = ProjectStore.open(root, {
+    transactionFault: (point) => { if (point === "after_evidence_write") throw new Error("INTERRUPTED"); },
+  });
+  await assert.rejects(
+    () => interrupted.transaction("OP-PENDING", [
+      { path: ".agent-team/evidence", content: "evidence", role: "evidence" },
+      { path: ".agent-team/workflow-state.yaml", content: workflowStateYaml, role: "state" },
+    ], auditEvent("OP-PENDING")),
+    /INTERRUPTED/,
+  );
+
+  const store = ProjectStore.open(root);
+  await assert.rejects(() => store.writeTextAtomic("ordinary", "newer"), /PENDING_TRANSACTIONS/);
+  await assert.rejects(() => store.transaction("OP-OTHER", [], auditEvent("OP-OTHER")), /PENDING_TRANSACTIONS/);
+  await store.repairTransactions();
+  await store.writeTextAtomic("ordinary", "allowed");
+});
+
+test("repair rejects malformed, misnamed, and unbound journals", async (t) => {
+  const root = await temporaryDirectory(t, "project-store-invalid-journal-");
+  const directory = join(root, ".agent-team/transactions");
+  await mkdir(directory, { recursive: true });
+  const write = async (name, value) => {
+    await writeFile(join(directory, name), JSON.stringify(value));
+    await assert.rejects(() => ProjectStore.open(root).repairTransactions(), /TRANSACTION_JOURNAL_INVALID/);
+    await rm(join(directory, name));
+  };
+
+  await write("wrong.json", { operationId: "OP", writes: [], auditEvent: auditEvent("OP") });
+  const operationId = "OP-SHAPE";
+  const name = `${createHash("sha256").update(operationId).digest("hex")}.json`;
+  await write(name, { operationId, writes: [{ path: "../escape", content: "x", role: "evidence" }], auditEvent: auditEvent(operationId) });
+  await write(name, { operationId, writes: [], auditEvent: auditEvent("OTHER") });
+});
+
+test("repair does not overwrite work newer than the journal", async (t) => {
+  const root = await temporaryDirectory(t, "project-store-newer-");
+  const interrupted = ProjectStore.open(root, {
+    transactionFault: (point) => { if (point === "before_audit_append") throw new Error("INTERRUPTED"); },
+  });
+  await writeFile(join(root, "value"), "old");
+  await assert.rejects(
+    () => interrupted.transaction("OP-NEWER", [{ path: "value", content: "transaction", role: "evidence" }], auditEvent("OP-NEWER")),
+    /INTERRUPTED/,
+  );
+  await writeFile(join(root, "value"), "newer");
+
+  await assert.rejects(() => ProjectStore.open(root).repairTransactions(), /TRANSACTION_WRITE_CONFLICT/);
+  assert.equal(await readFile(join(root, "value"), "utf8"), "newer");
+});
+
+test("fault hooks follow semantic write roles instead of array positions", async (t) => {
+  const root = await temporaryDirectory(t, "project-store-roles-");
+  const points = [];
+  const store = ProjectStore.open(root, { transactionFault: (point) => points.push(point) });
+  await store.transaction("OP-ROLES", [
+    { path: ".agent-team/workflow-state.yaml", content: workflowStateYaml, role: "state" },
+    { path: ".agent-team/reviews.yaml", content: "reviews: []\n", role: "evidence" },
+  ], auditEvent("OP-ROLES"));
+  assert.deepEqual(points, ["before_journal_commit", "after_state_write", "after_evidence_write", "before_audit_append"]);
+});
+
+test("agent audit identity must match the actor and transaction operation", async (t) => {
+  assert.throws(() => AuditEventSchema.parse({ ...auditEvent("OP-AGENT"), agent_id: "other" }), /agent/i);
+  const root = await temporaryDirectory(t, "project-store-audit-bind-");
+  await assert.rejects(
+    () => ProjectStore.open(root).transaction(
+      "OP-TRANSACTION",
+      [],
+      auditEvent("OTHER"),
+    ),
+    /AUDIT_ID_MISMATCH/,
+  );
 });

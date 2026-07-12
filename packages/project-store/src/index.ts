@@ -25,11 +25,15 @@ import { parse, stringify } from "yaml";
 type Schema<T> = { parse(value: unknown): T };
 type ProjectStoreErrorCode =
   | "LOCK_PATH_NOT_GENERATED"
+  | "OPERATION_ID_CONFLICT"
   | "PATH_OUTSIDE_PROJECT"
+  | "PENDING_TRANSACTIONS"
   | "QUIESCENCE_CONFIRMATION_REQUIRED"
   | "STATE_LOCKED"
   | "STATE_VERSION_CONFLICT"
-  | "STATE_VERSION_INVALID";
+  | "STATE_VERSION_INVALID"
+  | "TRANSACTION_JOURNAL_INVALID"
+  | "TRANSACTION_WRITE_CONFLICT";
 
 export class ProjectStoreError extends Error {
   constructor(readonly code: ProjectStoreErrorCode) {
@@ -41,6 +45,7 @@ export class ProjectStoreError extends Error {
 export const GENERATED_LOCK_PATHS = [
   ".system-design-team-init.lock",
   ".agent-team/lifecycle.lock",
+  ".agent-team/transactions.lock",
   ".agent-team/workflow-state.lock",
   ".agent-team/audit/events.lock",
 ] as const;
@@ -53,6 +58,7 @@ export interface LockInspection {
 export interface TransactionWrite {
   path: string;
   content: string;
+  role?: "evidence" | "state";
 }
 
 export type TransactionFaultPoint =
@@ -62,9 +68,21 @@ export type TransactionFaultPoint =
   | "before_audit_append";
 
 interface TransactionJournal {
+  version: 1;
   operationId: string;
-  writes: TransactionWrite[];
+  writes: Array<Required<TransactionWrite> & { beforeDigest: string | null }>;
   auditEvent: AuditEvent;
+}
+
+interface TransactionReceipt {
+  operationId: string;
+  digest: string;
+}
+
+const transactionLock = ".agent-team/transactions.lock";
+
+function digest(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
 }
 
 function inside(root: string, target: string): boolean {
@@ -161,18 +179,110 @@ export class ProjectStore {
   }
 
   private journalPath(operationId: string): string {
-    const name = createHash("sha256").update(operationId).digest("hex");
-    return `.agent-team/transactions/${name}.json`;
+    return `.agent-team/transactions/${digest(operationId)}.json`;
+  }
+
+  private receiptPath(operationId: string): string {
+    return `.agent-team/transactions/completed/${digest(operationId)}.json`;
+  }
+
+  private journalDigest(journal: TransactionJournal): string {
+    const { timestamp: _timestamp, ...auditEvent } = journal.auditEvent;
+    return digest(JSON.stringify({
+      operationId: journal.operationId,
+      writes: journal.writes.map(({ path, content, role }) => ({ path, content, role })),
+      auditEvent,
+    }));
+  }
+
+  private async fileDigest(relativePath: string): Promise<string | null> {
+    const target = targetPath(this.root, relativePath);
+    try {
+      requireInside(await realpath(this.root), await realpath(target));
+      return digest(await readFile(target, "utf8"));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw error;
+    }
+  }
+
+  private async pendingTransactionFiles(): Promise<string[]> {
+    const directory = targetPath(this.root, ".agent-team/transactions");
+    try {
+      requireInside(await realpath(this.root), await realpath(directory));
+      return (await readdir(directory)).filter((name) => name.endsWith(".json")).sort();
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+      throw error;
+    }
+  }
+
+  private async assertNoPendingTransactions(): Promise<void> {
+    if ((await this.pendingTransactionFiles()).length > 0) {
+      throw new ProjectStoreError("PENDING_TRANSACTIONS");
+    }
+  }
+
+  private validateJournal(value: unknown, file: string): TransactionJournal {
+    try {
+      if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error();
+      const raw = value as Record<string, unknown>;
+      if (raw.version !== 1 || typeof raw.operationId !== "string" || raw.operationId.length === 0
+        || !Array.isArray(raw.writes) || !raw.auditEvent || typeof raw.auditEvent !== "object"
+        || file !== `${digest(raw.operationId)}.json`) throw new Error();
+      const auditEvent = AuditEventSchema.parse(raw.auditEvent);
+      if (auditEvent.id !== raw.operationId) throw new Error();
+      const seen = new Set<string>();
+      const writes = raw.writes.map((value) => {
+        if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error();
+        const write = value as Record<string, unknown>;
+        if (typeof write.path !== "string" || typeof write.content !== "string"
+          || (write.role !== "evidence" && write.role !== "state")
+          || (write.beforeDigest !== null
+            && (typeof write.beforeDigest !== "string" || !/^[a-f0-9]{64}$/.test(write.beforeDigest)))) throw new Error();
+        targetPath(this.root, write.path);
+        if (seen.has(write.path)) throw new Error();
+        seen.add(write.path);
+        return {
+          path: write.path,
+          content: write.content,
+          role: write.role,
+          beforeDigest: write.beforeDigest,
+        } as Required<TransactionWrite> & { beforeDigest: string | null };
+      });
+      return { version: 1, operationId: raw.operationId, writes, auditEvent };
+    } catch {
+      throw new ProjectStoreError("TRANSACTION_JOURNAL_INVALID");
+    }
+  }
+
+  private async readReceipt(operationId: string): Promise<TransactionReceipt | undefined> {
+    try {
+      const value = JSON.parse(await readFile(targetPath(this.root, this.receiptPath(operationId)), "utf8")) as TransactionReceipt;
+      if (value.operationId !== operationId || !/^[a-f0-9]{64}$/.test(value.digest)) throw new Error();
+      return value;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+      throw new ProjectStoreError("TRANSACTION_JOURNAL_INVALID");
+    }
   }
 
   private async applyJournal(journal: TransactionJournal): Promise<void> {
-    for (const [index, write] of journal.writes.entries()) {
-      await this.writeTextAtomic(write.path, write.content);
-      if (index === 0) this.transactionFault?.("after_evidence_write");
-      if (index === 1) this.transactionFault?.("after_state_write");
+    const currentDigests = await Promise.all(journal.writes.map(({ path }) => this.fileDigest(path)));
+    journal.writes.forEach((write, index) => {
+      const current = currentDigests[index];
+      if (current !== write.beforeDigest && current !== digest(write.content)) {
+        throw new ProjectStoreError("TRANSACTION_WRITE_CONFLICT");
+      }
+    });
+    for (const write of journal.writes) {
+      const current = await this.fileDigest(write.path);
+      const intended = digest(write.content);
+      if (current !== intended) await atomicWrite(this.root, targetPath(this.root, write.path), write.content);
+      this.transactionFault?.(write.role === "state" ? "after_state_write" : "after_evidence_write");
     }
     this.transactionFault?.("before_audit_append");
-    await this.appendAuditOnce(journal.auditEvent);
+    await this.appendAuditOnceUnlocked(journal.auditEvent);
   }
 
   async transaction(
@@ -181,56 +291,74 @@ export class ProjectStore {
     auditEvent: AuditEvent,
   ): Promise<void> {
     if (!operationId) throw new Error("OPERATION_ID_REQUIRED");
-    const journal: TransactionJournal = {
-      operationId,
-      writes: writes.map(({ path, content }) => ({ path, content })),
-      auditEvent: AuditEventSchema.parse(auditEvent),
-    };
-    const relativeJournal = this.journalPath(operationId);
-    this.transactionFault?.("before_journal_commit");
-    await this.writeTextAtomic(relativeJournal, JSON.stringify(journal));
-    await this.applyJournal(journal);
-    await rm(targetPath(this.root, relativeJournal));
+    await this.withLock(transactionLock, async () => {
+      await this.assertNoPendingTransactions();
+      const validatedAudit = AuditEventSchema.parse(auditEvent);
+      if (validatedAudit.id !== operationId) throw new Error("AUDIT_ID_MISMATCH");
+      const transactionWrites = await Promise.all(writes.map(async ({ path, content, role }) => ({
+        path,
+        content,
+        role: role ?? (path === ".agent-team/workflow-state.yaml" ? "state" as const : "evidence" as const),
+        beforeDigest: await this.fileDigest(path),
+      })));
+      const journal: TransactionJournal = {
+        version: 1,
+        operationId,
+        writes: transactionWrites,
+        auditEvent: validatedAudit,
+      };
+      const journalDigest = this.journalDigest(journal);
+      const receipt = await this.readReceipt(operationId);
+      if (receipt) {
+        if (receipt.digest !== journalDigest) throw new ProjectStoreError("OPERATION_ID_CONFLICT");
+        return;
+      }
+      const relativeJournal = this.journalPath(operationId);
+      this.transactionFault?.("before_journal_commit");
+      await atomicWrite(this.root, targetPath(this.root, relativeJournal), JSON.stringify(journal));
+      await this.applyJournal(journal);
+      await atomicWrite(this.root, targetPath(this.root, this.receiptPath(operationId)), JSON.stringify({
+        operationId,
+        digest: journalDigest,
+      } satisfies TransactionReceipt));
+      await rm(targetPath(this.root, relativeJournal));
+    });
   }
 
   async inspectTransactions(): Promise<string[]> {
-    const directory = targetPath(this.root, ".agent-team/transactions");
-    let files: string[];
-    try {
-      requireInside(await realpath(this.root), await realpath(directory));
-      files = await readdir(directory);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
-      throw error;
-    }
     const operations: string[] = [];
-    for (const file of files.filter((name) => name.endsWith(".json")).sort()) {
-      const raw = JSON.parse(await readFile(targetPath(this.root, `.agent-team/transactions/${file}`), "utf8")) as TransactionJournal;
-      operations.push(raw.operationId);
+    for (const file of await this.pendingTransactionFiles()) {
+      const raw = JSON.parse(await readFile(targetPath(this.root, `.agent-team/transactions/${file}`), "utf8"));
+      operations.push(this.validateJournal(raw, file).operationId);
     }
     return operations;
   }
 
   async repairTransactions(): Promise<string[]> {
-    const directory = targetPath(this.root, ".agent-team/transactions");
-    let files: string[];
-    try {
-      requireInside(await realpath(this.root), await realpath(directory));
-      files = await readdir(directory);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
-      throw error;
-    }
-    const repaired: string[] = [];
-    for (const file of files.filter((name) => name.endsWith(".json")).sort()) {
-      const path = `.agent-team/transactions/${file}`;
-      const raw = JSON.parse(await readFile(targetPath(this.root, path), "utf8")) as TransactionJournal;
-      const journal = { ...raw, auditEvent: AuditEventSchema.parse(raw.auditEvent) };
-      await this.applyJournal(journal);
-      await rm(targetPath(this.root, path));
-      repaired.push(journal.operationId);
-    }
-    return repaired;
+    return this.withLock(transactionLock, async () => {
+      const repaired: string[] = [];
+      for (const file of await this.pendingTransactionFiles()) {
+        const path = `.agent-team/transactions/${file}`;
+        let raw: unknown;
+        try {
+          raw = JSON.parse(await readFile(targetPath(this.root, path), "utf8"));
+        } catch {
+          throw new ProjectStoreError("TRANSACTION_JOURNAL_INVALID");
+        }
+        const journal = this.validateJournal(raw, file);
+        const journalDigest = this.journalDigest(journal);
+        const receipt = await this.readReceipt(journal.operationId);
+        if (receipt && receipt.digest !== journalDigest) throw new ProjectStoreError("OPERATION_ID_CONFLICT");
+        await this.applyJournal(journal);
+        if (!receipt) await atomicWrite(this.root, targetPath(this.root, this.receiptPath(journal.operationId)), JSON.stringify({
+          operationId: journal.operationId,
+          digest: journalDigest,
+        } satisfies TransactionReceipt));
+        await rm(targetPath(this.root, path));
+        repaired.push(journal.operationId);
+      }
+      return repaired;
+    });
   }
 
   async readYaml<T>(relativePath: string, schema: Schema<T>): Promise<T> {
@@ -240,13 +368,17 @@ export class ProjectStore {
   }
 
   async writeYamlAtomic(relativePath: string, value: unknown): Promise<void> {
-    const target = targetPath(this.root, relativePath);
-    await atomicWrite(this.root, target, stringify(value));
+    await this.withLock(transactionLock, async () => {
+      await this.assertNoPendingTransactions();
+      await atomicWrite(this.root, targetPath(this.root, relativePath), stringify(value));
+    });
   }
 
   async writeTextAtomic(relativePath: string, content: string): Promise<void> {
-    const target = targetPath(this.root, relativePath);
-    await atomicWrite(this.root, target, content);
+    await this.withLock(transactionLock, async () => {
+      await this.assertNoPendingTransactions();
+      await atomicWrite(this.root, targetPath(this.root, relativePath), content);
+    });
   }
 
   async withLock<T>(relativeLockPath: string, callback: () => Promise<T> | T): Promise<T> {
@@ -323,7 +455,9 @@ export class ProjectStore {
     expectedVersion: number,
     reducer: (state: WorkflowState) => WorkflowState,
   ): Promise<WorkflowState> {
-    return this.withLock(".agent-team/workflow-state.lock", async () => {
+    return this.withLock(transactionLock, async () => {
+      await this.assertNoPendingTransactions();
+      return this.withLock(".agent-team/workflow-state.lock", async () => {
       const current = await this.readWorkflowState();
       if (current.state_version !== expectedVersion) {
         throw new ProjectStoreError("STATE_VERSION_CONFLICT");
@@ -336,12 +470,17 @@ export class ProjectStore {
       }
 
       const validated = WorkflowStateSchema.parse(next);
-      await this.writeYamlAtomic(".agent-team/workflow-state.yaml", validated);
+      await atomicWrite(
+        this.root,
+        targetPath(this.root, ".agent-team/workflow-state.yaml"),
+        stringify(validated),
+      );
       return validated;
+      });
     });
   }
 
-  async appendAudit(event: Record<string, unknown>): Promise<void> {
+  private async appendAuditUnlocked(event: Record<string, unknown>): Promise<void> {
     const target = targetPath(this.root, ".agent-team/audit/events.jsonl");
     const realRoot = await prepareParent(this.root, target);
     let exists = true;
@@ -363,7 +502,14 @@ export class ProjectStore {
     await appendFile(target, `${JSON.stringify(redact(event))}\n`, "utf8");
   }
 
-  async appendAuditOnce(event: Record<string, unknown> & { id: string }): Promise<void> {
+  async appendAudit(event: Record<string, unknown>): Promise<void> {
+    await this.withLock(transactionLock, async () => {
+      await this.assertNoPendingTransactions();
+      await this.appendAuditUnlocked(event);
+    });
+  }
+
+  private async appendAuditOnceUnlocked(event: Record<string, unknown> & { id: string }): Promise<void> {
     if (!event.id) throw new Error("AUDIT_ID_REQUIRED");
     await this.withLock(".agent-team/audit/events.lock", async () => {
       const target = targetPath(this.root, ".agent-team/audit/events.jsonl");
@@ -376,7 +522,14 @@ export class ProjectStore {
       }
       const exists = text.split(/\r?\n/).filter(Boolean)
         .some((line) => (JSON.parse(line) as { id?: unknown }).id === event.id);
-      if (!exists) await this.appendAudit(event);
+      if (!exists) await this.appendAuditUnlocked(event);
+    });
+  }
+
+  async appendAuditOnce(event: Record<string, unknown> & { id: string }): Promise<void> {
+    await this.withLock(transactionLock, async () => {
+      await this.assertNoPendingTransactions();
+      await this.appendAuditOnceUnlocked(event);
     });
   }
 }
