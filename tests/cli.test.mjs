@@ -325,6 +325,41 @@ test("change creation stales direct and downstream artifacts and invalidates the
   );
 });
 
+test("required reapproval reopens its approved phase without staling unrelated artifacts", async () => {
+  const root = await temporaryGitRepository();
+  await initProject(root, {
+    id: "leave-system",
+    name: "Leave System",
+    mode: "greenfield",
+    profile: "standard",
+  });
+  const store = ProjectStore.open(root);
+  const state = await store.readWorkflowState();
+  state.phases.intake = { status: "approved", approval_id: "APR-G0" };
+  await store.writeYamlAtomic(".agent-team/workflow-state.yaml", state);
+  await store.writeYamlAtomic(".agent-team/approvals.yaml", { approvals: [{
+    id: "APR-G0", gate: "G0", decision: "approved",
+    approved_by: { type: "human", identifier: "project-owner" },
+    artifact_versions: { "PROJECT-CHARTER": 1 }, timestamp: "2026-07-12T00:00:00Z",
+  }] });
+
+  await createChange(root, {
+    id: "CR-REAPPROVE",
+    requested_by: "product-owner",
+    affected_artifacts: ["POST-RELEASE-REVIEW"],
+    reason: "Reapprove the charter without changing it.",
+    impact: { scope: "low", architecture: "low", security: "low", schedule: "low" },
+    required_reapprovals: ["G0"],
+  }, "CHANGE-REAPPROVE");
+
+  const next = await store.readWorkflowState();
+  assert.equal(next.phases.intake.status, "revision_required");
+  assert.equal(next.phases.intake.approval_id, undefined);
+  const staleIds = new Set((await staleList(root)).map(({ id }) => id));
+  assert.equal(staleIds.has("POST-RELEASE-REVIEW"), true);
+  assert.equal(staleIds.has("PROJECT-CHARTER"), false);
+});
+
 test("checksum drift blocks review, approval, handover, and dependent dispatch", async () => {
   const root = await temporaryGitRepository();
   await initProject(root, {

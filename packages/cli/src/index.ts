@@ -564,15 +564,24 @@ export async function createChange(
     const stalePhases = new Set(workflow.phases
       .filter(({ artifact }) => staleIds.has(artifact.id))
       .map(({ id }) => id));
+    const invalidatedApprovalIds = new Set(approvals.approvals
+      .filter((approval) => (Object.keys(approval.artifact_versions).some((id) => staleIds.has(id))
+        || change.required_reapprovals.includes(approval.gate))
+        && (approval.decision === "approved" || approval.decision === "approved_with_conditions"))
+      .map(({ id }) => id));
+    const reopenedPhases = new Set([
+      ...stalePhases,
+      ...workflow.phases
+        .filter(({ id }) => invalidatedApprovalIds.has(state.phases[id]?.approval_id ?? ""))
+        .map(({ id }) => id),
+    ]);
     const nextRegistry = ArtifactRegistrySchema.parse({
       artifacts: registry.artifacts.map((artifact) =>
         staleIds.has(artifact.id) ? { ...artifact, status: "stale" } : artifact),
     });
     const nextApprovals = ApprovalListSchema.parse({
       approvals: approvals.approvals.map((approval) =>
-        (Object.keys(approval.artifact_versions).some((id) => staleIds.has(id))
-          || change.required_reapprovals.includes(approval.gate))
-          && (approval.decision === "approved" || approval.decision === "approved_with_conditions")
+        invalidatedApprovalIds.has(approval.id)
           ? { ...approval, decision: "revoked" }
           : approval),
     });
@@ -589,10 +598,10 @@ export async function createChange(
     await store.updateWorkflowState(state.state_version, (current) => ({
       ...current,
       state_version: current.state_version + 1,
-      current_phase: workflow.phases.find(({ id }) => stalePhases.has(id))?.id ?? current.current_phase,
+      current_phase: workflow.phases.find(({ id }) => reopenedPhases.has(id))?.id ?? current.current_phase,
       completed_operations: [...current.completed_operations, scopedOperation],
       phases: Object.fromEntries(Object.entries(current.phases).map(([id, phaseState]) => {
-        if (!stalePhases.has(id)) return [id, phaseState];
+        if (!reopenedPhases.has(id)) return [id, phaseState];
         const {
           review_id: _reviewId,
           approval_id: _approvalId,
