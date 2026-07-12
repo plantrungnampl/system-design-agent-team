@@ -2,13 +2,19 @@
 
 import process from "node:process";
 import { parseArgs } from "node:util";
-import { GateIdSchema, ProjectModeSchema, ProjectProfileSchema } from "@system-design-team/core";
+import {
+  GateIdSchema,
+  ProjectModeSchema,
+  ProjectProfileSchema,
+  ReviewVerdictSchema,
+} from "@system-design-team/core";
 import {
   approve,
   doctor,
   getStatus,
   handover,
   initProject,
+  reviewPhase,
   startPhase,
   validatePhase,
 } from "./index.js";
@@ -16,17 +22,45 @@ import {
 const usage = `Usage: system-design-team <command> [options]
 
 Commands:
-  init       Initialize project state
-  status     Show project state
-  start      Start a phase
-  approve    Approve a gate
-  handover   Hand over an approved phase
-  validate   Validate phase artifacts
-  doctor     Check project prerequisites`;
+  init --id <id> --name <name> --mode <mode> --profile <profile>
+  status
+  start <phase> --operation-id <id>
+  validate <phase> --operation-id <id>
+  review <phase> --reviewer <id> --verdict <approved|revision_required> --operation-id <id>
+  approve <gate> --by <id> --operation-id <id>
+  handover <phase> --operation-id <id>
+  doctor`;
+
+const commandShape: Record<string, { positionals: number; options: string[] }> = {
+  init: { positionals: 1, options: ["id", "name", "mode", "profile"] },
+  status: { positionals: 1, options: [] },
+  start: { positionals: 2, options: ["operation-id"] },
+  validate: { positionals: 2, options: ["operation-id"] },
+  review: { positionals: 2, options: ["reviewer", "verdict", "operation-id"] },
+  approve: { positionals: 2, options: ["by", "operation-id"] },
+  handover: { positionals: 2, options: ["operation-id"] },
+  doctor: { positionals: 1, options: [] },
+};
 
 function required(value: string | undefined, option: string): string {
   if (!value) throw new Error(`${option} is required`);
   return value;
+}
+
+function validateInvocation(
+  command: string,
+  positionals: string[],
+  values: Record<string, string | boolean | undefined>,
+): void {
+  const shape = commandShape[command];
+  if (!shape) throw new Error(`Unknown command: ${command}`);
+  if (positionals.length !== shape.positionals) {
+    throw new Error(`Unexpected positional arguments for ${command}`);
+  }
+  for (const [option, value] of Object.entries(values)) {
+    if (option === "help" || value === undefined || value === false) continue;
+    if (!shape.options.includes(option)) throw new Error(`Option --${option} is not valid for ${command}`);
+  }
 }
 
 async function main(): Promise<void> {
@@ -41,11 +75,18 @@ async function main(): Promise<void> {
       mode: { type: "string" },
       profile: { type: "string" },
       by: { type: "string" },
+      reviewer: { type: "string" },
+      verdict: { type: "string" },
       "operation-id": { type: "string" },
     },
   });
   const command = positionals[0];
-  if (values.help || !command) {
+  if (!command) {
+    console.log(usage);
+    return;
+  }
+  validateInvocation(command, positionals, values);
+  if (values.help) {
     console.log(usage);
     return;
   }
@@ -79,6 +120,15 @@ async function main(): Promise<void> {
         required(values["operation-id"], "--operation-id"),
       );
       break;
+    case "review":
+      result = await reviewPhase(
+        root,
+        required(positionals[1], "phase"),
+        required(values.reviewer, "--reviewer"),
+        ReviewVerdictSchema.parse(required(values.verdict, "--verdict")),
+        required(values["operation-id"], "--operation-id"),
+      );
+      break;
     case "handover":
       result = await handover(
         root,
@@ -100,6 +150,11 @@ async function main(): Promise<void> {
       throw new Error(`Unknown command: ${command}`);
   }
   console.log(JSON.stringify(result, null, 2));
+  const outcome = result as { ok?: boolean; valid?: boolean };
+  if ((command === "doctor" && outcome.ok === false)
+    || (command === "validate" && outcome.valid === false)) {
+    process.exitCode = 1;
+  }
 }
 
 main().catch((error: unknown) => {

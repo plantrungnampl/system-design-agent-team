@@ -48,12 +48,38 @@ test("validates persisted CLI wrapper records", () => {
     framework: { version: "0.1.0" },
     workflow: { id: "greenfield-standard", version: "1.0.0" },
   });
+  const handover = core.HandoverRecordSchema.parse({
+    id: '["handover","requirements","OP-1"]',
+    phase: "requirements",
+    from_agent: "business-analyst",
+    to_agent: "product-owner",
+    approved_inputs: ["REQUIREMENTS@1"],
+    expected_outputs: [],
+    acceptance_conditions: ["Use approved inputs."],
+  });
+  const reviews = core.ReviewListSchema.parse({
+    reviews: [{
+      id: '["review","requirements","OP-1"]',
+      phase: "requirements",
+      reviewer: "requirements-reviewer",
+      verdict: "approved",
+      artifact_versions: { REQUIREMENTS: 1 },
+      timestamp: "2026-07-11T00:00:00Z",
+    }],
+  });
 
   assert.equal(project.project.mode, "greenfield");
   assert.equal(plugins.plugins[0].status, "unknown");
   assert.deepEqual(approvals.approvals, []);
   assert.equal(registry.artifacts[0].version, 1);
   assert.equal(lock.framework.version, "0.1.0");
+  assert.equal(handover.id, '["handover","requirements","OP-1"]');
+  assert.equal(handover.phase, "requirements");
+  assert.equal(reviews.reviews[0].verdict, "approved");
+  assert.throws(() => core.ReviewRecordSchema.parse({
+    ...reviews.reviews[0],
+    verdict: "looks_good",
+  }));
   assert.throws(() => core.ArtifactRegistrySchema.parse({
     artifacts: [{ ...registry.artifacts[0], version: 0 }],
   }));

@@ -1,3 +1,5 @@
+id: handover-operation-id
+phase: source-phase
 from_agent: source-agent
 to_agent: destination-agent
 approved_inputs: []

@@ -174,7 +174,24 @@ export const ArtifactRegistrySchema = z.object({
   artifacts: z.array(ArtifactRecordSchema),
 });
 
+export const ReviewVerdictSchema = z.enum(["approved", "revision_required"]);
+
+export const ReviewRecordSchema = z.object({
+  id: z.string().min(1),
+  phase: z.string().min(1),
+  reviewer: z.string().min(1),
+  verdict: ReviewVerdictSchema,
+  artifact_versions: z.record(z.string().min(1), z.number().int().positive()),
+  timestamp: z.string().min(1),
+});
+
+export const ReviewListSchema = z.object({
+  reviews: z.array(ReviewRecordSchema),
+});
+
 export const HandoverRecordSchema = z.object({
+  id: z.string().min(1),
+  phase: z.string().min(1),
   from_agent: z.string().min(1),
   to_agent: z.string().min(1),
   approved_inputs: z.array(z.string()),
@@ -197,4 +214,7 @@ export type ApprovalRecord = z.infer<typeof ApprovalRecordSchema>;
 export type ApprovalList = z.infer<typeof ApprovalListSchema>;
 export type ArtifactRecord = z.infer<typeof ArtifactRecordSchema>;
 export type ArtifactRegistry = z.infer<typeof ArtifactRegistrySchema>;
+export type ReviewVerdict = z.infer<typeof ReviewVerdictSchema>;
+export type ReviewRecord = z.infer<typeof ReviewRecordSchema>;
+export type ReviewList = z.infer<typeof ReviewListSchema>;
 export type HandoverRecord = z.infer<typeof HandoverRecordSchema>;

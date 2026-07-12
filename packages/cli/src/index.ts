@@ -1,9 +1,9 @@
 import { execFile } from "node:child_process";
-import { access, mkdir, readFile, realpath, writeFile } from "node:fs/promises";
+import { lstat, readFile, realpath, rm } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-import { validateReviewReadyArtifact } from "@system-design-team/artifact-validator";
+import { parseArtifact, validateReviewReadyArtifact } from "@system-design-team/artifact-validator";
 import {
   AgentManifestSchema,
   ApprovalListSchema,
@@ -14,6 +14,9 @@ import {
   HandoverRecordSchema,
   PluginStatusListSchema,
   ProjectConfigSchema,
+  ReviewListSchema,
+  ReviewRecordSchema,
+  ReviewVerdictSchema,
   WorkflowDefinitionSchema,
   WorkflowStateSchema,
   type AgentManifest,
@@ -23,6 +26,7 @@ import {
   type ProjectConfig,
   type ProjectMode,
   type ProjectProfile,
+  type ReviewVerdict,
   type WorkflowDefinition,
   type WorkflowState,
 } from "@system-design-team/core";
@@ -48,10 +52,11 @@ const workflowFiles: Record<ProjectMode, string> = {
 
 async function exists(path: string): Promise<boolean> {
   try {
-    await access(path);
+    await lstat(path);
     return true;
-  } catch {
-    return false;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
   }
 }
 
@@ -65,14 +70,41 @@ async function readCatalogue(): Promise<AgentManifest[]> {
   return AgentManifestSchema.array().parse(parse(text));
 }
 
+async function removeNewAgentTeam(projectRoot: string): Promise<void> {
+  const target = join(projectRoot, ".agent-team");
+  let entry;
+  try {
+    entry = await lstat(target);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
+  if (!entry.isDirectory() || entry.isSymbolicLink()) return;
+  const [realRoot, realTarget] = await Promise.all([realpath(projectRoot), realpath(target)]);
+  if (inside(realRoot, realTarget)) await rm(target, { recursive: true });
+}
+
+async function readBootstrapAssets(mode: ProjectMode) {
+  const [workflowText, catalogueText, charter, requirements, handover] = await Promise.all([
+    readFile(join(assetsRoot, "workflows", workflowFiles[mode]), "utf8"),
+    readFile(join(assetsRoot, "agents/catalogue.yaml"), "utf8"),
+    readFile(join(assetsRoot, "templates/project-charter.md"), "utf8"),
+    readFile(join(assetsRoot, "templates/requirements.md"), "utf8"),
+    readFile(join(assetsRoot, "templates/handover.yaml"), "utf8"),
+  ]);
+  const workflow = WorkflowDefinitionSchema.parse(parse(workflowText));
+  const catalogue = AgentManifestSchema.array().parse(parse(catalogueText));
+  parseArtifact(charter);
+  parseArtifact(requirements);
+  HandoverRecordSchema.parse(parse(handover));
+  return { workflow, catalogue, charter, requirements };
+}
+
 export async function initProject(root: string, options: InitOptions): Promise<ProjectConfig> {
   const projectRoot = resolve(root);
-  if (await exists(join(projectRoot, ".agent-team/project.yaml"))) {
-    throw new Error("ALREADY_INITIALIZED");
-  }
+  if (await exists(join(projectRoot, ".agent-team"))) throw new Error("ALREADY_INITIALIZED");
 
-  const workflow = await readWorkflow(options.mode);
-  const catalogue = await readCatalogue();
+  const { workflow, catalogue, charter, requirements } = await readBootstrapAssets(options.mode);
   const project = ProjectConfigSchema.parse({
     schema_version: 1,
     project: options,
@@ -96,6 +128,7 @@ export async function initProject(root: string, options: InitOptions): Promise<P
     ))].sort().map((uri) => ({ uri, status: "unknown", skills: [] })),
   });
   const approvals = ApprovalListSchema.parse({ approvals: [] });
+  const reviews = ReviewListSchema.parse({ reviews: [] });
   const registry = ArtifactRegistrySchema.parse({
     artifacts: [
       {
@@ -122,30 +155,32 @@ export async function initProject(root: string, options: InitOptions): Promise<P
     framework: { version: FRAMEWORK_VERSION },
     workflow: project.workflow,
   });
-
-  for (const directory of ["context", "requirements", "product", "handovers"]) {
-    await mkdir(join(projectRoot, ".agent-team", directory), { recursive: true });
-  }
-  await mkdir(join(projectRoot, ".codex/generated"), { recursive: true });
-
   const store = ProjectStore.open(projectRoot);
-  await store.writeYamlAtomic(".agent-team/project.yaml", project);
-  await store.writeYamlAtomic(".agent-team/workflow-state.yaml", state);
-  await store.writeYamlAtomic(".agent-team/plugin-status.yaml", plugins);
-  await store.writeYamlAtomic(".agent-team/approvals.yaml", approvals);
-  await store.writeYamlAtomic(".agent-team/artifact-registry.yaml", registry);
-  await store.writeYamlAtomic(".agent-team/framework-lock.yaml", lock);
-  await writeFile(
-    join(projectRoot, ".agent-team/context/project-charter.md"),
-    await readFile(join(assetsRoot, "templates/project-charter.md")),
-    { flag: "wx" },
-  );
-  await writeFile(
-    join(projectRoot, ".agent-team/requirements/requirements.md"),
-    await readFile(join(assetsRoot, "templates/requirements.md")),
-    { flag: "wx" },
-  );
-  return project;
+  const codexKeep = join(projectRoot, ".codex/generated/.gitkeep");
+  const preserveCodexKeep = await exists(codexKeep);
+  if (preserveCodexKeep) {
+    const [realRoot, realKeep] = await Promise.all([realpath(projectRoot), realpath(codexKeep)]);
+    if (!inside(realRoot, realKeep)) throw new Error("PATH_OUTSIDE_PROJECT");
+  }
+
+  try {
+    await store.writeYamlAtomic(".agent-team/project.yaml", project);
+    await store.writeYamlAtomic(".agent-team/workflow-state.yaml", state);
+    await store.writeYamlAtomic(".agent-team/plugin-status.yaml", plugins);
+    await store.writeYamlAtomic(".agent-team/approvals.yaml", approvals);
+    await store.writeYamlAtomic(".agent-team/reviews.yaml", reviews);
+    await store.writeYamlAtomic(".agent-team/artifact-registry.yaml", registry);
+    await store.writeYamlAtomic(".agent-team/framework-lock.yaml", lock);
+    await store.writeTextAtomic(".agent-team/context/project-charter.md", charter);
+    await store.writeTextAtomic(".agent-team/requirements/requirements.md", requirements);
+    await store.writeTextAtomic(".agent-team/product/.gitkeep", "");
+    await store.writeTextAtomic(".agent-team/handovers/.gitkeep", "");
+    if (!preserveCodexKeep) await store.writeTextAtomic(".codex/generated/.gitkeep", "");
+    return project;
+  } catch (error) {
+    await removeNewAgentTeam(projectRoot);
+    throw error;
+  }
 }
 
 async function projectConfig(store: ProjectStore): Promise<ProjectConfig> {
@@ -173,6 +208,10 @@ function requireOperationId(operationId: string): void {
   if (!operationId.trim()) throw new Error("OPERATION_ID_REQUIRED");
 }
 
+function operationKey(action: string, target: string, operationId: string): string {
+  return JSON.stringify([action, target, operationId]);
+}
+
 export async function setPluginStatus(
   root: string,
   uri: string,
@@ -198,9 +237,10 @@ export async function startPhase(
   operationId: string,
 ): Promise<WorkflowState> {
   requireOperationId(operationId);
+  const scopedOperation = operationKey("start", phase, operationId);
   const store = ProjectStore.open(root);
   const state = await store.readWorkflowState();
-  if (state.completed_operations.includes(operationId)) return state;
+  if (state.completed_operations.includes(scopedOperation)) return state;
 
   const workflow = await configuredWorkflow(store);
   const definition = workflow.phases.find((candidate) => candidate.id === phase);
@@ -218,7 +258,7 @@ export async function startPhase(
   return store.updateWorkflowState(state.state_version, (current) => transitionPhase(
     current,
     workflow,
-    { phase, to: "in_progress", operation_id: operationId },
+    { phase, to: "in_progress", operation_id: scopedOperation },
   ));
 }
 
@@ -237,26 +277,39 @@ async function readArtifact(root: string, artifact: ArtifactRecord): Promise<str
   return readFile(target, "utf8");
 }
 
-export async function validatePhase(root: string, phase: string, operationId: string) {
-  requireOperationId(operationId);
-  const store = ProjectStore.open(root);
-  const state = await store.readWorkflowState();
-  if (state.completed_operations.includes(operationId)) {
-    return { valid: true, phase, findings: [], state };
-  }
-  const workflow = await configuredWorkflow(store);
-  const definition = workflow.phases.find((candidate) => candidate.id === phase);
-  if (!definition) throw new Error("PHASE_NOT_CONFIGURED");
-  const artifacts = (await artifactRegistry(store)).artifacts.filter(
-    (artifact) => artifact.owner === definition.owner && artifact.required_gate === definition.gate,
-  );
+const reviewReadyStatuses = new Set(["in_review", "approved", "approved_with_conditions"]);
+
+async function inspectArtifacts(root: string, artifacts: readonly ArtifactRecord[]) {
   const findings: { artifact_id?: string; code: string; message: string }[] = [];
-  if (artifacts.length === 0) {
-    findings.push({ code: "NO_REGISTERED_ARTIFACTS", message: `No artifacts registered for ${phase}` });
-  }
   for (const artifact of artifacts) {
+    if (!reviewReadyStatuses.has(artifact.status)) {
+      findings.push({
+        artifact_id: artifact.id,
+        code: "ARTIFACT_NOT_REVIEW_READY",
+        message: `${artifact.id} registry status is ${artifact.status}`,
+      });
+    }
     try {
-      const validation = validateReviewReadyArtifact(await readArtifact(root, artifact));
+      const text = await readArtifact(root, artifact);
+      const parsed = parseArtifact(text);
+      const status = String(parsed.metadata.status ?? "");
+      if (!reviewReadyStatuses.has(status)) {
+        findings.push({
+          artifact_id: artifact.id,
+          code: "ARTIFACT_NOT_REVIEW_READY",
+          message: `${artifact.id} front-matter status is ${status || "missing"}`,
+        });
+      }
+      if (parsed.metadata.artifact_id !== artifact.id
+        || Number(parsed.metadata.version) !== artifact.version
+        || status !== artifact.status) {
+        findings.push({
+          artifact_id: artifact.id,
+          code: "ARTIFACT_METADATA_MISMATCH",
+          message: `${artifact.id} front matter does not match its registry record`,
+        });
+      }
+      const validation = validateReviewReadyArtifact(text);
       findings.push(...validation.findings.map((finding) => ({
         artifact_id: artifact.id,
         ...finding,
@@ -269,12 +322,33 @@ export async function validatePhase(root: string, phase: string, operationId: st
       });
     }
   }
+  return findings;
+}
+
+export async function validatePhase(root: string, phase: string, operationId: string) {
+  requireOperationId(operationId);
+  const scopedOperation = operationKey("validate", phase, operationId);
+  const store = ProjectStore.open(root);
+  const state = await store.readWorkflowState();
+  if (state.completed_operations.includes(scopedOperation)) {
+    return { valid: true, phase, findings: [], state };
+  }
+  const workflow = await configuredWorkflow(store);
+  const definition = workflow.phases.find((candidate) => candidate.id === phase);
+  if (!definition) throw new Error("PHASE_NOT_CONFIGURED");
+  const artifacts = (await artifactRegistry(store)).artifacts.filter(
+    (artifact) => artifact.owner === definition.owner && artifact.required_gate === definition.gate,
+  );
+  const findings = await inspectArtifacts(root, artifacts);
+  if (artifacts.length === 0) {
+    findings.push({ code: "NO_REGISTERED_ARTIFACTS", message: `No artifacts registered for ${phase}` });
+  }
   if (findings.length > 0) return { valid: false, phase, findings, state };
 
   const next = await store.updateWorkflowState(state.state_version, (current) => transitionPhase(
     current,
     workflow,
-    { phase, to: "artifact_validation", operation_id: operationId },
+    { phase, to: "artifact_validation", operation_id: scopedOperation },
   ));
   return { valid: true, phase, findings, state: next };
 }
@@ -286,6 +360,104 @@ function artifactVersions(artifacts: readonly ArtifactRecord[]): Record<string, 
   );
 }
 
+export async function reviewPhase(
+  root: string,
+  phase: string,
+  reviewer: string,
+  verdictInput: ReviewVerdict,
+  operationId: string,
+): Promise<WorkflowState> {
+  requireOperationId(operationId);
+  const reviewerId = reviewer.trim();
+  const verdict = ReviewVerdictSchema.parse(verdictInput);
+  const evidenceId = operationKey("review", phase, operationId);
+  const underReviewId = operationKey("review-under-review", phase, operationId);
+  const verdictId = operationKey("review-verdict", phase, operationId);
+  const store = ProjectStore.open(root);
+  const [workflow, state, reviews, registry] = await Promise.all([
+    configuredWorkflow(store),
+    store.readWorkflowState(),
+    store.readYaml(".agent-team/reviews.yaml", ReviewListSchema),
+    artifactRegistry(store),
+  ]);
+  const definition = workflow.phases.find((candidate) => candidate.id === phase);
+  if (!definition) throw new Error("PHASE_NOT_CONFIGURED");
+  if (!reviewerId || reviewerId !== definition.reviewer || reviewerId === definition.owner) {
+    throw new Error("REVIEWER_NOT_CONFIGURED");
+  }
+  const existing = reviews.reviews.find((review) => review.id === evidenceId);
+  if (state.completed_operations.includes(verdictId)) {
+    if (!existing) throw new Error("REVIEW_EVIDENCE_MISSING");
+    return state;
+  }
+  const artifacts = registry.artifacts.filter(
+    (artifact) => artifact.owner === definition.owner && artifact.required_gate === definition.gate,
+  );
+  if (artifacts.length === 0) throw new Error("REVIEW_ARTIFACTS_REQUIRED");
+  const [finding] = await inspectArtifacts(root, artifacts);
+  if (finding) throw new Error(`${finding.code}: ${finding.message}`);
+  const expected = {
+    id: evidenceId,
+    phase,
+    reviewer: reviewerId,
+    verdict,
+    artifact_versions: artifactVersions(artifacts),
+  };
+  const review = existing ?? ReviewRecordSchema.parse({
+    ...expected,
+    timestamp: new Date().toISOString(),
+  });
+  if (existing) {
+    const { timestamp: _timestamp, ...existingWithoutTimestamp } = existing;
+    if (JSON.stringify(existingWithoutTimestamp) !== JSON.stringify(expected)) {
+      throw new Error("OPERATION_ID_CONFLICT");
+    }
+  }
+
+  let preview = state;
+  if (!preview.completed_operations.includes(underReviewId)) {
+    preview = transitionPhase(preview, workflow, {
+      phase,
+      to: "under_review",
+      operation_id: underReviewId,
+    });
+  }
+  if (!preview.completed_operations.includes(verdictId)) {
+    preview = transitionPhase(preview, workflow, {
+      phase,
+      to: verdict === "approved" ? "awaiting_approval" : "revision_required",
+      operation_id: verdictId,
+    });
+  }
+  if (!existing) {
+    await store.writeYamlAtomic(
+      ".agent-team/reviews.yaml",
+      ReviewListSchema.parse({ reviews: [...reviews.reviews, review] }),
+    );
+  }
+
+  let current = state;
+  if (!current.completed_operations.includes(underReviewId)) {
+    current = await store.updateWorkflowState(current.state_version, (value) => transitionPhase(
+      value,
+      workflow,
+      { phase, to: "under_review", operation_id: underReviewId },
+    ));
+  }
+  if (!current.completed_operations.includes(verdictId)) {
+    current = await store.updateWorkflowState(current.state_version, (value) => transitionPhase(
+      value,
+      workflow,
+      {
+        phase,
+        to: verdict === "approved" ? "awaiting_approval" : "revision_required",
+        operation_id: verdictId,
+      },
+    ));
+  }
+  return current;
+}
+
 export async function approve(
   root: string,
   gate: GateId,
@@ -293,7 +465,9 @@ export async function approve(
   operationId: string,
 ): Promise<WorkflowState> {
   requireOperationId(operationId);
-  if (!by.trim()) throw new Error("APPROVER_REQUIRED");
+  const approver = by.trim();
+  if (!approver) throw new Error("APPROVER_REQUIRED");
+  const scopedOperation = operationKey("approve", gate, operationId);
   const store = ProjectStore.open(root);
   const [state, workflow, approvals, registry] = await Promise.all([
     store.readWorkflowState(),
@@ -301,8 +475,8 @@ export async function approve(
     store.readYaml(".agent-team/approvals.yaml", ApprovalListSchema),
     artifactRegistry(store),
   ]);
-  const existing = approvals.approvals.find((approval) => approval.id === operationId);
-  if (state.completed_operations.includes(operationId)) {
+  const existing = approvals.approvals.find((approval) => approval.id === scopedOperation);
+  if (state.completed_operations.includes(scopedOperation)) {
     if (!existing) throw new Error("APPROVAL_EVIDENCE_MISSING");
     return state;
   }
@@ -311,15 +485,18 @@ export async function approve(
     (phase) => phase.gate === gate && state.phases[phase.id]?.status === "awaiting_approval",
   );
   if (!definition) throw new Error("INVALID_APPROVAL_STATE");
-  const versions = artifactVersions(registry.artifacts.filter(
+  const artifacts = registry.artifacts.filter(
     (artifact) => artifact.required_gate === gate && artifact.owner === definition.owner,
-  ));
+  );
+  const versions = artifactVersions(artifacts);
   if (Object.keys(versions).length === 0) throw new Error("APPROVAL_ARTIFACTS_REQUIRED");
+  const [finding] = await inspectArtifacts(root, artifacts);
+  if (finding) throw new Error(`${finding.code}: ${finding.message}`);
   const expected = {
-    id: operationId,
+    id: scopedOperation,
     gate,
     decision: "approved" as const,
-    approved_by: { type: "human" as const, identifier: by },
+    approved_by: { type: "human" as const, identifier: approver },
     artifact_versions: versions,
   };
   const approval = existing ?? ApprovalRecordSchema.parse({
@@ -346,20 +523,34 @@ export async function handover(
   operationId: string,
 ): Promise<WorkflowState> {
   requireOperationId(operationId);
+  const scopedOperation = operationKey("handover", phase, operationId);
   const store = ProjectStore.open(root);
-  const workflow = await configuredWorkflow(store);
+  const [workflow, approvals, registry] = await Promise.all([
+    configuredWorkflow(store),
+    store.readYaml(".agent-team/approvals.yaml", ApprovalListSchema),
+    artifactRegistry(store),
+  ]);
   const definition = workflow.phases.find((candidate) => candidate.id === phase);
   if (!definition) throw new Error("PHASE_NOT_CONFIGURED");
   const dependents = workflow.phases.filter((candidate) => candidate.depends_on.includes(phase));
   const target = dependents[0];
   if (!target) throw new Error("HANDOVER_TARGET_REQUIRED");
-  const registry = await artifactRegistry(store);
+  let state = await store.readWorkflowState();
+  const phaseState = state.phases[phase];
+  if (!phaseState) throw new Error("INVALID_HANDOVER_STATE");
+  const approval = approvals.approvals.find((candidate) => candidate.id === phaseState.approval_id);
+  if (!approval
+    || (approval.decision !== "approved" && approval.decision !== "approved_with_conditions")) {
+    throw new Error("APPROVAL_EVIDENCE_MISSING");
+  }
   const proposed = HandoverRecordSchema.parse({
+    id: scopedOperation,
+    phase,
     from_agent: definition.owner,
     to_agent: target.owner,
-    approved_inputs: Object.entries(artifactVersions(registry.artifacts.filter(
-      (artifact) => artifact.required_gate === definition.gate && artifact.owner === definition.owner,
-    ))).map(([id, version]) => `${id}@${version}`),
+    approved_inputs: Object.entries(approval.artifact_versions)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([id, version]) => `${id}@${version}`),
     expected_outputs: registry.artifacts.filter((artifact) => artifact.owner === target.owner)
       .map((artifact) => artifact.id).sort(),
     acceptance_conditions: ["Dependent work uses only the approved input versions."],
@@ -368,26 +559,24 @@ export async function handover(
   const recordExists = await exists(join(resolve(root), relativeRecord));
   if (recordExists) {
     const current = await store.readYaml(relativeRecord, HandoverRecordSchema);
-    if (current.from_agent !== proposed.from_agent || current.to_agent !== proposed.to_agent) {
+    if (JSON.stringify(current) !== JSON.stringify(proposed)) {
       throw new Error("HANDOVER_EVIDENCE_CONFLICT");
     }
   }
 
-  let state = await store.readWorkflowState();
-  if (!state.completed_operations.includes(operationId)) {
-    const phaseState = state.phases[phase];
-    if (!phaseState || phaseState.status !== "approved") throw new Error("INVALID_HANDOVER_STATE");
+  if (!state.completed_operations.includes(scopedOperation)) {
+    if (phaseState.status !== "approved") throw new Error("INVALID_HANDOVER_STATE");
     const withId: WorkflowState = {
       ...state,
       phases: {
         ...state.phases,
-        [phase]: { ...phaseState, handover_id: operationId },
+        [phase]: { ...phaseState, handover_id: scopedOperation },
       },
     };
     transitionPhase(withId, workflow, {
       phase,
       to: "handed_over",
-      operation_id: operationId,
+      operation_id: scopedOperation,
     });
     if (!recordExists) await store.writeYamlAtomic(relativeRecord, proposed);
     state = await store.updateWorkflowState(state.state_version, (current) => {
@@ -397,12 +586,12 @@ export async function handover(
         ...current,
         phases: {
           ...current.phases,
-          [phase]: { ...currentPhase, handover_id: operationId },
+          [phase]: { ...currentPhase, handover_id: scopedOperation },
         },
       }, workflow, {
         phase,
         to: "handed_over",
-        operation_id: operationId,
+        operation_id: scopedOperation,
       });
     });
   } else if (!recordExists) {
@@ -410,7 +599,7 @@ export async function handover(
   }
 
   for (const dependent of dependents) {
-    const readinessId = `${operationId}:ready:${dependent.id}`;
+    const readinessId = operationKey("handover-ready", `${phase}->${dependent.id}`, operationId);
     state = await store.readWorkflowState();
     if (state.completed_operations.includes(readinessId)) continue;
     state = await store.updateWorkflowState(state.state_version, (current) => transitionPhase(
@@ -464,14 +653,26 @@ export async function doctor(root: string) {
     checks.push({ name: "workflow", ok: false, detail: error instanceof Error ? error.message : String(error) });
   }
   try {
-    const plugins = await pluginStatus(store);
-    const unavailable = plugins.plugins.filter((plugin) => plugin.status !== "available");
+    const [plugins, workflow, catalogue] = await Promise.all([
+      pluginStatus(store),
+      configuredWorkflow(store),
+      readCatalogue(),
+    ]);
+    const registry = new PluginRegistry(plugins.plugins);
+    const agentIds = [...new Set(workflow.phases.flatMap((phase) => [phase.owner, phase.reviewer]))]
+      .sort();
+    const blockers = agentIds.flatMap((agentId) => {
+      const manifest = catalogue.find((agent) => agent.id === agentId);
+      if (!manifest) return [`${agentId}:AGENT_NOT_CONFIGURED`];
+      return registry.check(manifest).blockers.map((blocker) =>
+        `${agentId}:${blocker.code}:${blocker.uri}${blocker.skill ? `:${blocker.skill}` : ""}`);
+    });
     checks.push({
       name: "plugins",
-      ok: unavailable.length === 0,
-      detail: unavailable.length === 0
+      ok: blockers.length === 0,
+      detail: blockers.length === 0
         ? "available"
-        : unavailable.map((plugin) => `${plugin.uri}:${plugin.status}`).join(","),
+        : blockers.join(","),
     });
   } catch (error) {
     checks.push({ name: "plugins", ok: false, detail: error instanceof Error ? error.message : String(error) });

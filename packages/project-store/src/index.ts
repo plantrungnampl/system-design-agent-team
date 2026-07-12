@@ -106,6 +106,11 @@ export class ProjectStore {
     await atomicWrite(this.root, target, stringify(value));
   }
 
+  async writeTextAtomic(relativePath: string, content: string): Promise<void> {
+    const target = targetPath(this.root, relativePath);
+    await atomicWrite(this.root, target, content);
+  }
+
   readWorkflowState(): Promise<WorkflowState> {
     return this.readYaml(".agent-team/workflow-state.yaml", WorkflowStateSchema);
   }

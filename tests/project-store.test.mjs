@@ -84,6 +84,19 @@ test("atomically replaces YAML without leaving a temporary file", async (t) => {
   assert.deepEqual((await readdir(root)).filter((name) => name.endsWith(".tmp")), []);
 });
 
+test("writes text atomically through the same containment boundary", async (t) => {
+  const root = await temporaryDirectory(t, "project-store-");
+  const outside = await temporaryDirectory(t, "project-store-outside-");
+  const store = ProjectStore.open(root);
+
+  await store.writeTextAtomic("generated/instructions.md", "safe\n");
+  assert.equal(await readFile(join(root, "generated", "instructions.md"), "utf8"), "safe\n");
+  await assert.rejects(
+    () => store.writeTextAtomic(`../${basename(outside)}-escape.md`, "unsafe\n"),
+    /PATH_OUTSIDE_PROJECT/,
+  );
+});
+
 test("cleans the temporary file after atomic replacement fails", async (t) => {
   const root = await temporaryDirectory(t, "project-store-");
   await mkdir(join(root, "occupied"));
