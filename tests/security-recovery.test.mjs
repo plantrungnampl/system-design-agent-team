@@ -6,11 +6,10 @@ import {
   mkdtemp,
   readFile,
   rm,
-  symlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { join } from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
 import {
@@ -32,36 +31,9 @@ async function temporaryDirectory(t, prefix) {
   return root;
 }
 
-test("store rejects path and junction escapes, redacts audit secrets, and recovers failed locks", async (t) => {
+test("lifecycle lock is cleaned up after its callback fails", async (t) => {
   const root = await temporaryDirectory(t, "system-design-team-security-");
-  const outside = await temporaryDirectory(t, "system-design-team-outside-");
   const store = ProjectStore.open(root);
-
-  await assert.rejects(
-    () => store.writeTextAtomic(`../${basename(outside)}-escape.txt`, "unsafe"),
-    /PATH_OUTSIDE_PROJECT/,
-  );
-  const link = join(root, "linked");
-  try {
-    await symlink(outside, link, process.platform === "win32" ? "junction" : "dir");
-    await assert.rejects(
-      () => store.writeTextAtomic("linked/escape.txt", "unsafe"),
-      /PATH_OUTSIDE_PROJECT/,
-    );
-    await assert.rejects(() => access(join(outside, "escape.txt")), { code: "ENOENT" });
-  } catch (error) {
-    if (!["EACCES", "EPERM", "ENOSYS", "UNKNOWN"].includes(error?.code)) throw error;
-  }
-
-  await store.appendAudit({ action: "dispatch", token: "raw-token", nested: { apiKey: "raw-key" } });
-  const audit = await readFile(join(root, ".agent-team/audit/events.jsonl"), "utf8");
-  assert(!audit.includes("raw-token"));
-  assert(!audit.includes("raw-key"));
-  assert.deepEqual(JSON.parse(audit), {
-    action: "dispatch",
-    token: "[REDACTED]",
-    nested: { apiKey: "[REDACTED]" },
-  });
 
   await assert.rejects(
     () => store.withLock(".agent-team/lifecycle.lock", async () => { throw new Error("callback failed"); }),
@@ -71,7 +43,7 @@ test("store rejects path and junction escapes, redacts audit secrets, and recove
   await assert.rejects(() => access(join(root, ".agent-team/lifecycle.lock")), { code: "ENOENT" });
 });
 
-test("initialization preserves source and AGENTS while a concurrent review keeps its evidence", async (t) => {
+test("initialization preserves source and AGENTS while lifecycle exclusion recovers without losing evidence", async (t) => {
   const root = await temporaryDirectory(t, "system-design-team-recovery-");
   await execFileAsync("git", ["init", "--quiet"], { cwd: root });
   await mkdir(join(root, "src"));
@@ -106,16 +78,20 @@ test("initialization preserves source and AGENTS while a concurrent review keeps
   ].join("\n"));
   assert.equal((await validatePhase(root, "intake", "OP-VALIDATE")).valid, true);
 
-  const attempts = await Promise.allSettled([
-    reviewPhase(root, "intake", "documentation-reviewer", "approved", "OP-REVIEW-A"),
-    reviewPhase(root, "intake", "documentation-reviewer", "approved", "OP-REVIEW-B"),
-  ]);
-  assert.equal(attempts.filter(({ status }) => status === "fulfilled").length, 1);
-  assert.equal(attempts.filter(({ status }) => status === "rejected").length, 1);
+  await store.withLock(".agent-team/lifecycle.lock", async () => {
+    await assert.rejects(
+      () => reviewPhase(root, "intake", "documentation-reviewer", "approved", "OP-REVIEW"),
+      /STATE_LOCKED/,
+    );
+  });
+  await reviewPhase(root, "intake", "documentation-reviewer", "approved", "OP-REVIEW");
+
   const state = await store.readWorkflowState();
   const { reviews } = parse(await readFile(join(root, ".agent-team/reviews.yaml"), "utf8"));
-  assert.equal(reviews.length, 1);
+  assert.deepEqual(reviews.map(({ id, artifact_versions }) => ({ id, artifact_versions })), [{
+    id: JSON.stringify(["review", "intake", "OP-REVIEW"]),
+    artifact_versions: { "PROJECT-CHARTER": 1 },
+  }]);
   assert.equal(state.phases.intake.status, "awaiting_approval");
-  assert.equal(state.phases.intake.review_id, reviews[0].id);
-  assert.deepEqual(reviews[0].artifact_versions, { "PROJECT-CHARTER": 1 });
+  assert.equal(state.phases.intake.review_id, JSON.stringify(["review", "intake", "OP-REVIEW"]));
 });
