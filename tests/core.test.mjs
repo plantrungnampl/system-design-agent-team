@@ -1,13 +1,141 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 import test from "node:test";
 import * as core from "@system-design-team/core";
+import { parse } from "yaml";
+
+const repository = process.cwd();
+
+test("complete role catalogue defines approved boundaries and plugin mappings", async () => {
+  const catalogue = core.AgentManifestSchema.array().parse(
+    parse(await readFile(join(repository, "agents/catalogue.yaml"), "utf8")),
+  );
+  assert.deepEqual(catalogue.map(({ id }) => id), [
+    "lead-orchestrator",
+    "customer-proxy",
+    "business-analyst",
+    "requirements-reviewer",
+    "product-owner",
+    "project-manager",
+    "ux-designer",
+    "ux-reviewer",
+    "system-analyst",
+    "solution-architect",
+    "architecture-reviewer",
+    "developer-lead",
+    "developer",
+    "code-reviewer",
+    "qa-lead",
+    "tester",
+    "devops-lead",
+    "security-reviewer",
+    "data-reviewer",
+    "documentation-reviewer",
+    "operations-reviewer",
+  ]);
+  assert(catalogue.every((agent) => agent.mission.length >= 20));
+  assert(catalogue.every((agent) => agent.authority.may.length > 0));
+  assert(catalogue.every((agent) => agent.authority.may_not.length > 0));
+  assert(catalogue.every((agent) => agent.outputs.length > 0));
+  assert(catalogue.every((agent) => agent.id !== agent.reviewer));
+
+  const plugins = (id) => catalogue.find((agent) => agent.id === id)
+    .required_plugins.map(({ uri }) => uri);
+  assert.deepEqual(plugins("ux-designer"), ["plugin://ux-design@wondelai-skills"]);
+  assert.deepEqual(plugins("solution-architect"), ["plugin://systems-architecture@wondelai-skills"]);
+  assert.deepEqual(plugins("developer"), [
+    "plugin://code-craftsmanship@wondelai-skills",
+    "plugin://superpowers@openai-curated-remote",
+  ]);
+  assert.deepEqual(plugins("tester"), [
+    "plugin://code-craftsmanship@wondelai-skills",
+    "plugin://superpowers@openai-curated-remote",
+  ]);
+  assert.deepEqual(plugins("devops-lead"), [
+    "plugin://systems-architecture@wondelai-skills",
+    "plugin://superpowers@openai-curated-remote",
+  ]);
+  assert.deepEqual(plugins("security-reviewer"), [
+    "plugin://codex-security@openai-curated-remote",
+    "plugin://systems-architecture@wondelai-skills",
+  ]);
+
+  assert.throws(() => core.AgentManifestSchema.parse({
+    ...catalogue[0],
+    reviewer: catalogue[0].id,
+  }), /reviewer/i);
+});
+
+test("END2END workflow assets use configured agents, ordered dependencies, and phase artifacts", async () => {
+  const catalogue = core.AgentManifestSchema.array().parse(
+    parse(await readFile(join(repository, "agents/catalogue.yaml"), "utf8")),
+  );
+  const agents = new Set(catalogue.map(({ id }) => id));
+  const expected = new Map([
+    ["greenfield.yaml", [
+      "intake", "business-discovery", "requirements", "product", "ux", "system-analysis",
+      "architecture", "implementation-planning", "implementation", "verification",
+      "release-readiness", "deployment", "operational-validation", "post-release-review",
+    ]],
+    ["existing-system.yaml", [
+      "repository-discovery", "current-system-analysis", "change-request-analysis",
+      "impact-analysis", "updated-requirements", "ux-architecture-delta",
+      "implementation-planning", "implementation", "regression-security-testing", "security-review",
+      "release", "operational-validation",
+    ]],
+    ["migration.yaml", [
+      "legacy-assessment", "business-continuity", "target-state", "data-mapping",
+      "transition-architecture", "migration-waves", "parallel-validation",
+      "cutover-readiness", "cutover", "post-migration-reconciliation", "legacy-decommission",
+    ]],
+  ]);
+
+  for (const [file, phases] of expected) {
+    const workflow = core.WorkflowDefinitionSchema.parse(
+      parse(await readFile(join(repository, "workflows", file), "utf8")),
+    );
+    assert.deepEqual(workflow.phases.map(({ id }) => id), phases);
+    const positions = new Map(workflow.phases.map(({ id }, index) => [id, index]));
+    for (const [index, phase] of workflow.phases.entries()) {
+      assert(agents.has(phase.owner), `${file}:${phase.id} owner is configured`);
+      assert(agents.has(phase.reviewer), `${file}:${phase.id} reviewer is configured`);
+      assert.notEqual(phase.owner, phase.reviewer);
+      assert.deepEqual(
+        phase.required_plugins,
+        catalogue.find(({ id }) => id === phase.owner).required_plugins.map(({ uri }) => uri),
+        `${file}:${phase.id} plugin contract matches its owner`,
+      );
+      assert.equal(phase.artifact.path.startsWith("../"), false);
+      assert.match(phase.artifact.id, /^[A-Z][A-Z0-9-]+$/);
+      assert(phase.depends_on.every((dependency) => positions.get(dependency) < index));
+    }
+    if (file === "existing-system.yaml") {
+      assert.equal(workflow.phases.find(({ id }) => id === "security-review").owner, "security-reviewer");
+    }
+    if (file === "migration.yaml") {
+      assert.equal(workflow.phases.find(({ id }) => id === "data-mapping").reviewer, "data-reviewer");
+      assert.equal(
+        workflow.phases.find(({ id }) => id === "post-migration-reconciliation").reviewer,
+        "data-reviewer",
+      );
+    }
+  }
+});
 
 test("parses a valid workflow and rejects self-reviewing phase definitions", () => {
   const valid = core.WorkflowDefinitionSchema.parse({
     id: "greenfield-standard",
     version: "1.0.0",
     mode: "greenfield",
-    phases: [{ id: "requirements", owner: "business-analyst", reviewer: "requirements-reviewer", gate: "G2", depends_on: [] }],
+    phases: [{
+      id: "requirements",
+      owner: "business-analyst",
+      reviewer: "requirements-reviewer",
+      gate: "G2",
+      depends_on: [],
+      artifact: { id: "REQUIREMENTS", path: "requirements/requirements.md", title: "Requirements" },
+    }],
   });
   assert.equal(valid.phases[0].gate, "G2");
 
@@ -15,6 +143,10 @@ test("parses a valid workflow and rejects self-reviewing phase definitions", () 
     ...valid,
     phases: [{ ...valid.phases[0], reviewer: "business-analyst" }],
   }), /reviewer/i);
+  assert.throws(() => core.WorkflowDefinitionSchema.parse({
+    ...valid,
+    phases: [{ ...valid.phases[0], id: "../outside" }],
+  }), /phase id/i);
 
   assert.throws(() => core.WorkflowDefinitionSchema.parse({
     ...valid,
@@ -28,6 +160,26 @@ test("parses a valid workflow and rejects self-reviewing phase definitions", () 
     ...valid,
     phases: [{ ...valid.phases[0], depends_on: ["requirements"] }],
   }), /dependency/i);
+  assert.throws(() => core.WorkflowDefinitionSchema.parse({
+    ...valid,
+    phases: [{
+      ...valid.phases[0],
+      artifact: { ...valid.phases[0].artifact, path: "../outside.md" },
+    }],
+  }), /artifact path/i);
+  assert.throws(() => core.WorkflowDefinitionSchema.parse({
+    ...valid,
+    phases: [{
+      ...valid.phases[0],
+      artifact: { ...valid.phases[0].artifact, path: "nested/../../outside.md" },
+    }],
+  }), /artifact path/i);
+  assert.throws(() => core.AgentManifestSchema.parse({
+    id: "../outside",
+    version: "1.0.0",
+    reviewer: "independent-reviewer",
+    required_plugins: [],
+  }), /agent id/i);
 });
 
 test("validates persisted CLI wrapper records", () => {

@@ -6,7 +6,7 @@
   "workspaces": ["packages/*"],
   "engines": { "node": ">=20" },
   "scripts": {
-    "build": "tsc -b",
+    "build": "tsc -b && node scripts/copy-cli-assets.mjs",
     "pretest": "npm run build",
     "test": "node --test",
     "check": "npm run build && npm test"

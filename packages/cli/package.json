@@ -13,7 +13,7 @@
   "bin": {
     "system-design-team": "./dist/bin.js"
   },
-  "files": ["dist/*.js", "dist/*.d.ts"],
+  "files": ["dist/*.js", "dist/*.d.ts", "dist/assets"],
   "engines": { "node": ">=20" },
   "dependencies": {
     "@system-design-team/artifact-validator": "0.1.0",

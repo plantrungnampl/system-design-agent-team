@@ -8,15 +8,95 @@ phases:
     gate: G0
     depends_on: []
     required_plugins: [plugin://superpowers@openai-curated-remote]
+    artifact: { id: PROJECT-CHARTER, path: context/project-charter.md, title: Project Charter }
+  - id: business-discovery
+    owner: customer-proxy
+    reviewer: business-analyst
+    gate: G1
+    depends_on: [intake]
+    required_plugins: []
+    artifact: { id: BUSINESS-CONTEXT, path: context/business-context.md, title: Business Context }
   - id: requirements
     owner: business-analyst
     reviewer: requirements-reviewer
     gate: G2
-    depends_on: [intake]
+    depends_on: [business-discovery]
     required_plugins: [plugin://superpowers@openai-curated-remote]
+    artifact: { id: REQUIREMENTS, path: requirements/requirements.md, title: Requirements }
   - id: product
     owner: product-owner
     reviewer: requirements-reviewer
     gate: G3
     depends_on: [requirements]
     required_plugins: [plugin://superpowers@openai-curated-remote]
+    artifact: { id: PRODUCT-BACKLOG, path: product/backlog.md, title: Product Backlog }
+  - id: ux
+    owner: ux-designer
+    reviewer: ux-reviewer
+    gate: G4
+    depends_on: [product]
+    required_plugins: [plugin://ux-design@wondelai-skills]
+    artifact: { id: UX-HANDOFF, path: ux/developer-handoff.md, title: UX Developer Handoff }
+  - id: system-analysis
+    owner: system-analyst
+    reviewer: architecture-reviewer
+    gate: G5
+    depends_on: [ux]
+    required_plugins: [plugin://systems-architecture@wondelai-skills]
+    artifact: { id: SYSTEM-ANALYSIS, path: architecture/system-analysis.md, title: System Analysis }
+  - id: architecture
+    owner: solution-architect
+    reviewer: architecture-reviewer
+    gate: G5
+    depends_on: [system-analysis]
+    required_plugins: [plugin://systems-architecture@wondelai-skills]
+    artifact: { id: ARCHITECTURE, path: architecture/architecture-overview.md, title: Architecture Overview }
+  - id: implementation-planning
+    owner: developer-lead
+    reviewer: code-reviewer
+    gate: G6
+    depends_on: [architecture]
+    required_plugins: [plugin://code-craftsmanship@wondelai-skills, plugin://superpowers@openai-curated-remote]
+    artifact: { id: IMPLEMENTATION-PLAN, path: implementation/implementation-plan.md, title: Implementation Plan }
+  - id: implementation
+    owner: developer
+    reviewer: code-reviewer
+    gate: G7
+    depends_on: [implementation-planning]
+    required_plugins: [plugin://code-craftsmanship@wondelai-skills, plugin://superpowers@openai-curated-remote]
+    artifact: { id: IMPLEMENTATION-EVIDENCE, path: implementation/implementation-evidence.md, title: Implementation Evidence }
+  - id: verification
+    owner: qa-lead
+    reviewer: tester
+    gate: G7
+    depends_on: [implementation]
+    required_plugins: [plugin://code-craftsmanship@wondelai-skills, plugin://superpowers@openai-curated-remote]
+    artifact: { id: TEST-SUMMARY, path: testing/test-summary.md, title: Test Summary }
+  - id: release-readiness
+    owner: security-reviewer
+    reviewer: architecture-reviewer
+    gate: G7
+    depends_on: [verification]
+    required_plugins: [plugin://codex-security@openai-curated-remote, plugin://systems-architecture@wondelai-skills]
+    artifact: { id: RELEASE-READINESS, path: release/release-readiness.md, title: Release Readiness }
+  - id: deployment
+    owner: devops-lead
+    reviewer: operations-reviewer
+    gate: G8
+    depends_on: [release-readiness]
+    required_plugins: [plugin://systems-architecture@wondelai-skills, plugin://superpowers@openai-curated-remote]
+    artifact: { id: DEPLOYMENT-PLAN, path: release/deployment-plan.md, title: Deployment Plan }
+  - id: operational-validation
+    owner: devops-lead
+    reviewer: operations-reviewer
+    gate: G9
+    depends_on: [deployment]
+    required_plugins: [plugin://systems-architecture@wondelai-skills, plugin://superpowers@openai-curated-remote]
+    artifact: { id: OPERATIONAL-VALIDATION, path: operations/operational-validation.md, title: Operational Validation }
+  - id: post-release-review
+    owner: operations-reviewer
+    reviewer: documentation-reviewer
+    gate: G9
+    depends_on: [operational-validation]
+    required_plugins: [plugin://superpowers@openai-curated-remote]
+    artifact: { id: POST-RELEASE-REVIEW, path: operations/post-release-review.md, title: Post-release Review }

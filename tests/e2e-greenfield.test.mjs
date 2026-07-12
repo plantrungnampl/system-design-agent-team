@@ -64,7 +64,7 @@ test("greenfield requirements flow blocks missing plugins and reaches handover w
     () => startPhase(root, "intake", "OP-START-INTAKE"),
     /REQUIRED_PLUGIN_UNKNOWN/,
   );
-  await setPluginStatus(root, pluginUri, "available", ["brainstorming"]);
+  await setPluginStatus(root, pluginUri, "available", ["brainstorming", "writing-plans", "verification-before-completion"]);
 
   await startPhase(root, "intake", "OP-START-INTAKE");
   await makeReviewReady(root, "PROJECT-CHARTER");
@@ -72,6 +72,13 @@ test("greenfield requirements flow blocks missing plugins and reaches handover w
   await reviewPhase(root, "intake", "documentation-reviewer", "approved", "OP-REVIEW-INTAKE");
   await approve(root, "G0", "project-owner", "OP-APPROVE-G0");
   await handover(root, "intake", "OP-HANDOVER-INTAKE");
+
+  await startPhase(root, "business-discovery", "OP-START-DISCOVERY");
+  await makeReviewReady(root, "BUSINESS-CONTEXT");
+  assert.equal((await validatePhase(root, "business-discovery", "OP-VALIDATE-DISCOVERY")).valid, true);
+  await reviewPhase(root, "business-discovery", "business-analyst", "approved", "OP-REVIEW-DISCOVERY");
+  await approve(root, "G1", "project-owner", "OP-APPROVE-G1");
+  await handover(root, "business-discovery", "OP-HANDOVER-DISCOVERY");
 
   await startPhase(root, "requirements", "OP-START-REQ");
   await makeReviewReady(root, "REQUIREMENTS");
@@ -85,6 +92,7 @@ test("greenfield requirements flow blocks missing plugins and reaches handover w
   const { reviews } = await readYaml(root, ".agent-team/reviews.yaml");
   const { approvals } = await readYaml(root, ".agent-team/approvals.yaml");
   const intakeHandover = await readYaml(root, ".agent-team/handovers/intake.yaml");
+  const discoveryHandover = await readYaml(root, ".agent-team/handovers/business-discovery.yaml");
   const requirementsHandover = await readYaml(root, ".agent-team/handovers/requirements.yaml");
 
   assert.equal(finalState.phases.requirements.status, "handed_over");
@@ -98,6 +106,11 @@ test("greenfield requirements flow blocks missing plugins and reaches handover w
       id: operationKey("review", "intake", "OP-REVIEW-INTAKE"),
       reviewer: "documentation-reviewer",
       artifact_versions: { "PROJECT-CHARTER": 1 },
+    },
+    {
+      id: operationKey("review", "business-discovery", "OP-REVIEW-DISCOVERY"),
+      reviewer: "business-analyst",
+      artifact_versions: { "BUSINESS-CONTEXT": 1 },
     },
     {
       id: operationKey("review", "requirements", "OP-REVIEW-REQ"),
@@ -118,6 +131,12 @@ test("greenfield requirements flow blocks missing plugins and reaches handover w
       artifact_versions: { "PROJECT-CHARTER": 1 },
     },
     {
+      id: operationKey("approve", "G1", "OP-APPROVE-G1"),
+      gate: "G1",
+      approved_by: { type: "human", identifier: "project-owner" },
+      artifact_versions: { "BUSINESS-CONTEXT": 1 },
+    },
+    {
       id: operationKey("approve", "G2", "OP-APPROVE-G2"),
       gate: "G2",
       approved_by: { type: "human", identifier: "project-owner" },
@@ -125,11 +144,16 @@ test("greenfield requirements flow blocks missing plugins and reaches handover w
     },
   ]);
   assert.deepEqual(
-    [intakeHandover, requirementsHandover].map(({ id, approved_inputs }) => ({ id, approved_inputs })),
+    [intakeHandover, discoveryHandover, requirementsHandover]
+      .map(({ id, approved_inputs }) => ({ id, approved_inputs })),
     [
       {
         id: operationKey("handover", "intake", "OP-HANDOVER-INTAKE"),
         approved_inputs: ["PROJECT-CHARTER@1"],
+      },
+      {
+        id: operationKey("handover", "business-discovery", "OP-HANDOVER-DISCOVERY"),
+        approved_inputs: ["BUSINESS-CONTEXT@1"],
       },
       {
         id: operationKey("handover", "requirements", "OP-HANDOVER-REQ"),
@@ -144,7 +168,14 @@ test("greenfield requirements flow blocks missing plugins and reaches handover w
     operationKey("review-verdict", "intake", "OP-REVIEW-INTAKE"),
     operationKey("approve", "G0", "OP-APPROVE-G0"),
     operationKey("handover", "intake", "OP-HANDOVER-INTAKE"),
-    operationKey("handover-ready", "intake->requirements", "OP-HANDOVER-INTAKE"),
+    operationKey("handover-ready", "intake->business-discovery", "OP-HANDOVER-INTAKE"),
+    operationKey("start", "business-discovery", "OP-START-DISCOVERY"),
+    operationKey("validate", "business-discovery", "OP-VALIDATE-DISCOVERY"),
+    operationKey("review-under-review", "business-discovery", "OP-REVIEW-DISCOVERY"),
+    operationKey("review-verdict", "business-discovery", "OP-REVIEW-DISCOVERY"),
+    operationKey("approve", "G1", "OP-APPROVE-G1"),
+    operationKey("handover", "business-discovery", "OP-HANDOVER-DISCOVERY"),
+    operationKey("handover-ready", "business-discovery->requirements", "OP-HANDOVER-DISCOVERY"),
     operationKey("start", "requirements", "OP-START-REQ"),
     operationKey("validate", "requirements", "OP-VALIDATE-REQ"),
     operationKey("review-under-review", "requirements", "OP-REVIEW-REQ"),

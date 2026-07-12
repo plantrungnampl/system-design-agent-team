@@ -2,21 +2,87 @@ id: existing-system-standard
 version: 1.0.0
 mode: existing_system
 phases:
-  - id: intake
+  - id: repository-discovery
     owner: lead-orchestrator
     reviewer: documentation-reviewer
     gate: G0
     depends_on: []
     required_plugins: [plugin://superpowers@openai-curated-remote]
-  - id: requirements
+    artifact: { id: REPOSITORY-ASSESSMENT, path: context/repository-assessment.md, title: Repository Assessment }
+  - id: current-system-analysis
+    owner: system-analyst
+    reviewer: architecture-reviewer
+    gate: G1
+    depends_on: [repository-discovery]
+    required_plugins: [plugin://systems-architecture@wondelai-skills]
+    artifact: { id: CURRENT-SYSTEM, path: architecture/current-system.md, title: Current System Analysis }
+  - id: change-request-analysis
+    owner: customer-proxy
+    reviewer: business-analyst
+    gate: G1
+    depends_on: [current-system-analysis]
+    required_plugins: []
+    artifact: { id: CHANGE-REQUEST, path: requirements/change-request.md, title: Change Request Analysis }
+  - id: impact-analysis
+    owner: solution-architect
+    reviewer: architecture-reviewer
+    gate: G2
+    depends_on: [change-request-analysis]
+    required_plugins: [plugin://systems-architecture@wondelai-skills]
+    artifact: { id: IMPACT-ANALYSIS, path: architecture/impact-analysis.md, title: Impact Analysis }
+  - id: updated-requirements
     owner: business-analyst
     reviewer: requirements-reviewer
     gate: G2
-    depends_on: [intake]
+    depends_on: [impact-analysis]
     required_plugins: [plugin://superpowers@openai-curated-remote]
-  - id: product
-    owner: product-owner
-    reviewer: requirements-reviewer
-    gate: G3
-    depends_on: [requirements]
+    artifact: { id: UPDATED-REQUIREMENTS, path: requirements/updated-requirements.md, title: Updated Requirements }
+  - id: ux-architecture-delta
+    owner: ux-designer
+    reviewer: ux-reviewer
+    gate: G4
+    depends_on: [updated-requirements]
+    required_plugins: [plugin://ux-design@wondelai-skills]
+    artifact: { id: DELTA-DESIGN, path: ux/delta-design.md, title: UX and Architecture Delta }
+  - id: implementation-planning
+    owner: developer-lead
+    reviewer: code-reviewer
+    gate: G6
+    depends_on: [ux-architecture-delta]
+    required_plugins: [plugin://code-craftsmanship@wondelai-skills, plugin://superpowers@openai-curated-remote]
+    artifact: { id: IMPLEMENTATION-PLAN, path: implementation/implementation-plan.md, title: Implementation Plan }
+  - id: implementation
+    owner: developer
+    reviewer: code-reviewer
+    gate: G7
+    depends_on: [implementation-planning]
+    required_plugins: [plugin://code-craftsmanship@wondelai-skills, plugin://superpowers@openai-curated-remote]
+    artifact: { id: IMPLEMENTATION-EVIDENCE, path: implementation/implementation-evidence.md, title: Implementation Evidence }
+  - id: regression-security-testing
+    owner: qa-lead
+    reviewer: tester
+    gate: G7
+    depends_on: [implementation]
+    required_plugins: [plugin://code-craftsmanship@wondelai-skills, plugin://superpowers@openai-curated-remote]
+    artifact: { id: REGRESSION-SUMMARY, path: testing/regression-summary.md, title: Regression and Security Test Summary }
+  - id: security-review
+    owner: security-reviewer
+    reviewer: architecture-reviewer
+    gate: G7
+    depends_on: [regression-security-testing]
+    required_plugins: [plugin://codex-security@openai-curated-remote, plugin://systems-architecture@wondelai-skills]
+    artifact: { id: SECURITY-VERDICT, path: security/release-verdict.md, title: Security Release Verdict }
+  - id: release
+    owner: devops-lead
+    reviewer: operations-reviewer
+    gate: G8
+    depends_on: [security-review]
+    required_plugins: [plugin://systems-architecture@wondelai-skills, plugin://superpowers@openai-curated-remote]
+    artifact: { id: RELEASE-PLAN, path: release/release-plan.md, title: Release Plan }
+  - id: operational-validation
+    owner: operations-reviewer
+    reviewer: documentation-reviewer
+    gate: G9
+    depends_on: [release]
     required_plugins: [plugin://superpowers@openai-curated-remote]
+    artifact: { id: OPERATIONAL-ACCEPTANCE, path: operations/operational-acceptance.md, title: Operational Acceptance }

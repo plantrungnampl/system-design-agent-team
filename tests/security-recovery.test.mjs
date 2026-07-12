@@ -62,7 +62,7 @@ test("lifecycle lock serializes plugin status and phase start", async (t) => {
   await store.withLock(".agent-team/lifecycle.lock", async () => {
     let statusError;
     let startError;
-    try { await setPluginStatus(root, pluginUri, "available", ["brainstorming"]); } catch (error) { statusError = error; }
+    try { await setPluginStatus(root, pluginUri, "available", ["brainstorming", "writing-plans", "verification-before-completion"]); } catch (error) { statusError = error; }
     try { await startPhase(root, "intake", "LOCKED-START"); } catch (error) { startError = error; }
     assert.match(String(statusError), /STATE_LOCKED/);
     assert.match(String(startError), /STATE_LOCKED/);
@@ -135,7 +135,7 @@ test("completed lifecycle replay repairs a missing audit event once", async (t) 
     mode: "greenfield",
     profile: "standard",
   });
-  await setPluginStatus(root, pluginUri, "available", ["brainstorming"]);
+  await setPluginStatus(root, pluginUri, "available", ["brainstorming", "writing-plans", "verification-before-completion"]);
   const started = await startPhase(root, "intake", "AUDIT-START");
   const store = ProjectStore.open(root);
   const auditPath = join(root, ".agent-team/audit/events.jsonl");
@@ -169,7 +169,7 @@ test("initialization preserves source and AGENTS while lifecycle exclusion recov
   assert.equal(await readFile(join(root, "AGENTS.md"), "utf8"), "keep repository policy\n");
 
   const store = ProjectStore.open(root);
-  await setPluginStatus(root, pluginUri, "available", ["brainstorming"]);
+  await setPluginStatus(root, pluginUri, "available", ["brainstorming", "writing-plans", "verification-before-completion"]);
   await startPhase(root, "intake", "OP-START");
   const registry = parse(await readFile(join(root, ".agent-team/artifact-registry.yaml"), "utf8"));
   const artifact = registry.artifacts.find(({ id }) => id === "PROJECT-CHARTER");

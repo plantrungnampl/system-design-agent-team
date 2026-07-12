@@ -46,12 +46,21 @@ export const FrameworkLockSchema = z.object({
 });
 
 export const WorkflowPhaseSchema = z.object({
-  id: z.string().min(1),
+  id: z.string().regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/, "Phase id must be kebab-case"),
   owner: z.string().min(1),
   reviewer: z.string().min(1),
   gate: GateIdSchema,
   depends_on: z.array(z.string()).default([]),
   required_plugins: z.array(z.string()).default([]),
+  artifact: z.object({
+    id: z.string().regex(/^[A-Z][A-Z0-9-]+$/),
+    path: z.string().min(1).refine((path) =>
+      !path.startsWith("/")
+      && !path.includes("\\")
+      && path.split("/").every((segment) => segment !== "" && segment !== "." && segment !== ".."),
+    "Artifact path must be a contained POSIX-style relative path"),
+    title: z.string().min(1),
+  }),
 }).superRefine((phase, context) => {
   if (phase.owner === phase.reviewer) {
     context.addIssue({
@@ -69,11 +78,22 @@ export const WorkflowDefinitionSchema = z.object({
   phases: z.array(WorkflowPhaseSchema).min(1),
 }).superRefine((workflow, context) => {
   const phaseIds = new Set<string>();
+  const artifactIds = new Set<string>();
+  const artifactPaths = new Set<string>();
   workflow.phases.forEach((phase, index) => {
     if (phaseIds.has(phase.id)) {
       context.addIssue({ code: "custom", message: "Phase ids must be unique", path: ["phases", index, "id"] });
     }
     phaseIds.add(phase.id);
+    if (artifactIds.has(phase.artifact.id) || artifactPaths.has(phase.artifact.path)) {
+      context.addIssue({
+        code: "custom",
+        message: "Phase artifacts must have unique ids and paths",
+        path: ["phases", index, "artifact"],
+      });
+    }
+    artifactIds.add(phase.artifact.id);
+    artifactPaths.add(phase.artifact.path);
   });
   workflow.phases.forEach((phase, phaseIndex) => {
     phase.depends_on.forEach((dependency, dependencyIndex) => {
@@ -81,6 +101,12 @@ export const WorkflowDefinitionSchema = z.object({
         context.addIssue({
           code: "custom",
           message: "Phase dependency must reference another configured phase",
+          path: ["phases", phaseIndex, "depends_on", dependencyIndex],
+        });
+      } else if (workflow.phases.findIndex((candidate) => candidate.id === dependency) >= phaseIndex) {
+        context.addIssue({
+          code: "custom",
+          message: "Phase dependency must reference an earlier configured phase",
           path: ["phases", phaseIndex, "depends_on", dependencyIndex],
         });
       }
@@ -119,10 +145,26 @@ export const RequiredPluginSchema = z.object({
 });
 
 export const AgentManifestSchema = z.object({
-  id: z.string().min(1),
+  id: z.string().regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/, "Agent id must be kebab-case"),
   version: z.string().min(1),
+  display_name: z.string().min(1).default("Agent"),
+  category: z.string().min(1).default("general"),
+  mission: z.string().min(20).default("Execute the assigned role within its approved scope."),
+  authority: z.object({
+    may: z.array(z.string().min(1)).min(1),
+    may_not: z.array(z.string().min(1)).min(1),
+  }).default({ may: ["execute assigned work"], may_not: ["approve own work"] }),
+  outputs: z.array(z.string().min(1)).min(1).default(["execution result"]),
   reviewer: z.string().min(1),
   required_plugins: z.array(RequiredPluginSchema).default([]),
+}).superRefine((agent, context) => {
+  if (agent.id === agent.reviewer) {
+    context.addIssue({
+      code: "custom",
+      message: "Reviewer must be independent from agent",
+      path: ["reviewer"],
+    });
+  }
 });
 
 export const PluginStatusSchema = z.enum([
