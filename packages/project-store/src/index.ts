@@ -206,6 +206,24 @@ export class ProjectStore {
     }
   }
 
+  private async readContainedFile(relativePath: string, allowMissing = false): Promise<string | undefined> {
+    const target = targetPath(this.root, relativePath);
+    try {
+      await lstat(target);
+    } catch (error) {
+      if (allowMissing && (error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+      throw error;
+    }
+    let realTarget: string;
+    try {
+      realTarget = await realpath(target);
+    } catch {
+      throw new ProjectStoreError("PATH_OUTSIDE_PROJECT");
+    }
+    requireInside(await realpath(this.root), realTarget);
+    return readFile(target, "utf8");
+  }
+
   private async pendingTransactionFiles(): Promise<string[]> {
     const directory = targetPath(this.root, ".agent-team/transactions");
     try {
@@ -258,11 +276,13 @@ export class ProjectStore {
 
   private async readReceipt(operationId: string): Promise<TransactionReceipt | undefined> {
     try {
-      const value = JSON.parse(await readFile(targetPath(this.root, this.receiptPath(operationId)), "utf8")) as TransactionReceipt;
+      const text = await this.readContainedFile(this.receiptPath(operationId), true);
+      if (text === undefined) return undefined;
+      const value = JSON.parse(text) as TransactionReceipt;
       if (value.operationId !== operationId || !/^[a-f0-9]{64}$/.test(value.digest)) throw new Error();
       return value;
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+      if (error instanceof ProjectStoreError) throw error;
       throw new ProjectStoreError("TRANSACTION_JOURNAL_INVALID");
     }
   }
@@ -328,7 +348,7 @@ export class ProjectStore {
   async inspectTransactions(): Promise<string[]> {
     const operations: string[] = [];
     for (const file of await this.pendingTransactionFiles()) {
-      const raw = JSON.parse(await readFile(targetPath(this.root, `.agent-team/transactions/${file}`), "utf8"));
+      const raw = JSON.parse((await this.readContainedFile(`.agent-team/transactions/${file}`))!);
       operations.push(this.validateJournal(raw, file).operationId);
     }
     return operations;
@@ -341,8 +361,9 @@ export class ProjectStore {
         const path = `.agent-team/transactions/${file}`;
         let raw: unknown;
         try {
-          raw = JSON.parse(await readFile(targetPath(this.root, path), "utf8"));
-        } catch {
+          raw = JSON.parse((await this.readContainedFile(path))!);
+        } catch (error) {
+          if (error instanceof ProjectStoreError) throw error;
           throw new ProjectStoreError("TRANSACTION_JOURNAL_INVALID");
         }
         const journal = this.validateJournal(raw, file);

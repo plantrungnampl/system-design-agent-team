@@ -443,3 +443,50 @@ test("agent audit identity must match the actor and transaction operation", asyn
     /AUDIT_ID_MISMATCH/,
   );
 });
+
+test("inspect and repair reject a journal symlink outside the project", async (t) => {
+  const root = await temporaryDirectory(t, "project-store-journal-link-");
+  const outside = await temporaryDirectory(t, "project-store-journal-outside-");
+  const operationId = "OP-LINKED-JOURNAL";
+  const name = `${createHash("sha256").update(operationId).digest("hex")}.json`;
+  const outsideJournal = join(outside, name);
+  await writeFile(outsideJournal, JSON.stringify({
+    version: 1,
+    operationId,
+    writes: [{ path: "promoted", content: "unsafe", role: "evidence", beforeDigest: null }],
+    auditEvent: auditEvent(operationId),
+  }));
+  await mkdir(join(root, ".agent-team/transactions"), { recursive: true });
+  try {
+    await symlink(outsideJournal, join(root, ".agent-team/transactions", name), "file");
+  } catch (error) {
+    if (!["EACCES", "EPERM", "ENOSYS", "UNKNOWN"].includes(error?.code)) throw error;
+    await rm(outsideJournal);
+    await mkdir(outsideJournal);
+    await symlink(outsideJournal, join(root, ".agent-team/transactions", name), "junction");
+  }
+
+  const store = ProjectStore.open(root);
+  await assert.rejects(() => store.inspectTransactions(), /PATH_OUTSIDE_PROJECT/);
+  await assert.rejects(() => store.repairTransactions(), /PATH_OUTSIDE_PROJECT/);
+  await assert.rejects(() => access(join(root, "promoted")), { code: "ENOENT" });
+});
+
+test("transaction replay rejects a receipt symlink outside the project", async (t) => {
+  const root = await temporaryDirectory(t, "project-store-receipt-link-");
+  const outside = await temporaryDirectory(t, "project-store-receipt-outside-");
+  const operationId = "OP-LINKED-RECEIPT";
+  const store = ProjectStore.open(root);
+  const writes = [{ path: "value", content: "safe" }];
+  const event = auditEvent(operationId);
+  await store.transaction(operationId, writes, event);
+  const name = `${createHash("sha256").update(operationId).digest("hex")}.json`;
+  const receipt = join(root, ".agent-team/transactions/completed", name);
+  const outsideReceipt = join(outside, name);
+  await writeFile(outsideReceipt, await readFile(receipt));
+  await rm(join(root, ".agent-team/transactions/completed"), { recursive: true });
+  await symlink(outside, join(root, ".agent-team/transactions/completed"), "junction");
+
+  await assert.rejects(() => store.transaction(operationId, writes, event), /PATH_OUTSIDE_PROJECT/);
+  assert.equal(await readFile(join(root, "value"), "utf8"), "safe");
+});
