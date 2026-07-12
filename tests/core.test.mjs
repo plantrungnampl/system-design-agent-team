@@ -304,4 +304,5 @@ test("artifact, traceability, and change contracts preserve dependency metadata"
   assert.equal(traceability.links[0].to, "REQUIREMENTS");
   assert.equal(change.required_reapprovals[0], "G0");
   assert.throws(() => core.ArtifactRecordSchema.parse({ ...artifact, checksum: "sha256:bad" }));
+  assert.throws(() => core.ChangeRequestSchema.parse({ ...change, id: "../escape" }));
 });

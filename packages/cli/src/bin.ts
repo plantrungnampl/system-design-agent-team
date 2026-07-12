@@ -194,11 +194,11 @@ async function main(): Promise<void> {
       result = await createChange(root, {
         id: required(positionals[2], "change id"),
         requested_by: required(values.by, "--by"),
-        affected_artifacts: required(values.artifacts, "--artifacts").split(",").filter(Boolean),
+        affected_artifacts: required(values.artifacts, "--artifacts").split(",").map((id) => id.trim()).filter(Boolean),
         reason: required(values.reason, "--reason"),
         impact: { scope: level, architecture: level, security: level, schedule: level },
         required_reapprovals: values.reapprovals
-          ? values.reapprovals.split(",").map((gate) => GateIdSchema.parse(gate))
+          ? values.reapprovals.split(",").map((gate) => GateIdSchema.parse(gate.trim()))
           : [],
       }, required(values["operation-id"], "--operation-id"));
       break;

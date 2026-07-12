@@ -549,13 +549,15 @@ export async function createChange(
     if (change.affected_artifacts.some((id) => !artifactIds.has(id))) {
       throw new Error("ARTIFACT_NOT_FOUND");
     }
-    const staleArtifacts = [...propagateStaleness(change.affected_artifacts, traceability.links)]
-      .filter((id) => artifactIds.has(id))
-      .sort();
+    const staleArtifacts = [...new Set([
+      ...change.affected_artifacts,
+      ...propagateStaleness(change.affected_artifacts, traceability.links),
+    ])].filter((id) => artifactIds.has(id)).sort();
     if (state.completed_operations.includes(scopedOperation)) {
-      await store.readYaml(`.agent-team/changes/${change.id}.yaml`, ChangeRequestSchema);
+      const stored = await store.readYaml(`.agent-team/changes/${change.id}.yaml`, ChangeRequestSchema);
+      if (JSON.stringify(stored) !== JSON.stringify(change)) throw new Error("OPERATION_ID_CONFLICT");
       await appendOperationAudit(store, scopedOperation, "change", change.id);
-      return { change, stale_artifacts: staleArtifacts };
+      return { change: stored, stale_artifacts: staleArtifacts };
     }
 
     const staleIds = new Set(staleArtifacts);
@@ -568,7 +570,8 @@ export async function createChange(
     });
     const nextApprovals = ApprovalListSchema.parse({
       approvals: approvals.approvals.map((approval) =>
-        Object.keys(approval.artifact_versions).some((id) => staleIds.has(id))
+        (Object.keys(approval.artifact_versions).some((id) => staleIds.has(id))
+          || change.required_reapprovals.includes(approval.gate))
           && (approval.decision === "approved" || approval.decision === "approved_with_conditions")
           ? { ...approval, decision: "revoked" }
           : approval),

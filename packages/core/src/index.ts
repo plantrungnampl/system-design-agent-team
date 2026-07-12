@@ -245,7 +245,7 @@ export const TraceabilityDocumentSchema = z.object({
 const ChangeImpactSchema = z.enum(["low", "medium", "high"]);
 
 export const ChangeRequestSchema = z.object({
-  id: z.string().min(1),
+  id: z.string().regex(/^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*$/, "Change request id must be filename-safe"),
   requested_by: z.string().min(1),
   affected_artifacts: z.array(z.string().min(1)).min(1),
   reason: z.string().min(1),

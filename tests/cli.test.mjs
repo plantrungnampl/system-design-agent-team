@@ -22,6 +22,7 @@ import {
   artifactList,
   artifactValidate,
   approve,
+  createChange,
   doctor,
   getStatus,
   handover,
@@ -253,7 +254,7 @@ test("artifact and trace read operations expose persisted integrity", async () =
   assert.equal((await artifactValidate(root, "PROJECT-CHARTER")).findings[0].code, "ARTIFACT_CHECKSUM_MISMATCH");
 });
 
-test("change creation stales only downstream artifacts and invalidates their approvals", async () => {
+test("change creation stales direct and downstream artifacts and invalidates their approvals", async () => {
   const root = await temporaryGitRepository();
   await initProject(root, {
     id: "leave-system",
@@ -277,30 +278,51 @@ test("change creation stales only downstream artifacts and invalidates their app
       approved_by: { type: "human", identifier: "project-owner" },
       artifact_versions: { "BUSINESS-CONTEXT": 1 }, timestamp: "2026-07-12T00:00:00Z",
     },
+    {
+      id: "APR-G9", gate: "G9", decision: "approved",
+      approved_by: { type: "human", identifier: "project-owner" },
+      artifact_versions: { "POST-RELEASE-REVIEW": 1 }, timestamp: "2026-07-12T00:00:00Z",
+    },
   ] });
 
   const bin = join(repository, "packages/cli/dist/bin.js");
   const result = JSON.parse((await execFileAsync(process.execPath, [
     bin, "change", "create", "CR-001",
     "--by", "product-owner",
-    "--artifacts", "PROJECT-CHARTER",
+    "--artifacts", " PROJECT-CHARTER ",
     "--reason", "Approved scope changed.",
     "--impact", "high",
-    "--reapprovals", "G1",
+    "--reapprovals", " G1, G9 ",
     "--operation-id", "CHANGE-001",
   ], { cwd: root })).stdout);
 
+  assert(result.stale_artifacts.includes("PROJECT-CHARTER"));
   assert(result.stale_artifacts.includes("BUSINESS-CONTEXT"));
   assert.equal((await staleList(root)).some(({ id }) => id === "BUSINESS-CONTEXT"), true);
   const changedState = await store.readWorkflowState();
-  assert.equal(changedState.phases.intake.status, "approved");
+  assert.equal(changedState.phases.intake.status, "revision_required");
   assert.equal(changedState.phases["business-discovery"].status, "revision_required");
   const approvals = await readYaml(root, ".agent-team/approvals.yaml");
-  assert.equal(approvals.approvals.find(({ id }) => id === "APR-G0").decision, "approved");
+  assert.equal(approvals.approvals.find(({ id }) => id === "APR-G0").decision, "revoked");
   assert.equal(approvals.approvals.find(({ id }) => id === "APR-G1").decision, "revoked");
+  assert.equal(approvals.approvals.find(({ id }) => id === "APR-G9").decision, "revoked");
   const events = (await readFile(join(root, ".agent-team/audit/events.jsonl"), "utf8"))
     .trim().split("\n").map(JSON.parse);
   assert.equal(events.filter(({ action }) => action === "change").length, 1);
+
+  const replayInput = {
+    id: "CR-001",
+    requested_by: "product-owner",
+    affected_artifacts: ["PROJECT-CHARTER"],
+    reason: "Approved scope changed.",
+    impact: { scope: "high", architecture: "high", security: "high", schedule: "high" },
+    required_reapprovals: ["G1", "G9"],
+  };
+  assert.deepEqual((await createChange(root, replayInput, "CHANGE-001")).change, replayInput);
+  await assert.rejects(
+    () => createChange(root, { ...replayInput, reason: "Conflicting replay." }, "CHANGE-001"),
+    /OPERATION_ID_CONFLICT/,
+  );
 });
 
 test("checksum drift blocks review, approval, handover, and dependent dispatch", async () => {
