@@ -18,6 +18,9 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import {
+  artifactInspect,
+  artifactList,
+  artifactValidate,
   approve,
   doctor,
   getStatus,
@@ -26,6 +29,9 @@ import {
   reviewPhase,
   setPluginStatus,
   startPhase,
+  staleList,
+  traceCheck,
+  traceCoverageReport,
   validatePhase,
 } from "@system-design-team/cli";
 import {
@@ -80,8 +86,7 @@ async function setArtifactStatus(
   const artifact = registry.artifacts.find((candidate) => candidate.id === id);
   artifact.status = registryStatus;
   artifact.version = version;
-  await ProjectStore.open(root).writeYamlAtomic(".agent-team/artifact-registry.yaml", registry);
-  await writeFile(join(root, ".agent-team", artifact.path), [
+  const text = [
     "---",
     `artifact_id: ${artifact.id}`,
     `version: ${version}`,
@@ -91,7 +96,10 @@ async function setArtifactStatus(
     "---",
     `# ${artifact.id}`,
     body,
-  ].join("\n"));
+  ].join("\n");
+  await writeFile(join(root, ".agent-team", artifact.path), text);
+  artifact.checksum = `sha256:${createHash("sha256").update(text).digest("hex")}`;
+  await ProjectStore.open(root).writeYamlAtomic(".agent-team/artifact-registry.yaml", registry);
 }
 
 async function enterArtifactValidation(root, phase, artifactId, prefix) {
@@ -178,15 +186,16 @@ test("init materializes complete workflow assets and Codex agent instructions", 
     assert.equal(registry.artifacts.length, workflow.phases.length);
     for (const phase of workflow.phases) {
       const artifact = registry.artifacts.find(({ id }) => id === phase.artifact.id);
-      assert.deepEqual(artifact, {
-        id: phase.artifact.id,
-        path: phase.artifact.path,
+      assert.equal(artifact.type, "document");
+      assert.match(artifact.checksum, /^sha256:[a-f0-9]{64}$/);
+      assert.deepEqual(artifact.dependencies, phase.depends_on.map((dependency) => ({
+        artifact_id: workflow.phases.find(({ id }) => id === dependency).artifact.id,
         version: 1,
-        status: "draft",
-        owner: phase.owner,
-        reviewer: phase.reviewer,
-        required_gate: phase.gate,
-      });
+        type: "hard_dependency",
+      })));
+      assert.deepEqual(artifact.consumers, workflow.phases
+        .filter(({ depends_on }) => depends_on.includes(phase.id))
+        .map(({ artifact: dependentArtifact }) => dependentArtifact.id));
       const text = await readFile(join(root, ".agent-team", phase.artifact.path), "utf8");
       assert.match(text, new RegExp(`artifact_id: ${phase.artifact.id}`));
       assert.match(text, new RegExp(`owner: ${phase.owner}`));
@@ -205,6 +214,132 @@ test("init materializes complete workflow assets and Codex agent instructions", 
       assert.match(text, /^## Required plugins$/m);
     }
   }
+});
+
+test("artifact and trace read operations expose persisted integrity", async () => {
+  const root = await temporaryGitRepository();
+  await initProject(root, {
+    id: "leave-system",
+    name: "Leave System",
+    mode: "greenfield",
+    profile: "standard",
+  });
+
+  const artifacts = await artifactList(root);
+  const projectCharter = await artifactInspect(root, "PROJECT-CHARTER");
+  assert.equal(artifacts.some(({ id }) => id === "PROJECT-CHARTER"), true);
+  assert.equal(projectCharter.checksum_valid, true);
+  assert.deepEqual(await artifactValidate(root, "PROJECT-CHARTER"), {
+    artifact_id: "PROJECT-CHARTER",
+    valid: true,
+    findings: [],
+  });
+  assert.deepEqual(await traceCheck(root), { valid: true, findings: [] });
+  assert.deepEqual(await traceCoverageReport(root), { total: 0, covered: 0, percentage: 100 });
+  assert.deepEqual(await staleList(root), []);
+  const bin = join(repository, "packages/cli/dist/bin.js");
+  assert.equal(JSON.parse((await execFileAsync(process.execPath, [bin, "artifact", "list"], { cwd: root })).stdout).length, artifacts.length);
+  assert.equal(JSON.parse((await execFileAsync(process.execPath, [bin, "artifact", "inspect", "PROJECT-CHARTER"], { cwd: root })).stdout).checksum_valid, true);
+  assert.equal(JSON.parse((await execFileAsync(process.execPath, [bin, "artifact", "validate", "PROJECT-CHARTER"], { cwd: root })).stdout).valid, true);
+  assert.equal(JSON.parse((await execFileAsync(process.execPath, [bin, "trace", "check"], { cwd: root })).stdout).valid, true);
+  assert.equal(JSON.parse((await execFileAsync(process.execPath, [bin, "trace", "coverage"], { cwd: root })).stdout).percentage, 100);
+  assert.deepEqual(JSON.parse((await execFileAsync(process.execPath, [bin, "stale", "list"], { cwd: root })).stdout), []);
+
+  await writeFile(
+    join(root, ".agent-team", projectCharter.path),
+    `${await readFile(join(root, ".agent-team", projectCharter.path), "utf8")}tampered\n`,
+  );
+  assert.equal((await artifactInspect(root, "PROJECT-CHARTER")).checksum_valid, false);
+  assert.equal((await artifactValidate(root, "PROJECT-CHARTER")).findings[0].code, "ARTIFACT_CHECKSUM_MISMATCH");
+});
+
+test("change creation stales only downstream artifacts and invalidates their approvals", async () => {
+  const root = await temporaryGitRepository();
+  await initProject(root, {
+    id: "leave-system",
+    name: "Leave System",
+    mode: "greenfield",
+    profile: "standard",
+  });
+  const store = ProjectStore.open(root);
+  const state = await store.readWorkflowState();
+  state.phases.intake = { status: "approved", approval_id: "APR-G0" };
+  state.phases["business-discovery"] = { status: "approved", approval_id: "APR-G1" };
+  await store.writeYamlAtomic(".agent-team/workflow-state.yaml", state);
+  await store.writeYamlAtomic(".agent-team/approvals.yaml", { approvals: [
+    {
+      id: "APR-G0", gate: "G0", decision: "approved",
+      approved_by: { type: "human", identifier: "project-owner" },
+      artifact_versions: { "PROJECT-CHARTER": 1 }, timestamp: "2026-07-12T00:00:00Z",
+    },
+    {
+      id: "APR-G1", gate: "G1", decision: "approved",
+      approved_by: { type: "human", identifier: "project-owner" },
+      artifact_versions: { "BUSINESS-CONTEXT": 1 }, timestamp: "2026-07-12T00:00:00Z",
+    },
+  ] });
+
+  const bin = join(repository, "packages/cli/dist/bin.js");
+  const result = JSON.parse((await execFileAsync(process.execPath, [
+    bin, "change", "create", "CR-001",
+    "--by", "product-owner",
+    "--artifacts", "PROJECT-CHARTER",
+    "--reason", "Approved scope changed.",
+    "--impact", "high",
+    "--reapprovals", "G1",
+    "--operation-id", "CHANGE-001",
+  ], { cwd: root })).stdout);
+
+  assert(result.stale_artifacts.includes("BUSINESS-CONTEXT"));
+  assert.equal((await staleList(root)).some(({ id }) => id === "BUSINESS-CONTEXT"), true);
+  const changedState = await store.readWorkflowState();
+  assert.equal(changedState.phases.intake.status, "approved");
+  assert.equal(changedState.phases["business-discovery"].status, "revision_required");
+  const approvals = await readYaml(root, ".agent-team/approvals.yaml");
+  assert.equal(approvals.approvals.find(({ id }) => id === "APR-G0").decision, "approved");
+  assert.equal(approvals.approvals.find(({ id }) => id === "APR-G1").decision, "revoked");
+  const events = (await readFile(join(root, ".agent-team/audit/events.jsonl"), "utf8"))
+    .trim().split("\n").map(JSON.parse);
+  assert.equal(events.filter(({ action }) => action === "change").length, 1);
+});
+
+test("checksum drift blocks review, approval, handover, and dependent dispatch", async () => {
+  const root = await temporaryGitRepository();
+  await initProject(root, {
+    id: "leave-system",
+    name: "Leave System",
+    mode: "greenfield",
+    profile: "standard",
+  });
+  await enableAllPlugins(root);
+  await setArtifactStatus(root, "PROJECT-CHARTER");
+  await startPhase(root, "intake", "CHECKSUM-START");
+  await validatePhase(root, "intake", "CHECKSUM-VALIDATE");
+  const path = join(root, ".agent-team/context/project-charter.md");
+  const original = await readFile(path, "utf8");
+  const tamper = () => writeFile(path, `${original}\nUnregistered edit.`);
+  const restore = () => writeFile(path, original);
+
+  await tamper();
+  await assert.rejects(
+    () => reviewPhase(root, "intake", "documentation-reviewer", "approved", "CHECKSUM-REVIEW"),
+    /ARTIFACT_CHECKSUM_MISMATCH/,
+  );
+  await restore();
+  await reviewPhase(root, "intake", "documentation-reviewer", "approved", "CHECKSUM-REVIEW");
+
+  await tamper();
+  await assert.rejects(() => approve(root, "G0", "project-owner", "CHECKSUM-APPROVE"), /ARTIFACT_CHECKSUM_MISMATCH/);
+  await restore();
+  await approve(root, "G0", "project-owner", "CHECKSUM-APPROVE");
+
+  await tamper();
+  await assert.rejects(() => handover(root, "intake", "CHECKSUM-HANDOVER"), /APPROVED_INPUT_STALE/);
+  await restore();
+  await handover(root, "intake", "CHECKSUM-HANDOVER");
+
+  await tamper();
+  await assert.rejects(() => startPhase(root, "business-discovery", "CHECKSUM-DISPATCH"), /APPROVED_INPUT_STALE/);
 });
 
 test("init rejects partial state without touching existing project data", async () => {

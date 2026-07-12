@@ -223,14 +223,53 @@ export const ArtifactStatusSchema = z.enum([
   "rejected",
 ]);
 
+export const ArtifactDependencySchema = z.object({
+  artifact_id: z.string().min(1),
+  version: z.number().int().positive(),
+  type: z.enum(["hard_dependency", "soft_dependency", "reference_only", "derived_from"]),
+});
+
+export const TraceabilityDocumentSchema = z.object({
+  nodes: z.array(z.object({
+    id: z.string().min(1),
+    kind: z.string().min(1),
+    status: z.string().min(1),
+  })),
+  links: z.array(z.object({
+    from: z.string().min(1),
+    to: z.string().min(1),
+    type: z.string().min(1),
+  })),
+});
+
+const ChangeImpactSchema = z.enum(["low", "medium", "high"]);
+
+export const ChangeRequestSchema = z.object({
+  id: z.string().min(1),
+  requested_by: z.string().min(1),
+  affected_artifacts: z.array(z.string().min(1)).min(1),
+  reason: z.string().min(1),
+  impact: z.object({
+    scope: ChangeImpactSchema,
+    architecture: ChangeImpactSchema,
+    security: ChangeImpactSchema,
+    schedule: ChangeImpactSchema,
+  }),
+  required_reapprovals: z.array(GateIdSchema).default([]),
+});
+
 export const ArtifactRecordSchema = z.object({
   id: z.string().min(1),
   path: z.string().min(1),
+  type: z.string().min(1).default("document"),
   version: z.number().int().positive(),
   status: ArtifactStatusSchema,
   owner: z.string().min(1),
   reviewer: z.string().min(1),
+  dependencies: z.array(ArtifactDependencySchema).default([]),
+  consumers: z.array(z.string().min(1)).default([]),
   required_gate: GateIdSchema,
+  checksum: z.string().regex(/^sha256:[a-f0-9]{64}$/),
 });
 
 export const ArtifactRegistrySchema = z.object({
@@ -277,6 +316,9 @@ export type ApprovalRecord = z.infer<typeof ApprovalRecordSchema>;
 export type ApprovalList = z.infer<typeof ApprovalListSchema>;
 export type ArtifactRecord = z.infer<typeof ArtifactRecordSchema>;
 export type ArtifactRegistry = z.infer<typeof ArtifactRegistrySchema>;
+export type ArtifactDependency = z.infer<typeof ArtifactDependencySchema>;
+export type TraceabilityDocument = z.infer<typeof TraceabilityDocumentSchema>;
+export type ChangeRequest = z.infer<typeof ChangeRequestSchema>;
 export type ReviewVerdict = z.infer<typeof ReviewVerdictSchema>;
 export type ReviewRecord = z.infer<typeof ReviewRecordSchema>;
 export type ReviewList = z.infer<typeof ReviewListSchema>;

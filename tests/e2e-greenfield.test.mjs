@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -37,8 +38,7 @@ async function makeReviewReady(root, artifactId) {
   const registry = await readYaml(root, ".agent-team/artifact-registry.yaml");
   const artifact = registry.artifacts.find(({ id }) => id === artifactId);
   artifact.status = "in_review";
-  await store.writeYamlAtomic(".agent-team/artifact-registry.yaml", registry);
-  await store.writeTextAtomic(`.agent-team/${artifact.path}`, [
+  const text = [
     "---",
     `artifact_id: ${artifact.id}`,
     `version: ${artifact.version}`,
@@ -48,7 +48,10 @@ async function makeReviewReady(root, artifactId) {
     "---",
     `# ${artifact.id}`,
     "The artifact is complete and ready for independent review.",
-  ].join("\n"));
+  ].join("\n");
+  artifact.checksum = `sha256:${createHash("sha256").update(text).digest("hex")}`;
+  await store.writeYamlAtomic(".agent-team/artifact-registry.yaml", registry);
+  await store.writeTextAtomic(`.agent-team/${artifact.path}`, text);
 }
 
 test("greenfield requirements flow blocks missing plugins and reaches handover with evidence", async (t) => {

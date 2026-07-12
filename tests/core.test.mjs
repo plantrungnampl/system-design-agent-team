@@ -207,6 +207,7 @@ test("validates persisted CLI wrapper records", () => {
       owner: "lead-orchestrator",
       reviewer: "documentation-reviewer",
       required_gate: "G0",
+      checksum: `sha256:${"a".repeat(64)}`,
     }],
   });
   const lock = core.FrameworkLockSchema.parse({
@@ -264,4 +265,43 @@ test("validates persisted CLI wrapper records", () => {
   assert.throws(() => core.ArtifactRegistrySchema.parse({
     artifacts: [{ ...registry.artifacts[0], version: 0 }],
   }));
+});
+
+test("artifact, traceability, and change contracts preserve dependency metadata", () => {
+  const dependency = core.ArtifactDependencySchema.parse({
+    artifact_id: "PROJECT-CHARTER",
+    version: 1,
+    type: "hard_dependency",
+  });
+  const traceability = core.TraceabilityDocumentSchema.parse({
+    nodes: [{ id: "PROJECT-CHARTER", kind: "artifact", status: "approved" }],
+    links: [{ from: "PROJECT-CHARTER", to: "REQUIREMENTS", type: "hard_dependency" }],
+  });
+  const change = core.ChangeRequestSchema.parse({
+    id: "CR-001",
+    requested_by: "product-owner",
+    affected_artifacts: ["PROJECT-CHARTER"],
+    reason: "Approved scope changed.",
+    impact: { scope: "high", architecture: "medium", security: "low", schedule: "high" },
+    required_reapprovals: ["G0"],
+  });
+  const artifact = core.ArtifactRecordSchema.parse({
+    id: "REQUIREMENTS",
+    path: "requirements/requirements.md",
+    type: "requirements",
+    version: 1,
+    status: "approved",
+    owner: "business-analyst",
+    reviewer: "requirements-reviewer",
+    dependencies: [dependency],
+    consumers: ["PRODUCT-BACKLOG"],
+    required_gate: "G2",
+    checksum: `sha256:${"a".repeat(64)}`,
+  });
+
+  assert.equal(artifact.dependencies[0].type, "hard_dependency");
+  assert.deepEqual(artifact.consumers, ["PRODUCT-BACKLOG"]);
+  assert.equal(traceability.links[0].to, "REQUIREMENTS");
+  assert.equal(change.required_reapprovals[0], "G0");
+  assert.throws(() => core.ArtifactRecordSchema.parse({ ...artifact, checksum: "sha256:bad" }));
 });

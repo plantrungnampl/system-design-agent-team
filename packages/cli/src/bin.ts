@@ -9,7 +9,11 @@ import {
   ReviewVerdictSchema,
 } from "@system-design-team/core";
 import {
+  artifactInspect,
+  artifactList,
+  artifactValidate,
   approve,
+  createChange,
   doctor,
   getStatus,
   handover,
@@ -17,6 +21,9 @@ import {
   repair,
   reviewPhase,
   startPhase,
+  staleList,
+  traceCheck,
+  traceCoverageReport,
   validatePhase,
 } from "./index.js";
 
@@ -30,6 +37,13 @@ Commands:
   review <phase> --reviewer <id> --verdict <approved|revision_required> --operation-id <id>
   approve <gate> --by <id> --operation-id <id>
   handover <phase> --operation-id <id>
+  artifact list
+  artifact inspect <id>
+  artifact validate <id>
+  trace check
+  trace coverage
+  stale list
+  change create <id> --by <id> --artifacts <ids> --reason <text> --impact <low|medium|high> --operation-id <id>
   doctor
   repair --locks --yes`;
 
@@ -41,6 +55,13 @@ const commandShape: Record<string, { positionals: number; options: string[] }> =
   review: { positionals: 2, options: ["reviewer", "verdict", "operation-id"] },
   approve: { positionals: 2, options: ["by", "operation-id"] },
   handover: { positionals: 2, options: ["operation-id"] },
+  "artifact list": { positionals: 2, options: [] },
+  "artifact inspect": { positionals: 3, options: [] },
+  "artifact validate": { positionals: 3, options: [] },
+  "trace check": { positionals: 2, options: [] },
+  "trace coverage": { positionals: 2, options: [] },
+  "stale list": { positionals: 2, options: [] },
+  "change create": { positionals: 3, options: ["by", "artifacts", "reason", "impact", "reapprovals", "operation-id"] },
   doctor: { positionals: 1, options: [] },
   repair: { positionals: 1, options: ["locks", "yes"] },
 };
@@ -81,15 +102,22 @@ async function main(): Promise<void> {
       reviewer: { type: "string" },
       verdict: { type: "string" },
       "operation-id": { type: "string" },
+      artifacts: { type: "string" },
+      reason: { type: "string" },
+      impact: { type: "string" },
+      reapprovals: { type: "string" },
       locks: { type: "boolean" },
       yes: { type: "boolean" },
     },
   });
-  const command = positionals[0];
-  if (!command) {
+  const rootCommand = positionals[0];
+  if (!rootCommand) {
     console.log(usage);
     return;
   }
+  const command = ["artifact", "trace", "stale", "change"].includes(rootCommand)
+    ? `${rootCommand} ${positionals[1] ?? ""}`
+    : rootCommand;
   validateInvocation(command, positionals, values);
   if (values.help) {
     console.log(usage);
@@ -141,6 +169,40 @@ async function main(): Promise<void> {
         required(values["operation-id"], "--operation-id"),
       );
       break;
+    case "artifact list":
+      result = await artifactList(root);
+      break;
+    case "artifact inspect":
+      result = await artifactInspect(root, required(positionals[2], "artifact id"));
+      break;
+    case "artifact validate":
+      result = await artifactValidate(root, required(positionals[2], "artifact id"));
+      break;
+    case "trace check":
+      result = await traceCheck(root);
+      break;
+    case "trace coverage":
+      result = await traceCoverageReport(root);
+      break;
+    case "stale list":
+      result = await staleList(root);
+      break;
+    case "change create": {
+      const inputLevel = required(values.impact, "--impact");
+      const level = (["low", "medium", "high"] as const).find((candidate) => candidate === inputLevel);
+      if (!level) throw new Error("--impact must be low, medium, or high");
+      result = await createChange(root, {
+        id: required(positionals[2], "change id"),
+        requested_by: required(values.by, "--by"),
+        affected_artifacts: required(values.artifacts, "--artifacts").split(",").filter(Boolean),
+        reason: required(values.reason, "--reason"),
+        impact: { scope: level, architecture: level, security: level, schedule: level },
+        required_reapprovals: values.reapprovals
+          ? values.reapprovals.split(",").map((gate) => GateIdSchema.parse(gate))
+          : [],
+      }, required(values["operation-id"], "--operation-id"));
+      break;
+    }
     case "validate":
       result = await validatePhase(
         root,
@@ -163,7 +225,8 @@ async function main(): Promise<void> {
   console.log(JSON.stringify(result, null, 2));
   const outcome = result as { ok?: boolean; valid?: boolean };
   if ((command === "doctor" && outcome.ok === false)
-    || (command === "validate" && outcome.valid === false)) {
+    || ((command === "validate" || command === "artifact validate" || command === "trace check")
+      && outcome.valid === false)) {
     process.exitCode = 1;
   }
 }

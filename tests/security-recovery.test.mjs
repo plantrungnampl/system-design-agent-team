@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { once } from "node:events";
 import {
   access,
@@ -174,8 +175,7 @@ test("initialization preserves source and AGENTS while lifecycle exclusion recov
   const registry = parse(await readFile(join(root, ".agent-team/artifact-registry.yaml"), "utf8"));
   const artifact = registry.artifacts.find(({ id }) => id === "PROJECT-CHARTER");
   artifact.status = "in_review";
-  await store.writeYamlAtomic(".agent-team/artifact-registry.yaml", registry);
-  await store.writeTextAtomic(`.agent-team/${artifact.path}`, [
+  const text = [
     "---",
     "artifact_id: PROJECT-CHARTER",
     "version: 1",
@@ -185,7 +185,10 @@ test("initialization preserves source and AGENTS while lifecycle exclusion recov
     "---",
     "# Project Charter",
     "Ready for review.",
-  ].join("\n"));
+  ].join("\n");
+  artifact.checksum = `sha256:${createHash("sha256").update(text).digest("hex")}`;
+  await store.writeYamlAtomic(".agent-team/artifact-registry.yaml", registry);
+  await store.writeTextAtomic(`.agent-team/${artifact.path}`, text);
   assert.equal((await validatePhase(root, "intake", "OP-VALIDATE")).valid, true);
 
   await store.withLock(".agent-team/lifecycle.lock", async () => {

@@ -20,6 +20,7 @@
     "@system-design-team/core": "0.1.0",
     "@system-design-team/plugin-registry": "0.1.0",
     "@system-design-team/project-store": "0.1.0",
+    "@system-design-team/traceability": "0.1.0",
     "@system-design-team/workflow-engine": "0.1.0",
     "yaml": "^2.8.1"
   }

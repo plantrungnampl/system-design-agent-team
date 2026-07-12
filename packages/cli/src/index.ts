@@ -10,6 +10,7 @@ import {
   ApprovalListSchema,
   ApprovalRecordSchema,
   ArtifactRegistrySchema,
+  ChangeRequestSchema,
   FRAMEWORK_VERSION,
   FrameworkLockSchema,
   HandoverRecordSchema,
@@ -18,10 +19,12 @@ import {
   ReviewListSchema,
   ReviewRecordSchema,
   ReviewVerdictSchema,
+  TraceabilityDocumentSchema,
   WorkflowDefinitionSchema,
   WorkflowStateSchema,
   type AgentManifest,
   type ArtifactRecord,
+  type ChangeRequest,
   type GateId,
   type HandoverRecord,
   type PluginStatusRecord,
@@ -34,6 +37,7 @@ import {
 } from "@system-design-team/core";
 import { PluginRegistry } from "@system-design-team/plugin-registry";
 import { GENERATED_LOCK_PATHS, ProjectStore } from "@system-design-team/project-store";
+import { propagateStaleness, traceCoverage, validateTraceability } from "@system-design-team/traceability";
 import { approveGate, transitionPhase } from "@system-design-team/workflow-engine";
 import { parse } from "yaml";
 
@@ -146,6 +150,10 @@ function renderPhaseArtifact(phase: WorkflowDefinition["phases"][number]): strin
   ].join("\n");
 }
 
+function artifactChecksum(text: string): string {
+  return `sha256:${createHash("sha256").update(text).digest("hex")}`;
+}
+
 function renderAgentInstruction(agent: AgentManifest): string {
   const bullets = (values: readonly string[]) => values.map((value) => `- ${value}`).join("\n");
   const plugins = agent.required_plugins.length === 0
@@ -217,16 +225,39 @@ export async function initProject(root: string, options: InitOptions): Promise<P
   });
   const approvals = ApprovalListSchema.parse({ approvals: [] });
   const reviews = ReviewListSchema.parse({ reviews: [] });
+  const artifactTexts = new Map(workflow.phases.map((phase) => [phase.id, renderPhaseArtifact(phase)]));
   const registry = ArtifactRegistrySchema.parse({
     artifacts: workflow.phases.map((phase) => ({
       id: phase.artifact.id,
       path: phase.artifact.path,
+      type: "document",
       version: 1,
       status: "draft",
       owner: phase.owner,
       reviewer: phase.reviewer,
+      dependencies: phase.depends_on.map((dependency) => ({
+        artifact_id: workflow.phases.find((candidate) => candidate.id === dependency)!.artifact.id,
+        version: 1,
+        type: "hard_dependency",
+      })),
+      consumers: workflow.phases
+        .filter((candidate) => candidate.depends_on.includes(phase.id))
+        .map((candidate) => candidate.artifact.id),
       required_gate: phase.gate,
+      checksum: artifactChecksum(artifactTexts.get(phase.id)!),
     })),
+  });
+  const traceability = TraceabilityDocumentSchema.parse({
+    nodes: registry.artifacts.map((artifact) => ({
+      id: artifact.id,
+      kind: "artifact",
+      status: artifact.status,
+    })),
+    links: registry.artifacts.flatMap((artifact) => artifact.dependencies.map((dependency) => ({
+      from: dependency.artifact_id,
+      to: artifact.id,
+      type: dependency.type,
+    }))),
   });
   const lock = FrameworkLockSchema.parse({
     framework: { version: FRAMEWORK_VERSION },
@@ -253,11 +284,12 @@ export async function initProject(root: string, options: InitOptions): Promise<P
     await store.writeYamlAtomic(".agent-team/approvals.yaml", approvals);
     await store.writeYamlAtomic(".agent-team/reviews.yaml", reviews);
     await store.writeYamlAtomic(".agent-team/artifact-registry.yaml", registry);
+    await store.writeYamlAtomic(".agent-team/traceability.yaml", traceability);
     await store.writeYamlAtomic(".agent-team/framework-lock.yaml", lock);
     for (const phase of workflow.phases) {
       await store.writeTextAtomic(
         `.agent-team/${phase.artifact.path}`,
-        renderPhaseArtifact(phase),
+        artifactTexts.get(phase.id)!,
       );
     }
     await store.writeTextAtomic(".agent-team/handovers/.gitkeep", "");
@@ -350,14 +382,19 @@ export async function startPhase(
   const store = ProjectStore.open(root);
   return store.withLock(".agent-team/lifecycle.lock", async () => {
   const state = await store.readWorkflowState();
+  const workflow = await configuredWorkflow(store);
+  const definition = workflow.phases.find((candidate) => candidate.id === phase);
+  if (!definition) throw new Error("PHASE_NOT_CONFIGURED");
+  const registry = await artifactRegistry(store);
+  const inputIds = new Set(definition.depends_on.map((dependency) =>
+    workflow.phases.find((candidate) => candidate.id === dependency)!.artifact.id));
+  if ((await inspectArtifacts(root, registry.artifacts.filter(({ id }) => inputIds.has(id)))).length > 0) {
+    throw new Error("APPROVED_INPUT_STALE");
+  }
   if (state.completed_operations.includes(scopedOperation)) {
     await appendOperationAudit(store, scopedOperation, "start", phase);
     return state;
   }
-
-  const workflow = await configuredWorkflow(store);
-  const definition = workflow.phases.find((candidate) => candidate.id === phase);
-  if (!definition) throw new Error("PHASE_NOT_CONFIGURED");
   const owner = (await readCatalogue()).find((agent) => agent.id === definition.owner);
   if (!owner) throw new Error(`AGENT_NOT_CONFIGURED: ${definition.owner}`);
   const report = new PluginRegistry((await pluginStatus(store)).plugins).check(owner);
@@ -395,10 +432,14 @@ async function readArtifact(root: string, artifact: ArtifactRecord): Promise<str
 
 const reviewReadyStatuses = new Set(["in_review", "approved", "approved_with_conditions"]);
 
-async function inspectArtifacts(root: string, artifacts: readonly ArtifactRecord[]) {
+async function inspectArtifacts(
+  root: string,
+  artifacts: readonly ArtifactRecord[],
+  requireReviewReady = true,
+) {
   const findings: { artifact_id?: string; code: string; message: string }[] = [];
   for (const artifact of artifacts) {
-    if (!reviewReadyStatuses.has(artifact.status)) {
+    if (requireReviewReady && !reviewReadyStatuses.has(artifact.status)) {
       findings.push({
         artifact_id: artifact.id,
         code: "ARTIFACT_NOT_REVIEW_READY",
@@ -409,7 +450,14 @@ async function inspectArtifacts(root: string, artifacts: readonly ArtifactRecord
       const text = await readArtifact(root, artifact);
       const parsed = parseArtifact(text);
       const status = String(parsed.metadata.status ?? "");
-      if (!reviewReadyStatuses.has(status)) {
+      if (artifactChecksum(text) !== artifact.checksum) {
+        findings.push({
+          artifact_id: artifact.id,
+          code: "ARTIFACT_CHECKSUM_MISMATCH",
+          message: `${artifact.id} content does not match its registered checksum`,
+        });
+      }
+      if (requireReviewReady && !reviewReadyStatuses.has(status)) {
         findings.push({
           artifact_id: artifact.id,
           code: "ARTIFACT_NOT_REVIEW_READY",
@@ -439,6 +487,122 @@ async function inspectArtifacts(root: string, artifacts: readonly ArtifactRecord
     }
   }
   return findings;
+}
+
+export async function artifactList(root: string): Promise<ArtifactRecord[]> {
+  return [...(await artifactRegistry(ProjectStore.open(root))).artifacts]
+    .sort((left, right) => left.id.localeCompare(right.id));
+}
+
+export async function artifactInspect(root: string, id: string) {
+  const artifact = (await artifactRegistry(ProjectStore.open(root))).artifacts
+    .find((candidate) => candidate.id === id);
+  if (!artifact) throw new Error("ARTIFACT_NOT_FOUND");
+  return { ...artifact, checksum_valid: artifactChecksum(await readArtifact(root, artifact)) === artifact.checksum };
+}
+
+export async function artifactValidate(root: string, id: string) {
+  const registry = await artifactRegistry(ProjectStore.open(root));
+  const artifact = registry.artifacts.find((candidate) => candidate.id === id);
+  if (!artifact) throw new Error("ARTIFACT_NOT_FOUND");
+  const findings = await inspectArtifacts(root, [artifact], false);
+  return { artifact_id: id, valid: findings.length === 0, findings };
+}
+
+async function traceabilityDocument(store: ProjectStore) {
+  return store.readYaml(".agent-team/traceability.yaml", TraceabilityDocumentSchema);
+}
+
+export async function traceCheck(root: string) {
+  const document = await traceabilityDocument(ProjectStore.open(root));
+  const findings = validateTraceability(document.nodes, document.links);
+  return { valid: findings.length === 0, findings };
+}
+
+export async function traceCoverageReport(root: string) {
+  const document = await traceabilityDocument(ProjectStore.open(root));
+  return traceCoverage(document.nodes, document.links);
+}
+
+export async function staleList(root: string): Promise<ArtifactRecord[]> {
+  return (await artifactList(root)).filter(({ status }) => status === "stale");
+}
+
+export async function createChange(
+  root: string,
+  input: ChangeRequest,
+  operationId: string,
+) {
+  requireOperationId(operationId);
+  const change = ChangeRequestSchema.parse(input);
+  const scopedOperation = operationKey("change", change.id, operationId);
+  const store = ProjectStore.open(root);
+  return store.withLock(".agent-team/lifecycle.lock", async () => {
+    const [state, workflow, registry, approvals, traceability] = await Promise.all([
+      store.readWorkflowState(),
+      configuredWorkflow(store),
+      artifactRegistry(store),
+      store.readYaml(".agent-team/approvals.yaml", ApprovalListSchema),
+      traceabilityDocument(store),
+    ]);
+    const artifactIds = new Set(registry.artifacts.map(({ id }) => id));
+    if (change.affected_artifacts.some((id) => !artifactIds.has(id))) {
+      throw new Error("ARTIFACT_NOT_FOUND");
+    }
+    const staleArtifacts = [...propagateStaleness(change.affected_artifacts, traceability.links)]
+      .filter((id) => artifactIds.has(id))
+      .sort();
+    if (state.completed_operations.includes(scopedOperation)) {
+      await store.readYaml(`.agent-team/changes/${change.id}.yaml`, ChangeRequestSchema);
+      await appendOperationAudit(store, scopedOperation, "change", change.id);
+      return { change, stale_artifacts: staleArtifacts };
+    }
+
+    const staleIds = new Set(staleArtifacts);
+    const stalePhases = new Set(workflow.phases
+      .filter(({ artifact }) => staleIds.has(artifact.id))
+      .map(({ id }) => id));
+    const nextRegistry = ArtifactRegistrySchema.parse({
+      artifacts: registry.artifacts.map((artifact) =>
+        staleIds.has(artifact.id) ? { ...artifact, status: "stale" } : artifact),
+    });
+    const nextApprovals = ApprovalListSchema.parse({
+      approvals: approvals.approvals.map((approval) =>
+        Object.keys(approval.artifact_versions).some((id) => staleIds.has(id))
+          && (approval.decision === "approved" || approval.decision === "approved_with_conditions")
+          ? { ...approval, decision: "revoked" }
+          : approval),
+    });
+    const nextTraceability = TraceabilityDocumentSchema.parse({
+      ...traceability,
+      nodes: traceability.nodes.map((node) =>
+        staleIds.has(node.id) ? { ...node, status: "stale" } : node),
+    });
+
+    await store.writeYamlAtomic(`.agent-team/changes/${change.id}.yaml`, change);
+    await store.writeYamlAtomic(".agent-team/artifact-registry.yaml", nextRegistry);
+    await store.writeYamlAtomic(".agent-team/approvals.yaml", nextApprovals);
+    await store.writeYamlAtomic(".agent-team/traceability.yaml", nextTraceability);
+    await store.updateWorkflowState(state.state_version, (current) => ({
+      ...current,
+      state_version: current.state_version + 1,
+      current_phase: workflow.phases.find(({ id }) => stalePhases.has(id))?.id ?? current.current_phase,
+      completed_operations: [...current.completed_operations, scopedOperation],
+      phases: Object.fromEntries(Object.entries(current.phases).map(([id, phaseState]) => {
+        if (!stalePhases.has(id)) return [id, phaseState];
+        const {
+          review_id: _reviewId,
+          approval_id: _approvalId,
+          handover_id: _handoverId,
+          handover_digest: _handoverDigest,
+          ...reopened
+        } = phaseState;
+        return [id, { ...reopened, status: "revision_required" }];
+      })),
+    }));
+    await appendOperationAudit(store, scopedOperation, "change", change.id);
+    return { change, stale_artifacts: staleArtifacts };
+  });
 }
 
 export async function validatePhase(root: string, phase: string, operationId: string) {
@@ -528,6 +692,10 @@ export async function reviewPhase(
       throw new Error("OPERATION_ID_CONFLICT");
     }
     if (state.phases[phase]?.review_id !== existing.id) throw new Error("REVIEW_EVIDENCE_MISSING");
+    const replayDefinition = workflow.phases.find((candidate) => candidate.id === phase);
+    const [finding] = await inspectArtifacts(root, registry.artifacts.filter((artifact) =>
+      artifact.owner === replayDefinition?.owner && artifact.required_gate === replayDefinition.gate));
+    if (finding) throw new Error(`${finding.code}: ${finding.message}`);
     await appendOperationAudit(store, evidenceId, "review", phase);
     return state;
   }
@@ -649,6 +817,9 @@ export async function approve(
       || existing.approved_by.identifier !== approver) {
       throw new Error("OPERATION_ID_CONFLICT");
     }
+    const [finding] = await inspectArtifacts(root, registry.artifacts.filter((artifact) =>
+      artifact.required_gate === gate));
+    if (finding) throw new Error(`${finding.code}: ${finding.message}`);
     await appendOperationAudit(store, scopedOperation, "approve", gate);
     return state;
   }
@@ -729,8 +900,15 @@ export async function handover(
 
   if (state.completed_operations.includes(scopedOperation)) {
     if (!stored) throw new Error("HANDOVER_EVIDENCE_MISSING");
-    const approvals = await store.readYaml(".agent-team/approvals.yaml", ApprovalListSchema);
+    const [approvals, registry] = await Promise.all([
+      store.readYaml(".agent-team/approvals.yaml", ApprovalListSchema),
+      artifactRegistry(store),
+    ]);
     const approval = approvals.approvals.find((candidate) => candidate.id === phaseState.approval_id);
+    if ((await inspectArtifacts(root, registry.artifacts.filter((artifact) =>
+      artifact.required_gate === definition.gate && artifact.owner === definition.owner))).length > 0) {
+      throw new Error("APPROVED_INPUT_STALE");
+    }
     if (phaseState.handover_id !== scopedOperation
       || !phaseState.handover_digest
       || handoverDigest(stored) !== phaseState.handover_digest

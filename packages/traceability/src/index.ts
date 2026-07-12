@@ -1,14 +1,7 @@
-export interface TraceNode {
-  id: string;
-  kind: string;
-  status: string;
-}
+import type { TraceabilityDocument } from "@system-design-team/core";
 
-export interface TraceLink {
-  from: string;
-  to: string;
-  type: string;
-}
+export type TraceNode = TraceabilityDocument["nodes"][number];
+export type TraceLink = TraceabilityDocument["links"][number];
 
 export interface TraceabilityFinding {
   code: "REQUIREMENT_WITHOUT_TEST";

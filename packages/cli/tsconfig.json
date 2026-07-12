@@ -11,6 +11,7 @@
     { "path": "../workflow-engine" },
     { "path": "../project-store" },
     { "path": "../artifact-validator" },
+    { "path": "../traceability" },
     { "path": "../plugin-registry" }
   ]
 }

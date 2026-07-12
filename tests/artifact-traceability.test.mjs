@@ -131,3 +131,10 @@ test("staleness follows hard dependencies transitively and direct derivations", 
   assert.deepEqual([...propagateStaleness(["SRS"], links)], ["BACKLOG", "GENERATED", "PLAN"]);
   assert.deepEqual(links, snapshot);
 });
+
+test("staleness does not propagate through soft dependencies", () => {
+  assert.deepEqual([...propagateStaleness(["SRS"], [
+    { from: "SRS", to: "BACKLOG", type: "soft_dependency" },
+    { from: "BACKLOG", to: "PLAN", type: "hard_dependency" },
+  ])], []);
+});
