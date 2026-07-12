@@ -360,6 +360,15 @@ function artifactVersions(artifacts: readonly ArtifactRecord[]): Record<string, 
   );
 }
 
+function sameArtifactVersions(
+  left: Record<string, number>,
+  right: Record<string, number>,
+): boolean {
+  const entries = (value: Record<string, number>) => Object.entries(value)
+    .sort(([leftId], [rightId]) => leftId.localeCompare(rightId));
+  return JSON.stringify(entries(left)) === JSON.stringify(entries(right));
+}
+
 export async function reviewPhase(
   root: string,
   phase: string,
@@ -374,6 +383,7 @@ export async function reviewPhase(
   const underReviewId = operationKey("review-under-review", phase, operationId);
   const verdictId = operationKey("review-verdict", phase, operationId);
   const store = ProjectStore.open(root);
+  return store.withLock(".agent-team/lifecycle.lock", async () => {
   const [workflow, state, reviews, registry] = await Promise.all([
     configuredWorkflow(store),
     store.readWorkflowState(),
@@ -382,13 +392,17 @@ export async function reviewPhase(
   ]);
   const definition = workflow.phases.find((candidate) => candidate.id === phase);
   if (!definition) throw new Error("PHASE_NOT_CONFIGURED");
-  if (!reviewerId || reviewerId !== definition.reviewer || reviewerId === definition.owner) {
-    throw new Error("REVIEWER_NOT_CONFIGURED");
-  }
   const existing = reviews.reviews.find((review) => review.id === evidenceId);
   if (state.completed_operations.includes(verdictId)) {
     if (!existing) throw new Error("REVIEW_EVIDENCE_MISSING");
+    if (existing.phase !== phase || existing.reviewer !== reviewerId || existing.verdict !== verdict) {
+      throw new Error("OPERATION_ID_CONFLICT");
+    }
+    if (state.phases[phase]?.review_id !== existing.id) throw new Error("REVIEW_EVIDENCE_MISSING");
     return state;
+  }
+  if (!reviewerId || reviewerId !== definition.reviewer || reviewerId === definition.owner) {
+    throw new Error("REVIEWER_NOT_CONFIGURED");
   }
   const artifacts = registry.artifacts.filter(
     (artifact) => artifact.owner === definition.owner && artifact.required_gate === definition.gate,
@@ -413,17 +427,25 @@ export async function reviewPhase(
       throw new Error("OPERATION_ID_CONFLICT");
     }
   }
+  const bindReview = (value: WorkflowState): WorkflowState => {
+    const current = value.phases[phase];
+    if (!current) throw new Error("PHASE_NOT_CONFIGURED");
+    return {
+      ...value,
+      phases: { ...value.phases, [phase]: { ...current, review_id: evidenceId } },
+    };
+  };
 
   let preview = state;
   if (!preview.completed_operations.includes(underReviewId)) {
-    preview = transitionPhase(preview, workflow, {
+    preview = transitionPhase(bindReview(preview), workflow, {
       phase,
       to: "under_review",
       operation_id: underReviewId,
     });
   }
   if (!preview.completed_operations.includes(verdictId)) {
-    preview = transitionPhase(preview, workflow, {
+    preview = transitionPhase(bindReview(preview), workflow, {
       phase,
       to: verdict === "approved" ? "awaiting_approval" : "revision_required",
       operation_id: verdictId,
@@ -439,14 +461,14 @@ export async function reviewPhase(
   let current = state;
   if (!current.completed_operations.includes(underReviewId)) {
     current = await store.updateWorkflowState(current.state_version, (value) => transitionPhase(
-      value,
+      bindReview(value),
       workflow,
       { phase, to: "under_review", operation_id: underReviewId },
     ));
   }
   if (!current.completed_operations.includes(verdictId)) {
     current = await store.updateWorkflowState(current.state_version, (value) => transitionPhase(
-      value,
+      bindReview(value),
       workflow,
       {
         phase,
@@ -456,6 +478,7 @@ export async function reviewPhase(
     ));
   }
   return current;
+  });
 }
 
 export async function approve(
@@ -469,15 +492,23 @@ export async function approve(
   if (!approver) throw new Error("APPROVER_REQUIRED");
   const scopedOperation = operationKey("approve", gate, operationId);
   const store = ProjectStore.open(root);
-  const [state, workflow, approvals, registry] = await Promise.all([
+  return store.withLock(".agent-team/lifecycle.lock", async () => {
+  const [state, workflow, approvals, reviews, registry] = await Promise.all([
     store.readWorkflowState(),
     configuredWorkflow(store),
     store.readYaml(".agent-team/approvals.yaml", ApprovalListSchema),
+    store.readYaml(".agent-team/reviews.yaml", ReviewListSchema),
     artifactRegistry(store),
   ]);
   const existing = approvals.approvals.find((approval) => approval.id === scopedOperation);
   if (state.completed_operations.includes(scopedOperation)) {
     if (!existing) throw new Error("APPROVAL_EVIDENCE_MISSING");
+    if (existing.gate !== gate
+      || existing.decision !== "approved"
+      || existing.approved_by.type !== "human"
+      || existing.approved_by.identifier !== approver) {
+      throw new Error("OPERATION_ID_CONFLICT");
+    }
     return state;
   }
 
@@ -492,6 +523,14 @@ export async function approve(
   if (Object.keys(versions).length === 0) throw new Error("APPROVAL_ARTIFACTS_REQUIRED");
   const [finding] = await inspectArtifacts(root, artifacts);
   if (finding) throw new Error(`${finding.code}: ${finding.message}`);
+  const reviewId = state.phases[definition.id]?.review_id;
+  const review = reviews.reviews.find((candidate) => candidate.id === reviewId);
+  if (!reviewId || !review) throw new Error("REVIEW_EVIDENCE_MISSING");
+  if (review.phase !== definition.id
+    || review.verdict !== "approved"
+    || !sameArtifactVersions(review.artifact_versions, versions)) {
+    throw new Error("REVIEW_VERSION_MISMATCH");
+  }
   const expected = {
     id: scopedOperation,
     gate,
@@ -515,6 +554,7 @@ export async function approve(
   }
   return store.updateWorkflowState(state.state_version, (current) =>
     approveGate(current, workflow, approval));
+  });
 }
 
 export async function handover(
@@ -525,6 +565,7 @@ export async function handover(
   requireOperationId(operationId);
   const scopedOperation = operationKey("handover", phase, operationId);
   const store = ProjectStore.open(root);
+  return store.withLock(".agent-team/lifecycle.lock", async () => {
   const [workflow, approvals, registry] = await Promise.all([
     configuredWorkflow(store),
     store.readYaml(".agent-team/approvals.yaml", ApprovalListSchema),
@@ -609,6 +650,7 @@ export async function handover(
     ));
   }
   return state;
+  });
 }
 
 export async function getStatus(root: string) {

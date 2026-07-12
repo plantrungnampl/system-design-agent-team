@@ -362,9 +362,11 @@ test("review records independent evidence and applies two idempotent state updat
   );
   const evidence = await readYaml(root, ".agent-team/reviews.yaml");
   assert.equal(reviewed.phases.intake.status, "awaiting_approval");
+  assert.equal(reviewed.phases.intake.review_id, evidence.reviews[0].id);
   assert.equal(reviewed.state_version, validated.state.state_version + 2);
   assert.equal(evidence.reviews[0].id, operationKey("review", "intake", "OP-REVIEW"));
   assert.deepEqual(evidence.reviews[0].artifact_versions, { "PROJECT-CHARTER": 1 });
+  await setArtifactStatus(root, "PROJECT-CHARTER", { version: 2 });
   assert.deepEqual(await reviewPhase(
     root,
     "intake",
@@ -373,6 +375,20 @@ test("review records independent evidence and applies two idempotent state updat
     "OP-REVIEW",
   ), reviewed);
   assert.equal((await readYaml(root, ".agent-team/reviews.yaml")).reviews.length, 1);
+  await assert.rejects(() => reviewPhase(
+    root,
+    "intake",
+    "documentation-reviewer",
+    "revision_required",
+    "OP-REVIEW",
+  ), /OPERATION_ID_CONFLICT/);
+  await assert.rejects(() => reviewPhase(
+    root,
+    "intake",
+    "lead-orchestrator",
+    "approved",
+    "OP-REVIEW",
+  ), /OPERATION_ID_CONFLICT/);
 });
 
 test("review can require revision without automated reviewer execution", async () => {
@@ -417,12 +433,41 @@ test("approve persists registry-bound evidence and is idempotent", async () => {
   assert.equal(approval.approved_by.identifier, "project-owner");
   assert.equal(approval.id, operationKey("approve", "G2", "OP-APPROVE-G2"));
 
+  await setArtifactStatus(root, "REQUIREMENTS", { version: 2 });
   assert.deepEqual(await approve(root, "G2", "project-owner", "OP-APPROVE-G2"), approved);
+  await assert.rejects(
+    () => approve(root, "G2", "alternate-owner", "OP-APPROVE-G2"),
+    /OPERATION_ID_CONFLICT/,
+  );
   assert.equal(
     (await readYaml(root, ".agent-team/approvals.yaml")).approvals
       .filter(({ gate }) => gate === "G2").length,
     1,
   );
+});
+
+test("approval rejects artifact versions that were not independently reviewed", async () => {
+  const root = await temporaryGitRepository();
+  await initProject(root, {
+    id: "leave-system",
+    name: "Leave System",
+    mode: "greenfield",
+    profile: "standard",
+  });
+  await setPluginStatus(root, pluginUri, "available", ["brainstorming"]);
+  await requirementsAwaitingApproval(root, "VERSION-BINDING");
+  await setArtifactStatus(root, "REQUIREMENTS", { version: 2 });
+
+  await assert.rejects(
+    () => approve(root, "G2", "project-owner", "OP-UNREVIEWED-V2"),
+    /REVIEW_VERSION_MISMATCH/,
+  );
+  assert.equal(
+    (await readYaml(root, ".agent-team/approvals.yaml")).approvals
+      .filter(({ gate }) => gate === "G2").length,
+    0,
+  );
+  assert.equal((await ProjectStore.open(root).readWorkflowState()).phases.requirements.status, "awaiting_approval");
 });
 
 test("approval rejects non-ready artifacts and trimmed self-approval", async () => {

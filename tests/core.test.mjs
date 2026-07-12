@@ -67,6 +67,19 @@ test("validates persisted CLI wrapper records", () => {
       timestamp: "2026-07-11T00:00:00Z",
     }],
   });
+  const state = core.WorkflowStateSchema.parse({
+    schema_version: 1,
+    state_version: 1,
+    project_id: "leave-system",
+    current_phase: "requirements",
+    phases: {
+      requirements: {
+        status: "awaiting_approval",
+        review_id: reviews.reviews[0].id,
+      },
+    },
+    completed_operations: [],
+  });
 
   assert.equal(project.project.mode, "greenfield");
   assert.equal(plugins.plugins[0].status, "unknown");
@@ -76,6 +89,7 @@ test("validates persisted CLI wrapper records", () => {
   assert.equal(handover.id, '["handover","requirements","OP-1"]');
   assert.equal(handover.phase, "requirements");
   assert.equal(reviews.reviews[0].verdict, "approved");
+  assert.equal(state.phases.requirements.review_id, reviews.reviews[0].id);
   assert.throws(() => core.ReviewRecordSchema.parse({
     ...reviews.reviews[0],
     verdict: "looks_good",

@@ -150,6 +150,31 @@ test("allows exactly one concurrent update for the same state version", async (t
   );
 });
 
+test("allows only one concurrent caller inside a shared lock", async (t) => {
+  const root = await projectWithState(t);
+  const store = ProjectStore.open(root);
+  let release;
+  let entered;
+  const inside = new Promise((resolve) => { entered = resolve; });
+  const held = new Promise((resolve) => { release = resolve; });
+  const first = store.withLock(".agent-team/lifecycle.lock", async () => {
+    entered();
+    await held;
+  });
+  await inside;
+
+  await assert.rejects(
+    () => store.withLock(".agent-team/lifecycle.lock", async () => {}),
+    /STATE_LOCKED/,
+  );
+  release();
+  await first;
+  await assert.rejects(
+    () => access(join(root, ".agent-team", "lifecycle.lock")),
+    { code: "ENOENT" },
+  );
+});
+
 test("appends one redacted audit JSON object per line", async (t) => {
   const root = await temporaryDirectory(t, "project-store-");
   const store = ProjectStore.open(root);

@@ -71,6 +71,7 @@ export const WorkflowDefinitionSchema = z.object({
 
 export const WorkflowPhaseStateSchema = z.object({
   status: PhaseStatusSchema,
+  review_id: z.string().min(1).optional(),
   approval_id: z.string().min(1).optional(),
   handover_id: z.string().min(1).optional(),
 });

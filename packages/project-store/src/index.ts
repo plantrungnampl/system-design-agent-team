@@ -111,15 +111,8 @@ export class ProjectStore {
     await atomicWrite(this.root, target, content);
   }
 
-  readWorkflowState(): Promise<WorkflowState> {
-    return this.readYaml(".agent-team/workflow-state.yaml", WorkflowStateSchema);
-  }
-
-  async updateWorkflowState(
-    expectedVersion: number,
-    reducer: (state: WorkflowState) => WorkflowState,
-  ): Promise<WorkflowState> {
-    const lockPath = targetPath(this.root, ".agent-team/workflow-state.lock");
+  async withLock<T>(relativeLockPath: string, callback: () => Promise<T> | T): Promise<T> {
+    const lockPath = targetPath(this.root, relativeLockPath);
     await prepareParent(this.root, lockPath);
     let lock: FileHandle;
     try {
@@ -130,8 +123,26 @@ export class ProjectStore {
       }
       throw error;
     }
-
     try {
+      return await callback();
+    } finally {
+      try {
+        await lock.close();
+      } finally {
+        await rm(lockPath, { force: true });
+      }
+    }
+  }
+
+  readWorkflowState(): Promise<WorkflowState> {
+    return this.readYaml(".agent-team/workflow-state.yaml", WorkflowStateSchema);
+  }
+
+  async updateWorkflowState(
+    expectedVersion: number,
+    reducer: (state: WorkflowState) => WorkflowState,
+  ): Promise<WorkflowState> {
+    return this.withLock(".agent-team/workflow-state.lock", async () => {
       const current = await this.readWorkflowState();
       if (current.state_version !== expectedVersion) {
         throw new ProjectStoreError("STATE_VERSION_CONFLICT");
@@ -146,13 +157,7 @@ export class ProjectStore {
       const validated = WorkflowStateSchema.parse(next);
       await this.writeYamlAtomic(".agent-team/workflow-state.yaml", validated);
       return validated;
-    } finally {
-      try {
-        await lock.close();
-      } finally {
-        await rm(lockPath, { force: true });
-      }
-    }
+    });
   }
 
   async appendAudit(event: Record<string, unknown>): Promise<void> {
