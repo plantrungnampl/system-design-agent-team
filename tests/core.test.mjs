@@ -89,6 +89,7 @@ test("validates persisted CLI wrapper records", () => {
       requirements: {
         status: "awaiting_approval",
         review_id: reviews.reviews[0].id,
+        handover_digest: "a".repeat(64),
       },
     },
     completed_operations: [],
@@ -103,6 +104,7 @@ test("validates persisted CLI wrapper records", () => {
   assert.equal(handover.phase, "requirements");
   assert.equal(reviews.reviews[0].verdict, "approved");
   assert.equal(state.phases.requirements.review_id, reviews.reviews[0].id);
+  assert.equal(state.phases.requirements.handover_digest, "a".repeat(64));
   assert.throws(() => core.ReviewRecordSchema.parse({
     ...reviews.reviews[0],
     verdict: "looks_good",

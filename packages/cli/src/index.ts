@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { lstat, readFile, realpath, rm } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -22,6 +23,7 @@ import {
   type AgentManifest,
   type ArtifactRecord,
   type GateId,
+  type HandoverRecord,
   type PluginStatusRecord,
   type ProjectConfig,
   type ProjectMode,
@@ -31,7 +33,7 @@ import {
   type WorkflowState,
 } from "@system-design-team/core";
 import { PluginRegistry } from "@system-design-team/plugin-registry";
-import { ProjectStore } from "@system-design-team/project-store";
+import { GENERATED_LOCK_PATHS, ProjectStore } from "@system-design-team/project-store";
 import { approveGate, transitionPhase } from "@system-design-team/workflow-engine";
 import { parse } from "yaml";
 
@@ -392,6 +394,17 @@ function sameArtifactVersions(
   return JSON.stringify(entries(left)) === JSON.stringify(entries(right));
 }
 
+function handoverDigest(record: HandoverRecord): string {
+  const validated = HandoverRecordSchema.parse(record);
+  return createHash("sha256").update(JSON.stringify(validated)).digest("hex");
+}
+
+function approvalInputs(artifactVersions: Record<string, number>): string[] {
+  return Object.entries(artifactVersions)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([id, version]) => `${id}@${version}`);
+}
+
 export async function reviewPhase(
   root: string,
   phase: string,
@@ -614,11 +627,17 @@ export async function handover(
 
   if (state.completed_operations.includes(scopedOperation)) {
     if (!stored) throw new Error("HANDOVER_EVIDENCE_MISSING");
+    const approvals = await store.readYaml(".agent-team/approvals.yaml", ApprovalListSchema);
+    const approval = approvals.approvals.find((candidate) => candidate.id === phaseState.approval_id);
     if (phaseState.handover_id !== scopedOperation
+      || !phaseState.handover_digest
+      || handoverDigest(stored) !== phaseState.handover_digest
       || stored.id !== scopedOperation
       || stored.phase !== phase
       || stored.from_agent !== definition.owner
-      || stored.to_agent !== target.owner) {
+      || stored.to_agent !== target.owner
+      || !approval
+      || JSON.stringify(stored.approved_inputs) !== JSON.stringify(approvalInputs(approval.artifact_versions))) {
       throw new Error("HANDOVER_EVIDENCE_CONFLICT");
     }
   } else {
@@ -645,13 +664,12 @@ export async function handover(
       phase,
       from_agent: definition.owner,
       to_agent: target.owner,
-      approved_inputs: Object.entries(approval.artifact_versions)
-        .sort(([left], [right]) => left.localeCompare(right))
-        .map(([id, version]) => `${id}@${version}`),
+      approved_inputs: approvalInputs(approval.artifact_versions),
       expected_outputs: registry.artifacts.filter((artifact) => artifact.owner === target.owner)
         .map((artifact) => artifact.id).sort(),
       acceptance_conditions: ["Dependent work uses only the approved input versions."],
     });
+    const digest = handoverDigest(proposed);
     if (stored && JSON.stringify(stored) !== JSON.stringify(proposed)) {
       throw new Error("HANDOVER_EVIDENCE_CONFLICT");
     }
@@ -660,7 +678,7 @@ export async function handover(
       ...state,
       phases: {
         ...state.phases,
-        [phase]: { ...phaseState, handover_id: scopedOperation },
+        [phase]: { ...phaseState, handover_id: scopedOperation, handover_digest: digest },
       },
     };
     transitionPhase(withId, workflow, {
@@ -676,7 +694,7 @@ export async function handover(
         ...current,
         phases: {
           ...current.phases,
-          [phase]: { ...currentPhase, handover_id: scopedOperation },
+          [phase]: { ...currentPhase, handover_id: scopedOperation, handover_digest: digest },
         },
       }, workflow, {
         phase,
@@ -717,6 +735,23 @@ export async function getStatus(root: string) {
     phases: state.phases,
     plugins: plugins.plugins,
   };
+}
+
+export async function repair(
+  root: string,
+  options: { locks: boolean; confirmedQuiescent: boolean },
+) {
+  if (!options.locks) throw new Error("LOCKS_REQUIRED");
+  if (!options.confirmedQuiescent) throw new Error("QUIESCENCE_CONFIRMATION_REQUIRED");
+  const store = ProjectStore.open(root);
+  const inspections = await Promise.all(GENERATED_LOCK_PATHS.map((path) => store.inspectLock(path)));
+  if (inspections.some(({ status }) => status === "locked")) throw new Error("STATE_LOCKED");
+  const repaired: string[] = [];
+  for (const { path, status } of inspections) {
+    if (status === "missing") continue;
+    if (await store.repairLock(path, { confirmedQuiescent: true })) repaired.push(path);
+  }
+  return { repaired };
 }
 
 export async function doctor(root: string) {
@@ -766,6 +801,20 @@ export async function doctor(root: string) {
     });
   } catch (error) {
     checks.push({ name: "plugins", ok: false, detail: error instanceof Error ? error.message : String(error) });
+  }
+  try {
+    const abandoned = (await Promise.all(GENERATED_LOCK_PATHS.map((path) => store.inspectLock(path))))
+      .filter(({ status }) => status === "abandoned")
+      .map(({ path }) => path);
+    checks.push({
+      name: "locks",
+      ok: abandoned.length === 0,
+      detail: abandoned.length === 0
+        ? "no abandoned locks"
+        : `abandoned:${abandoned.join(",")}; stop all framework processes, then run system-design-team repair --locks --yes`,
+    });
+  } catch (error) {
+    checks.push({ name: "locks", ok: false, detail: error instanceof Error ? error.message : String(error) });
   }
   return { ok: checks.every((check) => check.ok), checks };
 }

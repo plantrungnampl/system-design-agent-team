@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { access, mkdir, mkdtemp, open, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { hostname, tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import test from "node:test";
@@ -177,7 +177,7 @@ test("allows only one concurrent caller inside a shared lock", async (t) => {
   );
 });
 
-test("recovers a same-host lock after its owner process dies", async (t) => {
+test("requires explicit quiescent repair after a lock owner process dies", async (t) => {
   const root = await projectWithState(t);
   const moduleUrl = new URL("../packages/project-store/dist/index.js", import.meta.url).href;
   const child = spawn(process.execPath, ["--input-type=module", "-e", [
@@ -192,75 +192,44 @@ test("recovers a same-host lock after its owner process dies", async (t) => {
   child.kill();
   await once(child, "exit");
 
-  await ProjectStore.open(root).withLock(".agent-team/lifecycle.lock", async () => {});
+  const store = ProjectStore.open(root);
+  await assert.rejects(
+    () => store.withLock(".agent-team/lifecycle.lock", async () => {}),
+    /STATE_LOCKED/,
+  );
+  assert.equal((await store.inspectLock(".agent-team/lifecycle.lock")).status, "abandoned");
+  await assert.rejects(
+    () => store.repairLock(".agent-team/lifecycle.lock", { confirmedQuiescent: false }),
+    /QUIESCENCE_CONFIRMATION_REQUIRED/,
+  );
+  assert.equal(
+    await store.repairLock(".agent-team/lifecycle.lock", { confirmedQuiescent: true }),
+    true,
+  );
+  await store.withLock(".agent-team/lifecycle.lock", async () => {});
   await assert.rejects(
     () => access(join(root, ".agent-team", "lifecycle.lock")),
     { code: "ENOENT" },
   );
 });
 
-test("serializes simultaneous reclaimers of one abandoned lock", async (t) => {
+test("explicit repair rejects live, foreign-host, and invalid lock metadata", async (t) => {
   const root = await projectWithState(t);
-  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"]);
-  child.kill();
-  await once(child, "exit");
+  const store = ProjectStore.open(root);
   const lockPath = join(root, ".agent-team/lifecycle.lock");
-  await writeFile(lockPath, JSON.stringify({
-    pid: child.pid,
-    hostname: hostname(),
-    created_at: new Date().toISOString(),
-    padding: "x".repeat(1024 * 1024),
-  }));
-  let entered = 0;
-  let firstEntered;
-  let secondEntered;
-  let release;
-  const firstEntry = new Promise((resolve) => { firstEntered = resolve; });
-  const secondEntry = new Promise((resolve) => { secondEntered = resolve; });
-  const held = new Promise((resolve) => { release = resolve; });
-  const contend = () => ProjectStore.open(root).withLock(".agent-team/lifecycle.lock", async () => {
-    entered += 1;
-    if (entered === 1) firstEntered();
-    if (entered === 2) secondEntered();
-    await held;
-  });
-  const attempts = [contend(), contend()];
-  const settlements = attempts.map((attempt) => attempt.then(() => "settled", () => "settled"));
-  await firstEntry;
-  const firstOutcome = await Promise.race([
-    ...settlements,
-    secondEntry.then(() => "second-entered"),
-  ]);
-  assert.equal(firstOutcome, "settled");
-  assert.equal(entered, 1);
-  release();
-  const results = await Promise.allSettled(attempts);
-  assert.equal(results.filter(({ status }) => status === "fulfilled").length, 1);
-  assert.equal(results.filter(({ status }) => status === "rejected").length, 1);
-  assert.match(String(results.find(({ status }) => status === "rejected")?.reason), /STATE_LOCKED/);
-});
-
-test("does not reclaim while another caller owns the recovery guard", async (t) => {
-  const root = await projectWithState(t);
-  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"]);
-  child.kill();
-  await once(child, "exit");
-  const lockPath = join(root, ".agent-team/lifecycle.lock");
-  await writeFile(lockPath, JSON.stringify({
-    pid: child.pid,
-    hostname: hostname(),
-    created_at: new Date().toISOString(),
-  }));
-  const recovery = await open(`${lockPath}.recovery`, "wx");
-  try {
+  const reject = async (metadata) => {
+    await writeFile(lockPath, typeof metadata === "string" ? metadata : JSON.stringify(metadata));
+    assert.equal((await store.inspectLock(".agent-team/lifecycle.lock")).status, "locked");
     await assert.rejects(
-      () => ProjectStore.open(root).withLock(".agent-team/lifecycle.lock", async () => {}),
+      () => store.repairLock(".agent-team/lifecycle.lock", { confirmedQuiescent: true }),
       /STATE_LOCKED/,
     );
-  } finally {
-    await recovery.close();
-    await rm(`${lockPath}.recovery`, { force: true });
-  }
+    await rm(lockPath);
+  };
+
+  await reject({ pid: process.pid, hostname: hostname(), created_at: new Date().toISOString() });
+  await reject({ pid: 2147483647, hostname: "other-host", created_at: new Date().toISOString() });
+  await reject("invalid metadata");
 });
 
 test("appends a redacted audit event only once per id", async (t) => {

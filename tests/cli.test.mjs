@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   access,
   lstat,
@@ -536,6 +537,33 @@ test("handover writes a valid record and advances each directly dependent phase 
   assert.equal(handedOver.phases.requirements.status, "handed_over");
   assert.equal(handedOver.phases.product.status, "ready");
   assert.equal(handedOver.state_version, approved.state_version + 2);
+  assert.match(handedOver.phases.requirements.handover_digest, /^[a-f0-9]{64}$/);
+
+  const originalDigest = handedOver.phases.requirements.handover_digest;
+  const tamperedInputs = HandoverRecordSchema.parse({ ...record, approved_inputs: ["REQUIREMENTS@999"] });
+  await ProjectStore.open(root).writeYamlAtomic(
+    ".agent-team/handovers/requirements.yaml",
+    tamperedInputs,
+  );
+  const tamperedState = await ProjectStore.open(root).readWorkflowState();
+  tamperedState.phases.requirements.handover_digest = createHash("sha256")
+    .update(JSON.stringify(tamperedInputs)).digest("hex");
+  await ProjectStore.open(root).writeYamlAtomic(".agent-team/workflow-state.yaml", tamperedState);
+  await assert.rejects(
+    () => handover(root, "requirements", "OP-HANDOVER-REQ"),
+    /HANDOVER_EVIDENCE_CONFLICT/,
+  );
+  tamperedState.phases.requirements.handover_digest = originalDigest;
+  await ProjectStore.open(root).writeYamlAtomic(".agent-team/workflow-state.yaml", tamperedState);
+  await ProjectStore.open(root).writeYamlAtomic(
+    ".agent-team/handovers/requirements.yaml",
+    { ...record, acceptance_conditions: ["Tampered condition"] },
+  );
+  await assert.rejects(
+    () => handover(root, "requirements", "OP-HANDOVER-REQ"),
+    /HANDOVER_EVIDENCE_CONFLICT/,
+  );
+  await ProjectStore.open(root).writeYamlAtomic(".agent-team/handovers/requirements.yaml", record);
 
   const auditPath = join(root, ".agent-team/audit/events.jsonl");
   const handoverId = operationKey("handover", "requirements", "OP-HANDOVER-REQ");
@@ -580,6 +608,7 @@ test("status and doctor return structured project diagnostics", async () => {
     "state_schema",
     "workflow",
     "plugins",
+    "locks",
   ]);
   assert.equal(diagnostics.checks.find(({ name }) => name === "plugins").ok, false);
   await setPluginStatus(root, pluginUri, "available", []);
@@ -596,10 +625,11 @@ test("CLI help lists the first-slice commands", async () => {
     process.execPath,
     [bin, "--help"],
   );
-  for (const command of ["init", "status", "start", "review", "approve", "handover", "validate", "doctor"]) {
+  for (const command of ["init", "status", "start", "review", "approve", "handover", "validate", "doctor", "repair"]) {
     assert.match(stdout, new RegExp(`\\b${command}\\b`));
   }
   assert.match(stdout, /review <phase> --reviewer <id> --verdict <approved\|revision_required> --operation-id <id>/);
+  assert.match(stdout, /repair --locks --yes/);
 
   const root = await temporaryGitRepository();
   await execFileAsync(process.execPath, [
@@ -612,6 +642,16 @@ test("CLI help lists the first-slice commands", async () => {
   ], { cwd: root });
   const status = JSON.parse((await execFileAsync(process.execPath, [bin, "status"], { cwd: root })).stdout);
   assert.equal(status.project.id, "leave-system");
+  await assert.rejects(
+    () => execFileAsync(process.execPath, [bin, "repair", "--locks"], { cwd: root }),
+    /QUIESCENCE_CONFIRMATION_REQUIRED/,
+  );
+  const repairedLocks = JSON.parse((await execFileAsync(
+    process.execPath,
+    [bin, "repair", "--locks", "--yes"],
+    { cwd: root },
+  )).stdout);
+  assert.deepEqual(repairedLocks.repaired, []);
   assert.equal(status.phases.intake.status, "ready");
 
   await assert.rejects(

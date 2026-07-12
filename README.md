@@ -12,7 +12,7 @@ npm run build
 node packages/cli/dist/bin.js --help
 ```
 
-The first slice exposes `init`, `status`, `start`, `validate`, `review`, `approve`, `handover`, and `doctor` for the intake-to-requirements-to-product workflow. Project state is stored under `.agent-team/`; application source and an existing root `AGENTS.md` are left untouched.
+The first slice exposes `init`, `status`, `start`, `validate`, `review`, `approve`, `handover`, `doctor`, and explicit lock `repair` for the intake-to-requirements-to-product workflow. Project state is stored under `.agent-team/`; application source and an existing root `AGENTS.md` are left untouched.
 
 Packed CLI assets still require this repository checkout; workflows, the agent catalogue, and templates are not yet bundled for standalone installation.
 

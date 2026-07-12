@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
+import { once } from "node:events";
 import {
   access,
   mkdir,
@@ -13,7 +14,9 @@ import { join } from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
 import {
+  doctor,
   initProject,
+  repair,
   reviewPhase,
   setPluginStatus,
   startPhase,
@@ -81,6 +84,46 @@ test("initialization check and creation share a root lock", async (t) => {
     }), /STATE_LOCKED/);
     await assert.rejects(() => access(join(root, ".agent-team")), { code: "ENOENT" });
   });
+});
+
+test("doctor diagnoses and explicit repair clears an abandoned lifecycle lock", async (t) => {
+  const root = await temporaryDirectory(t, "system-design-team-explicit-repair-");
+  await execFileAsync("git", ["init", "--quiet"], { cwd: root });
+  await initProject(root, {
+    id: "leave-system",
+    name: "Leave System",
+    mode: "greenfield",
+    profile: "standard",
+  });
+  const moduleUrl = new URL("../packages/project-store/dist/index.js", import.meta.url).href;
+  const child = spawn(process.execPath, ["--input-type=module", "-e", [
+    `import { ProjectStore } from ${JSON.stringify(moduleUrl)};`,
+    `await ProjectStore.open(${JSON.stringify(root)}).withLock(".agent-team/lifecycle.lock", async () => {`,
+    `  console.log("ready");`,
+    `  await new Promise(() => {});`,
+    `});`,
+  ].join("\n")], { stdio: ["ignore", "pipe", "pipe"] });
+  t.after(() => child.kill());
+  await once(child.stdout, "data");
+  child.kill();
+  await once(child, "exit");
+
+  await assert.rejects(
+    () => ProjectStore.open(root).withLock(".agent-team/lifecycle.lock", async () => {}),
+    /STATE_LOCKED/,
+  );
+  const locks = (await doctor(root)).checks.find(({ name }) => name === "locks");
+  assert.equal(locks.ok, false);
+  assert.match(locks.detail, /repair --locks --yes/);
+  await assert.rejects(
+    () => repair(root, { locks: true, confirmedQuiescent: false }),
+    /QUIESCENCE_CONFIRMATION_REQUIRED/,
+  );
+  assert.deepEqual(
+    await repair(root, { locks: true, confirmedQuiescent: true }),
+    { repaired: [".agent-team/lifecycle.lock"] },
+  );
+  await ProjectStore.open(root).withLock(".agent-team/lifecycle.lock", async () => {});
 });
 
 test("completed lifecycle replay repairs a missing audit event once", async (t) => {

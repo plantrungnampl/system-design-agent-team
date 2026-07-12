@@ -35,6 +35,14 @@ approve <gate> --by <human-id> --operation-id <id>
 handover <phase> --operation-id <id>
 ```
 
+Lock files are never reclaimed automatically. If `doctor` reports an abandoned same-host lock, stop every framework process for the project, then explicitly confirm that quiescent state:
+
+```text
+repair --locks --yes
+```
+
+The repair command only removes generated lock files with valid metadata whose same-host owner PID is dead. Live, foreign-host, invalid, and unconfirmed repairs remain blocked.
+
 `start` blocks until the host records the owner's required plugin skills through the exported `setPluginStatus` library API. There is no plugin-status CLI command in this slice.
 
 Packed CLI assets still require a repository checkout: workflows, the agent catalogue, and templates are not yet included in the npm package. Run `npm run check` for the complete build and test gate.

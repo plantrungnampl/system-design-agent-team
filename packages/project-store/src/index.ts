@@ -18,7 +18,9 @@ import { parse, stringify } from "yaml";
 
 type Schema<T> = { parse(value: unknown): T };
 type ProjectStoreErrorCode =
+  | "LOCK_PATH_NOT_GENERATED"
   | "PATH_OUTSIDE_PROJECT"
+  | "QUIESCENCE_CONFIRMATION_REQUIRED"
   | "STATE_LOCKED"
   | "STATE_VERSION_CONFLICT"
   | "STATE_VERSION_INVALID";
@@ -28,6 +30,18 @@ export class ProjectStoreError extends Error {
     super(code);
     this.name = "ProjectStoreError";
   }
+}
+
+export const GENERATED_LOCK_PATHS = [
+  ".system-design-team-init.lock",
+  ".agent-team/lifecycle.lock",
+  ".agent-team/workflow-state.lock",
+  ".agent-team/audit/events.lock",
+] as const;
+
+export interface LockInspection {
+  path: string;
+  status: "missing" | "abandoned" | "locked";
 }
 
 function inside(root: string, target: string): boolean {
@@ -110,38 +124,6 @@ async function abandonedLocalLock(path: string): Promise<boolean> {
   }
 }
 
-async function recoverAbandonedLock(lockPath: string): Promise<FileHandle> {
-  const recoveryPath = `${lockPath}.recovery`;
-  let recovery: FileHandle;
-  try {
-    recovery = await open(recoveryPath, "wx");
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
-      // ponytail: abandoned recovery guards require manual removal; automate only with evidence it is needed.
-      throw new ProjectStoreError("STATE_LOCKED");
-    }
-    throw error;
-  }
-  try {
-    if (!await abandonedLocalLock(lockPath)) throw new ProjectStoreError("STATE_LOCKED");
-    await rm(lockPath, { force: true });
-    try {
-      return await open(lockPath, "wx");
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "EEXIST") {
-        throw new ProjectStoreError("STATE_LOCKED");
-      }
-      throw error;
-    }
-  } finally {
-    try {
-      await recovery.close();
-    } finally {
-      await rm(recoveryPath, { force: true });
-    }
-  }
-}
-
 export class ProjectStore {
   private constructor(private readonly root: string) {}
 
@@ -172,9 +154,10 @@ export class ProjectStore {
     try {
       lock = await open(lockPath, "wx");
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      if (!await abandonedLocalLock(lockPath)) throw new ProjectStoreError("STATE_LOCKED");
-      lock = await recoverAbandonedLock(lockPath);
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+        throw new ProjectStoreError("STATE_LOCKED");
+      }
+      throw error;
     }
     try {
       await lock.writeFile(JSON.stringify({
@@ -191,6 +174,43 @@ export class ProjectStore {
         await rm(lockPath, { force: true });
       }
     }
+  }
+
+  async inspectLock(relativeLockPath: string): Promise<LockInspection> {
+    if (!(GENERATED_LOCK_PATHS as readonly string[]).includes(relativeLockPath)) {
+      throw new ProjectStoreError("LOCK_PATH_NOT_GENERATED");
+    }
+    const lockPath = targetPath(this.root, relativeLockPath);
+    try {
+      await lstat(lockPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        return { path: relativeLockPath, status: "missing" };
+      }
+      throw error;
+    }
+    return {
+      path: relativeLockPath,
+      status: await abandonedLocalLock(lockPath) ? "abandoned" : "locked",
+    };
+  }
+
+  async repairLock(
+    relativeLockPath: string,
+    options: { confirmedQuiescent: boolean },
+  ): Promise<boolean> {
+    if (!options.confirmedQuiescent) {
+      throw new ProjectStoreError("QUIESCENCE_CONFIRMATION_REQUIRED");
+    }
+    const inspection = await this.inspectLock(relativeLockPath);
+    if (inspection.status === "missing") return false;
+    if (inspection.status !== "abandoned"
+      || !await abandonedLocalLock(targetPath(this.root, relativeLockPath))) {
+      throw new ProjectStoreError("STATE_LOCKED");
+    }
+    // Administrative precondition: the caller confirmed all framework processes are quiescent.
+    await rm(targetPath(this.root, relativeLockPath));
+    return true;
   }
 
   readWorkflowState(): Promise<WorkflowState> {

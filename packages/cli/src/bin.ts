@@ -14,6 +14,7 @@ import {
   getStatus,
   handover,
   initProject,
+  repair,
   reviewPhase,
   startPhase,
   validatePhase,
@@ -29,7 +30,8 @@ Commands:
   review <phase> --reviewer <id> --verdict <approved|revision_required> --operation-id <id>
   approve <gate> --by <id> --operation-id <id>
   handover <phase> --operation-id <id>
-  doctor`;
+  doctor
+  repair --locks --yes`;
 
 const commandShape: Record<string, { positionals: number; options: string[] }> = {
   init: { positionals: 1, options: ["id", "name", "mode", "profile"] },
@@ -40,6 +42,7 @@ const commandShape: Record<string, { positionals: number; options: string[] }> =
   approve: { positionals: 2, options: ["by", "operation-id"] },
   handover: { positionals: 2, options: ["operation-id"] },
   doctor: { positionals: 1, options: [] },
+  repair: { positionals: 1, options: ["locks", "yes"] },
 };
 
 function required(value: string | undefined, option: string): string {
@@ -78,6 +81,8 @@ async function main(): Promise<void> {
       reviewer: { type: "string" },
       verdict: { type: "string" },
       "operation-id": { type: "string" },
+      locks: { type: "boolean" },
+      yes: { type: "boolean" },
     },
   });
   const command = positionals[0];
@@ -145,6 +150,12 @@ async function main(): Promise<void> {
       break;
     case "doctor":
       result = await doctor(root);
+      break;
+    case "repair":
+      result = await repair(root, {
+        locks: values.locks === true,
+        confirmedQuiescent: values.yes === true,
+      });
       break;
     default:
       throw new Error(`Unknown command: ${command}`);

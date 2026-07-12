@@ -93,6 +93,7 @@ export const WorkflowPhaseStateSchema = z.object({
   review_id: z.string().min(1).optional(),
   approval_id: z.string().min(1).optional(),
   handover_id: z.string().min(1).optional(),
+  handover_digest: z.string().regex(/^[a-f0-9]{64}$/).optional(),
 });
 
 export const WorkflowStateSchema = z.object({
