@@ -15,6 +15,19 @@ test("parses a valid workflow and rejects self-reviewing phase definitions", () 
     ...valid,
     phases: [{ ...valid.phases[0], reviewer: "business-analyst" }],
   }), /reviewer/i);
+
+  assert.throws(() => core.WorkflowDefinitionSchema.parse({
+    ...valid,
+    phases: [valid.phases[0], { ...valid.phases[0] }],
+  }), /unique/i);
+  assert.throws(() => core.WorkflowDefinitionSchema.parse({
+    ...valid,
+    phases: [{ ...valid.phases[0], depends_on: ["missing"] }],
+  }), /dependency/i);
+  assert.throws(() => core.WorkflowDefinitionSchema.parse({
+    ...valid,
+    phases: [{ ...valid.phases[0], depends_on: ["requirements"] }],
+  }), /dependency/i);
 });
 
 test("validates persisted CLI wrapper records", () => {

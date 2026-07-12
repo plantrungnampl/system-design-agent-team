@@ -12,6 +12,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
+import { hostname } from "node:os";
 import { WorkflowStateSchema, type WorkflowState } from "@system-design-team/core";
 import { parse, stringify } from "yaml";
 
@@ -88,6 +89,27 @@ function redact(value: unknown): unknown {
   ]));
 }
 
+async function abandonedLocalLock(path: string): Promise<boolean> {
+  let owner: unknown;
+  try {
+    owner = JSON.parse(await readFile(path, "utf8"));
+  } catch {
+    return false;
+  }
+  if (!owner || typeof owner !== "object") return false;
+  const { pid, hostname: ownerHost, created_at: createdAt } = owner as Record<string, unknown>;
+  if (!Number.isInteger(pid) || (pid as number) <= 0
+    || ownerHost !== hostname()
+    || typeof createdAt !== "string"
+    || !Number.isFinite(Date.parse(createdAt))) return false;
+  try {
+    process.kill(pid as number, 0);
+    return false;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ESRCH";
+  }
+}
+
 export class ProjectStore {
   private constructor(private readonly root: string) {}
 
@@ -114,16 +136,28 @@ export class ProjectStore {
   async withLock<T>(relativeLockPath: string, callback: () => Promise<T> | T): Promise<T> {
     const lockPath = targetPath(this.root, relativeLockPath);
     await prepareParent(this.root, lockPath);
-    let lock: FileHandle;
-    try {
-      lock = await open(lockPath, "wx");
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+    let lock: FileHandle | undefined;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        lock = await open(lockPath, "wx");
+        break;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        if (attempt === 0 && await abandonedLocalLock(lockPath)) {
+          await rm(lockPath, { force: true });
+          continue;
+        }
         throw new ProjectStoreError("STATE_LOCKED");
       }
-      throw error;
     }
+    if (!lock) throw new ProjectStoreError("STATE_LOCKED");
     try {
+      await lock.writeFile(JSON.stringify({
+        pid: process.pid,
+        hostname: hostname(),
+        created_at: new Date().toISOString(),
+      }), "utf8");
+      await lock.sync();
       return await callback();
     } finally {
       try {
@@ -180,5 +214,22 @@ export class ProjectStore {
       requireInside(realRoot, realTarget);
     }
     await appendFile(target, `${JSON.stringify(redact(event))}\n`, "utf8");
+  }
+
+  async appendAuditOnce(event: Record<string, unknown> & { id: string }): Promise<void> {
+    if (!event.id) throw new Error("AUDIT_ID_REQUIRED");
+    await this.withLock(".agent-team/audit/events.lock", async () => {
+      const target = targetPath(this.root, ".agent-team/audit/events.jsonl");
+      let text = "";
+      try {
+        requireInside(await realpath(this.root), await realpath(target));
+        text = await readFile(target, "utf8");
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+      const exists = text.split(/\r?\n/).filter(Boolean)
+        .some((line) => (JSON.parse(line) as { id?: unknown }).id === event.id);
+      if (!exists) await this.appendAudit(event);
+    });
   }
 }

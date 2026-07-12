@@ -67,6 +67,25 @@ export const WorkflowDefinitionSchema = z.object({
   version: z.string().min(1),
   mode: ProjectModeSchema,
   phases: z.array(WorkflowPhaseSchema).min(1),
+}).superRefine((workflow, context) => {
+  const phaseIds = new Set<string>();
+  workflow.phases.forEach((phase, index) => {
+    if (phaseIds.has(phase.id)) {
+      context.addIssue({ code: "custom", message: "Phase ids must be unique", path: ["phases", index, "id"] });
+    }
+    phaseIds.add(phase.id);
+  });
+  workflow.phases.forEach((phase, phaseIndex) => {
+    phase.depends_on.forEach((dependency, dependencyIndex) => {
+      if (dependency === phase.id || !phaseIds.has(dependency)) {
+        context.addIssue({
+          code: "custom",
+          message: "Phase dependency must reference another configured phase",
+          path: ["phases", phaseIndex, "depends_on", dependencyIndex],
+        });
+      }
+    });
+  });
 });
 
 export const WorkflowPhaseStateSchema = z.object({

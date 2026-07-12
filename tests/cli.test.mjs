@@ -514,6 +514,16 @@ test("handover writes a valid record and advances each directly dependent phase 
   const approved = await approve(root, "G2", "project-owner", "OP-APPROVE-REQ");
   await setArtifactStatus(root, "REQUIREMENTS", { version: 2 });
 
+  await assert.rejects(
+    () => handover(root, "requirements", "OP-HANDOVER-REQ"),
+    /APPROVED_INPUT_STALE/,
+  );
+  await assert.rejects(
+    () => access(join(root, ".agent-team/handovers/requirements.yaml")),
+    { code: "ENOENT" },
+  );
+  await setArtifactStatus(root, "REQUIREMENTS", { version: 1 });
+
   const handedOver = await handover(root, "requirements", "OP-HANDOVER-REQ");
   const record = HandoverRecordSchema.parse(
     await readYaml(root, ".agent-team/handovers/requirements.yaml"),

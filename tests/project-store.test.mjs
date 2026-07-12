@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
 import { access, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
@@ -173,6 +175,40 @@ test("allows only one concurrent caller inside a shared lock", async (t) => {
     () => access(join(root, ".agent-team", "lifecycle.lock")),
     { code: "ENOENT" },
   );
+});
+
+test("recovers a same-host lock after its owner process dies", async (t) => {
+  const root = await projectWithState(t);
+  const moduleUrl = new URL("../packages/project-store/dist/index.js", import.meta.url).href;
+  const child = spawn(process.execPath, ["--input-type=module", "-e", [
+    `import { ProjectStore } from ${JSON.stringify(moduleUrl)};`,
+    `await ProjectStore.open(${JSON.stringify(root)}).withLock(".agent-team/lifecycle.lock", async () => {`,
+    `  console.log("ready");`,
+    `  await new Promise(() => {});`,
+    `});`,
+  ].join("\n")], { stdio: ["ignore", "pipe", "pipe"] });
+  t.after(() => child.kill());
+  await once(child.stdout, "data");
+  child.kill();
+  await once(child, "exit");
+
+  await ProjectStore.open(root).withLock(".agent-team/lifecycle.lock", async () => {});
+  await assert.rejects(
+    () => access(join(root, ".agent-team", "lifecycle.lock")),
+    { code: "ENOENT" },
+  );
+});
+
+test("appends a redacted audit event only once per id", async (t) => {
+  const root = await projectWithState(t);
+  const store = ProjectStore.open(root);
+
+  await store.appendAuditOnce({ id: "OP-1", action: "start", token: "secret" });
+  await store.appendAuditOnce({ id: "OP-1", action: "start", token: "changed" });
+
+  const events = (await readFile(join(root, ".agent-team/audit/events.jsonl"), "utf8"))
+    .trim().split("\n").map(JSON.parse);
+  assert.deepEqual(events, [{ id: "OP-1", action: "start", token: "[REDACTED]" }]);
 });
 
 test("appends one redacted audit JSON object per line", async (t) => {

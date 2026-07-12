@@ -102,6 +102,8 @@ async function readBootstrapAssets(mode: ProjectMode) {
 
 export async function initProject(root: string, options: InitOptions): Promise<ProjectConfig> {
   const projectRoot = resolve(root);
+  const store = ProjectStore.open(projectRoot);
+  return store.withLock(".system-design-team-init.lock", async () => {
   if (await exists(join(projectRoot, ".agent-team"))) throw new Error("ALREADY_INITIALIZED");
 
   const { workflow, catalogue, charter, requirements } = await readBootstrapAssets(options.mode);
@@ -155,7 +157,6 @@ export async function initProject(root: string, options: InitOptions): Promise<P
     framework: { version: FRAMEWORK_VERSION },
     workflow: project.workflow,
   });
-  const store = ProjectStore.open(projectRoot);
   const codexKeep = join(projectRoot, ".codex/generated/.gitkeep");
   const preserveCodexKeep = await exists(codexKeep);
   if (preserveCodexKeep) {
@@ -176,11 +177,13 @@ export async function initProject(root: string, options: InitOptions): Promise<P
     await store.writeTextAtomic(".agent-team/product/.gitkeep", "");
     await store.writeTextAtomic(".agent-team/handovers/.gitkeep", "");
     if (!preserveCodexKeep) await store.writeTextAtomic(".codex/generated/.gitkeep", "");
+    await appendOperationAudit(store, operationKey("init", options.id, "bootstrap"), "init", options.id);
     return project;
   } catch (error) {
     await removeNewAgentTeam(projectRoot);
     throw error;
   }
+  });
 }
 
 async function projectConfig(store: ProjectStore): Promise<ProjectConfig> {
@@ -212,6 +215,15 @@ function operationKey(action: string, target: string, operationId: string): stri
   return JSON.stringify([action, target, operationId]);
 }
 
+async function appendOperationAudit(
+  store: ProjectStore,
+  id: string,
+  action: string,
+  target: string,
+): Promise<void> {
+  await store.appendAuditOnce({ id, action, target });
+}
+
 export async function setPluginStatus(
   root: string,
   uri: string,
@@ -219,6 +231,7 @@ export async function setPluginStatus(
   skills: string[] = [],
 ) {
   const store = ProjectStore.open(root);
+  return store.withLock(".agent-team/lifecycle.lock", async () => {
   const current = await pluginStatus(store);
   const record = { uri, status, skills };
   const plugins = current.plugins.some((plugin) => plugin.uri === uri)
@@ -229,6 +242,7 @@ export async function setPluginStatus(
   });
   await store.writeYamlAtomic(".agent-team/plugin-status.yaml", next);
   return next;
+  });
 }
 
 export async function startPhase(
@@ -239,8 +253,12 @@ export async function startPhase(
   requireOperationId(operationId);
   const scopedOperation = operationKey("start", phase, operationId);
   const store = ProjectStore.open(root);
+  return store.withLock(".agent-team/lifecycle.lock", async () => {
   const state = await store.readWorkflowState();
-  if (state.completed_operations.includes(scopedOperation)) return state;
+  if (state.completed_operations.includes(scopedOperation)) {
+    await appendOperationAudit(store, scopedOperation, "start", phase);
+    return state;
+  }
 
   const workflow = await configuredWorkflow(store);
   const definition = workflow.phases.find((candidate) => candidate.id === phase);
@@ -255,11 +273,14 @@ export async function startPhase(
       : "PLUGIN_CAPABILITY_BLOCKED");
   }
 
-  return store.updateWorkflowState(state.state_version, (current) => transitionPhase(
+  const next = await store.updateWorkflowState(state.state_version, (current) => transitionPhase(
     current,
     workflow,
     { phase, to: "in_progress", operation_id: scopedOperation },
   ));
+  await appendOperationAudit(store, scopedOperation, "start", phase);
+  return next;
+  });
 }
 
 function inside(root: string, target: string): boolean {
@@ -331,6 +352,7 @@ export async function validatePhase(root: string, phase: string, operationId: st
   const store = ProjectStore.open(root);
   const state = await store.readWorkflowState();
   if (state.completed_operations.includes(scopedOperation)) {
+    await appendOperationAudit(store, scopedOperation, "validate", phase);
     return { valid: true, phase, findings: [], state };
   }
   const workflow = await configuredWorkflow(store);
@@ -350,6 +372,7 @@ export async function validatePhase(root: string, phase: string, operationId: st
     workflow,
     { phase, to: "artifact_validation", operation_id: scopedOperation },
   ));
+  await appendOperationAudit(store, scopedOperation, "validate", phase);
   return { valid: true, phase, findings, state: next };
 }
 
@@ -399,6 +422,7 @@ export async function reviewPhase(
       throw new Error("OPERATION_ID_CONFLICT");
     }
     if (state.phases[phase]?.review_id !== existing.id) throw new Error("REVIEW_EVIDENCE_MISSING");
+    await appendOperationAudit(store, evidenceId, "review", phase);
     return state;
   }
   if (!reviewerId || reviewerId !== definition.reviewer || reviewerId === definition.owner) {
@@ -477,6 +501,7 @@ export async function reviewPhase(
       },
     ));
   }
+  await appendOperationAudit(store, evidenceId, "review", phase);
   return current;
   });
 }
@@ -509,6 +534,7 @@ export async function approve(
       || existing.approved_by.identifier !== approver) {
       throw new Error("OPERATION_ID_CONFLICT");
     }
+    await appendOperationAudit(store, scopedOperation, "approve", gate);
     return state;
   }
 
@@ -552,8 +578,10 @@ export async function approve(
     const next = ApprovalListSchema.parse({ approvals: [...approvals.approvals, approval] });
     await store.writeYamlAtomic(".agent-team/approvals.yaml", next);
   }
-  return store.updateWorkflowState(state.state_version, (current) =>
+  const nextState = await store.updateWorkflowState(state.state_version, (current) =>
     approveGate(current, workflow, approval));
+  await appendOperationAudit(store, scopedOperation, "approve", gate);
+  return nextState;
   });
 }
 
@@ -583,6 +611,15 @@ export async function handover(
   if (!approval
     || (approval.decision !== "approved" && approval.decision !== "approved_with_conditions")) {
     throw new Error("APPROVAL_EVIDENCE_MISSING");
+  }
+  const approvedArtifacts = registry.artifacts.filter(
+    (artifact) => artifact.required_gate === definition.gate && artifact.owner === definition.owner,
+  );
+  const [staleFinding] = await inspectArtifacts(root, approvedArtifacts);
+  if (staleFinding
+    || Object.keys(approval.artifact_versions).length === 0
+    || !sameArtifactVersions(approval.artifact_versions, artifactVersions(approvedArtifacts))) {
+    throw new Error("APPROVED_INPUT_STALE");
   }
   const proposed = HandoverRecordSchema.parse({
     id: scopedOperation,
@@ -649,6 +686,7 @@ export async function handover(
       { phase: dependent.id, to: "ready", operation_id: readinessId },
     ));
   }
+  await appendOperationAudit(store, scopedOperation, "handover", phase);
   return state;
   });
 }

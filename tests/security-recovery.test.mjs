@@ -43,6 +43,73 @@ test("lifecycle lock is cleaned up after its callback fails", async (t) => {
   await assert.rejects(() => access(join(root, ".agent-team/lifecycle.lock")), { code: "ENOENT" });
 });
 
+test("lifecycle lock serializes plugin status and phase start", async (t) => {
+  const root = await temporaryDirectory(t, "system-design-team-lifecycle-race-");
+  await execFileAsync("git", ["init", "--quiet"], { cwd: root });
+  await initProject(root, {
+    id: "leave-system",
+    name: "Leave System",
+    mode: "greenfield",
+    profile: "standard",
+  });
+  const store = ProjectStore.open(root);
+  const beforeState = await store.readWorkflowState();
+  const beforeStatus = await readFile(join(root, ".agent-team/plugin-status.yaml"), "utf8");
+
+  await store.withLock(".agent-team/lifecycle.lock", async () => {
+    let statusError;
+    let startError;
+    try { await setPluginStatus(root, pluginUri, "available", ["brainstorming"]); } catch (error) { statusError = error; }
+    try { await startPhase(root, "intake", "LOCKED-START"); } catch (error) { startError = error; }
+    assert.match(String(statusError), /STATE_LOCKED/);
+    assert.match(String(startError), /STATE_LOCKED/);
+  });
+
+  assert.deepEqual(await store.readWorkflowState(), beforeState);
+  assert.equal(await readFile(join(root, ".agent-team/plugin-status.yaml"), "utf8"), beforeStatus);
+});
+
+test("initialization check and creation share a root lock", async (t) => {
+  const root = await temporaryDirectory(t, "system-design-team-init-race-");
+  const store = ProjectStore.open(root);
+  await store.withLock(".system-design-team-init.lock", async () => {
+    await assert.rejects(() => initProject(root, {
+      id: "leave-system",
+      name: "Leave System",
+      mode: "greenfield",
+      profile: "standard",
+    }), /STATE_LOCKED/);
+    await assert.rejects(() => access(join(root, ".agent-team")), { code: "ENOENT" });
+  });
+});
+
+test("completed lifecycle replay repairs a missing audit event once", async (t) => {
+  const root = await temporaryDirectory(t, "system-design-team-audit-recovery-");
+  await execFileAsync("git", ["init", "--quiet"], { cwd: root });
+  await initProject(root, {
+    id: "leave-system",
+    name: "Leave System",
+    mode: "greenfield",
+    profile: "standard",
+  });
+  await setPluginStatus(root, pluginUri, "available", ["brainstorming"]);
+  const started = await startPhase(root, "intake", "AUDIT-START");
+  const store = ProjectStore.open(root);
+  const auditPath = join(root, ".agent-team/audit/events.jsonl");
+  const startId = JSON.stringify(["start", "intake", "AUDIT-START"]);
+  const events = (await readFile(auditPath, "utf8")).trim().split("\n").map(JSON.parse);
+  assert(events.some(({ action }) => action === "init"));
+  await store.writeTextAtomic(
+    ".agent-team/audit/events.jsonl",
+    `${events.filter(({ id }) => id !== startId).map(JSON.stringify).join("\n")}\n`,
+  );
+
+  assert.deepEqual(await startPhase(root, "intake", "AUDIT-START"), started);
+  assert.deepEqual(await startPhase(root, "intake", "AUDIT-START"), started);
+  const repaired = (await readFile(auditPath, "utf8")).trim().split("\n").map(JSON.parse);
+  assert.equal(repaired.filter(({ id }) => id === startId).length, 1);
+});
+
 test("initialization preserves source and AGENTS while lifecycle exclusion recovers without losing evidence", async (t) => {
   const root = await temporaryDirectory(t, "system-design-team-recovery-");
   await execFileAsync("git", ["init", "--quiet"], { cwd: root });
