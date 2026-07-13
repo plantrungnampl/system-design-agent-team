@@ -5,6 +5,7 @@ import { parse } from "yaml";
 import {
   approveGate,
   evaluateExecutionPolicy,
+  evaluateReviewExecutionResult,
   gateReadiness,
   transitionPhase,
 } from "@system-design-team/workflow-engine";
@@ -329,6 +330,36 @@ test("G7 requires current QA, security, and data evidence", () => {
     "SECURITY_EVIDENCE_NOT_CURRENT",
     "DATA_EVIDENCE_NOT_CURRENT",
   ]);
+});
+
+test("review execution validates supplied semantic evidence without requiring its approval", () => {
+  const execution = {
+    execution_id: "EXEC-REVIEW-EVIDENCE",
+    dispatch_digest: "e".repeat(64),
+    status: "completed",
+    permission_profile: "read_only_assessment",
+    authorized_paths: { read: [".agent-team/**"], write: [], execute: [] },
+    command_class: "safe_read",
+    destructive: false,
+    checkpoints: [{
+      id: "review-complete",
+      status: "completed",
+      timestamp: "2026-07-13T00:00:00.000Z",
+      evidence: [`sha256:${"e".repeat(64)}`],
+    }],
+    evidence: { gate_approvals: [], qa: { ...artifactReference("QA"), approval_id: undefined } },
+  };
+  const context = { ...evidenceContext, reviews: [], approvals: [] };
+
+  assert.deepEqual(evaluateReviewExecutionResult(execution, context, "verification").blockers, []);
+  assert.deepEqual(
+    evaluateReviewExecutionResult(execution, context, "release-readiness").blockers,
+    ["QA_EVIDENCE_NOT_CURRENT"],
+  );
+  assert.deepEqual(evaluateReviewExecutionResult(execution, {
+    ...context,
+    verified_checksums: { ...context.verified_checksums, QA: `sha256:${"f".repeat(64)}` },
+  }, "verification").blockers, ["QA_EVIDENCE_NOT_CURRENT"]);
 });
 
 test("G8 production execution requires explicit human authorization", () => {
@@ -667,22 +698,22 @@ test("unrelated approval cannot authorize destructive confirmation or scope", ()
   assert(report.blockers.includes("SCOPE_CONFIRMATION_REQUIRED"));
 });
 
-test("all shipped workflows have satisfiable legitimate evidence roles", async () => {
+test("all shipped workflows progress shared G7 phases before enforcing final release evidence", async () => {
   for (const file of ["greenfield.yaml", "existing-system.yaml", "migration.yaml"]) {
     const definition = parse(await readFile(new URL(`../workflows/${file}`, import.meta.url), "utf8"));
-    const qa = definition.phases.find(({ owner }) => owner === "qa-lead");
+    const gatePhases = definition.phases.filter(({ gate }) => gate === "G7");
+    const qa = definition.phases.find(({ owner, artifact }) => owner === "qa-lead"
+      && artifact.path.startsWith("testing/"));
     const security = definition.phases.find(({ owner }) => owner === "security-reviewer");
     const data = definition.phases.find(({ artifact, owner, reviewer }) => artifact.path.startsWith("data/")
       && (owner === "data-reviewer" || reviewer === "data-reviewer"));
-    const release = definition.phases.find(({ gate, owner, artifact }) => gate === "G8"
-      && owner === "devops-lead" && artifact.path.startsWith("release/"));
-    const phases = [...new Set([qa, security, data, release].filter(Boolean))];
-    const artifacts = phases.map((phase) => ({
+    const evidencePhases = [...new Set([qa, security, data, ...gatePhases].filter(Boolean))];
+    const artifacts = evidencePhases.map((phase) => ({
       id: phase.artifact.id,
       path: phase.artifact.path,
       type: "document",
       version: 1,
-      status: "approved",
+      status: gatePhases.some(({ id }) => id === phase.id) ? "in_review" : "approved",
       owner: phase.owner,
       reviewer: phase.reviewer,
       dependencies: [],
@@ -690,49 +721,105 @@ test("all shipped workflows have satisfiable legitimate evidence roles", async (
       required_gate: phase.gate,
       checksum: `sha256:${"a".repeat(64)}`,
     }));
-    const approvals = phases.map((phase) => ({
-      id: `APR-${phase.artifact.id}`,
-      gate: phase.gate,
-      decision: "approved",
-      approved_by: { type: "human", identifier: "owner" },
-      artifact_versions: { [phase.artifact.id]: 1 },
-      timestamp: "2026-07-13T00:00:00Z",
-    }));
+    const reviews = [];
+    const approvals = [];
+    if (data && !gatePhases.some(({ id }) => id === data.id)) {
+      reviews.push({
+        id: `REV-${data.artifact.id}`,
+        phase: data.id,
+        reviewer: data.reviewer,
+        verdict: "approved",
+        artifact_versions: { [data.artifact.id]: 1 },
+        timestamp: "2026-07-13T00:00:00Z",
+      });
+      approvals.push({
+        id: `APR-${data.artifact.id}`,
+        gate: data.gate,
+        decision: "approved",
+        approved_by: { type: "human", identifier: "project-owner" },
+        artifact_versions: { [data.artifact.id]: 1 },
+        timestamp: "2026-07-13T00:00:00Z",
+      });
+    }
     const reference = (phase) => phase ? ({
       artifact_id: phase.artifact.id,
       version: 1,
-      status: "approved",
+      status: gatePhases.some(({ id }) => id === phase.id) ? "in_review" : "approved",
       review_id: `REV-${phase.artifact.id}`,
-      approval_id: `APR-${phase.artifact.id}`,
     }) : undefined;
-    const report = evaluateExecutionPolicy({
-      ...policyInput,
+    const execution = {
+      execution_id: `EXEC-${file}`,
+      dispatch_digest: "d".repeat(64),
+      status: "completed",
       permission_profile: "test_execution",
+      authorized_paths: { read: [".agent-team/**"], write: [], execute: ["npm test"] },
       command_class: "local_validation",
-      target_gate: "G8",
+      destructive: false,
+      checkpoints: [{
+        id: "release-validation",
+        status: "completed",
+        timestamp: "2026-07-13T00:00:00.000Z",
+        evidence: [`sha256:${"d".repeat(64)}`],
+      }],
       evidence: {
         gate_approvals: [],
         qa: reference(qa),
         security: reference(security),
         data: reference(data),
-        backup: reference(release),
-        rollback: reference(release),
       },
-    }, {
+    };
+    let lifecycle = {
+      schema_version: 1,
+      state_version: 0,
+      project_id: `project-${file}`,
+      current_phase: gatePhases[0].id,
+      phases: Object.fromEntries(definition.phases.map(({ id }) => [id, { status: "not_started" }])),
+      completed_operations: [],
+    };
+    const context = () => ({
       workflow: definition,
       artifacts,
       approvals,
       verified_checksums: Object.fromEntries(artifacts.map(({ id, checksum }) => [id, checksum])),
-      reviews: phases.map((phase) => ({
+      reviews,
+    });
+
+    for (const [index, phase] of gatePhases.entries()) {
+      lifecycle = withPhase(lifecycle, phase.id, "awaiting_approval");
+      reviews.push({
         id: `REV-${phase.artifact.id}`,
         phase: phase.id,
         reviewer: phase.reviewer,
         verdict: "approved",
         artifact_versions: { [phase.artifact.id]: 1 },
         timestamp: "2026-07-13T00:00:00Z",
-      })),
-    }, { type: "human", identifier: "owner" });
+      });
+      const approval = {
+        id: `APR-${phase.artifact.id}`,
+        gate: "G7",
+        decision: "approved",
+        approved_by: { type: "human", identifier: "project-owner" },
+        artifact_versions: { [phase.artifact.id]: 1 },
+        timestamp: "2026-07-13T00:00:00Z",
+      };
+      const final = index === gatePhases.length - 1;
+      if (!final) {
+        lifecycle = approveGate(lifecycle, definition, approval);
+        approvals.push(approval);
+        assert.equal(lifecycle.phases[phase.id].status, "approved", `${file}:${phase.id}`);
+        continue;
+      }
 
-    assert.deepEqual(report.blockers, [], file);
+      const priorApprovals = approvals.splice(0);
+      assert.throws(
+        () => approveGate(lifecycle, definition, approval, execution, context()),
+        /EVIDENCE_NOT_CURRENT/,
+        `${file}:${phase.id}:missing prior evidence`,
+      );
+      approvals.push(...priorApprovals);
+      lifecycle = approveGate(lifecycle, definition, approval, execution, context());
+      approvals.push(approval);
+      assert.equal(lifecycle.phases[phase.id].status, "approved", `${file}:${phase.id}`);
+    }
   }
 });

@@ -61,6 +61,7 @@ import { propagateStaleness, traceCoverage, validateTraceability } from "@system
 import {
   approveGate,
   evaluateExecutionResult,
+  evaluateReviewExecutionResult,
   gateReadiness,
   rejectGate as rejectWorkflowGate,
   transitionPhase,
@@ -914,14 +915,12 @@ export async function reviewPhase(
       || receipt.result.checkpoints.some(({ status }) => status !== "completed")) {
       throw new Error("REVIEW_EXECUTION_NOT_COMPLETED");
     }
-    if (verdict === "approved") {
-      const report = evaluateExecutionResult(
-        receipt.result,
-        definition.gate,
-        await executionEvidenceContext(root, store),
-      );
-      if (!report.allowed) throw new Error(report.blockers[0]);
-    }
+    const report = evaluateReviewExecutionResult(
+      receipt.result,
+      await executionEvidenceContext(root, store),
+      definition.id,
+    );
+    if (!report.allowed) throw new Error(report.blockers[0]);
   }
   const existing = reviews.reviews.find((review) => review.id === evidenceId);
   if (state.completed_operations.includes(verdictId)) {
@@ -1044,7 +1043,6 @@ export async function approve(
   const existing = approvals.approvals.find((approval) => approval.id === scopedOperation);
   const receipt = receiptId ? await loadExecutionReceipt(root, receiptId) : undefined;
   const request = requestId ? await loadExecutionRequest(root, requestId) : undefined;
-  if (gate === "G8" && !request) throw new Error("EXECUTION_REQUEST_REQUIRED");
   if (state.completed_operations.includes(scopedOperation)) {
     if (!existing) throw new Error("APPROVAL_EVIDENCE_MISSING");
     if (existing.gate !== gate
@@ -1122,7 +1120,7 @@ export async function approve(
     workflow,
     approval,
     receipt?.result,
-    { ...policyContext, approvals: [...policyContext.approvals, approval] },
+    policyContext,
     request,
   );
   const { project } = await projectConfig(store);

@@ -100,6 +100,50 @@ export function transitionPhase(
   return applyTransition(state, workflow, request);
 }
 
+function phaseDependsOn(
+  workflow: WorkflowDefinition,
+  phaseId: string,
+  dependencyId: string,
+  visited = new Set<string>(),
+): boolean {
+  if (visited.has(phaseId)) return false;
+  visited.add(phaseId);
+  const phase = workflow.phases.find(({ id }) => id === phaseId);
+  return phase?.depends_on.some((candidate) => candidate === dependencyId
+    || phaseDependsOn(workflow, candidate, dependencyId, visited)) ?? false;
+}
+
+function isFinalGatePhase(workflow: WorkflowDefinition, definition: WorkflowDefinition["phases"][number]): boolean {
+  return !workflow.phases.some((candidate) => candidate.gate === definition.gate
+    && candidate.id !== definition.id
+    && phaseDependsOn(workflow, candidate.id, definition.id));
+}
+
+function bindPendingArtifactEvidence(
+  evidence: ExecutionPolicyInput["evidence"],
+  definition: WorkflowDefinition["phases"][number],
+  current: WorkflowState["phases"][string],
+  approval: ApprovalRecord,
+): ExecutionPolicyInput["evidence"] {
+  const bind = (reference: ArtifactEvidenceReference | undefined) => reference
+    && reference.artifact_id === definition.artifact?.id
+    ? {
+        ...reference,
+        ...(current.review_id ? { review_id: current.review_id } : {}),
+        approval_id: approval.id,
+      }
+    : reference;
+  return {
+    ...evidence,
+    qa: bind(evidence.qa),
+    security: bind(evidence.security),
+    data: bind(evidence.data),
+    backup: bind(evidence.backup),
+    dry_run: bind(evidence.dry_run),
+    rollback: bind(evidence.rollback),
+  };
+}
+
 export function approveGate(
   state: WorkflowState,
   workflow: WorkflowDefinition,
@@ -126,20 +170,29 @@ export function approveGate(
   if (approval.approved_by.identifier === definition.owner) {
     throw new Error("SELF_APPROVAL_FORBIDDEN");
   }
-  if (approval.gate === "G7") {
+  const enforceReleasePolicy = (approval.gate === "G7" || approval.gate === "G8")
+    && isFinalGatePhase(workflow, definition);
+  const pendingContext = evidenceContext ? {
+    ...evidenceContext,
+    approvals: [...evidenceContext.approvals.filter(({ id }) => id !== approval.id), approval],
+  } : undefined;
+  if (approval.gate === "G7" && enforceReleasePolicy) {
     if (!execution) throw new Error("EXECUTION_EVIDENCE_REQUIRED");
-    if (!evidenceContext) throw new Error("EXECUTION_EVIDENCE_CONTEXT_REQUIRED");
-    const report = evaluateExecutionResult(execution, approval.gate, evidenceContext, approval.approved_by);
+    if (!pendingContext) throw new Error("EXECUTION_EVIDENCE_CONTEXT_REQUIRED");
+    const report = evaluateExecutionResult({
+      ...execution,
+      evidence: bindPendingArtifactEvidence(execution.evidence, definition, current, approval),
+    }, approval.gate, pendingContext, approval.approved_by);
     if (!report.allowed) throw new Error(report.blockers[0]);
   }
-  if (approval.gate === "G8") {
+  if (approval.gate === "G8" && enforceReleasePolicy) {
     if (!executionRequest) throw new Error("EXECUTION_REQUEST_REQUIRED");
-    if (!evidenceContext) throw new Error("EXECUTION_EVIDENCE_CONTEXT_REQUIRED");
+    if (!pendingContext) throw new Error("EXECUTION_EVIDENCE_CONTEXT_REQUIRED");
     const report = evaluateExecutionPolicy({
       ...executionRequest.authorization,
-      evidence: executionRequest.evidence,
+      evidence: bindPendingArtifactEvidence(executionRequest.evidence, definition, current, approval),
       target_gate: "G8",
-    }, evidenceContext, approval.approved_by);
+    }, pendingContext, approval.approved_by);
     if (!report.allowed) throw new Error(report.blockers[0]);
   }
   if (approval.decision !== "approved" && approval.decision !== "approved_with_conditions") {
@@ -229,8 +282,7 @@ function currentArtifact(
   role: EvidenceRole,
   context: ExecutionEvidenceContext,
 ): boolean {
-  if (!reference) return false;
-  const artifact = context.artifacts.find(({ id }) => id === reference.artifact_id);
+  if (!reference || !referencedArtifact(reference, role, context)) return false;
   const phase = context.workflow.phases.find(({ artifact: configured }) => configured.id === reference.artifact_id);
   const review = context.reviews.find(({ id }) => id === reference.review_id);
   const approval = context.approvals.find((candidate) =>
@@ -239,6 +291,24 @@ function currentArtifact(
       && candidate.artifact_versions[reference.artifact_id] === reference.version
       && (candidate.decision === "approved" || candidate.decision === "approved_with_conditions")
       && candidate.approved_by.type === "human");
+  return review?.verdict === "approved"
+    && review.phase === phase?.id
+    && review.reviewer === phase?.reviewer
+    && review.artifact_versions[reference.artifact_id] === reference.version
+    && (approval?.decision === "approved" || approval?.decision === "approved_with_conditions")
+    && approval.approved_by.type === "human"
+    && approval.gate === phase?.gate
+    && approval.artifact_versions[reference.artifact_id] === reference.version;
+}
+
+function referencedArtifact(
+  reference: ArtifactEvidenceReference | undefined,
+  role: EvidenceRole,
+  context: ExecutionEvidenceContext,
+): boolean {
+  if (!reference) return false;
+  const artifact = context.artifacts.find(({ id }) => id === reference.artifact_id);
+  const phase = context.workflow.phases.find(({ artifact: configured }) => configured.id === reference.artifact_id);
   return artifact?.version === reference.version
     && artifact.status === reference.status
     && context.verified_checksums[artifact.id] === artifact.checksum
@@ -246,15 +316,72 @@ function currentArtifact(
     && phase.owner === artifact.owner
     && phase.reviewer === artifact.reviewer
     && phase.gate === artifact.required_gate
-    && phaseMatchesRole(role, phase)
-    && review?.verdict === "approved"
-    && review.phase === phase.id
-    && review.reviewer === phase.reviewer
+    && phaseMatchesRole(role, phase);
+}
+
+function reviewArtifact(
+  reference: ArtifactEvidenceReference | undefined,
+  role: EvidenceRole,
+  context: ExecutionEvidenceContext,
+  reviewedPhase: string | undefined,
+): boolean {
+  if (!reference || !referencedArtifact(reference, role, context)) return false;
+  const phase = context.workflow.phases.find(({ artifact }) => artifact.id === reference.artifact_id);
+  if (phase?.id === reviewedPhase) return true;
+  const review = context.reviews.find(({ id }) => id === reference.review_id);
+  const approval = reference.approval_id
+    ? context.approvals.find(({ id }) => id === reference.approval_id)
+    : undefined;
+  return review?.verdict === "approved"
+    && review.phase === phase?.id
+    && review.reviewer === phase?.reviewer
     && review.artifact_versions[reference.artifact_id] === reference.version
-    && (approval?.decision === "approved" || approval?.decision === "approved_with_conditions")
-    && approval.approved_by.type === "human"
-    && approval.gate === phase.gate
-    && approval.artifact_versions[reference.artifact_id] === reference.version;
+    && (!reference.approval_id || ((approval?.decision === "approved"
+      || approval?.decision === "approved_with_conditions")
+      && approval.approved_by.type === "human"
+      && approval.gate === phase?.gate
+      && approval.artifact_versions[reference.artifact_id] === reference.version));
+}
+
+export function evaluateReviewExecutionResult(
+  execution: AgentExecutionResult,
+  contextInput: ExecutionEvidenceContext,
+  reviewedPhase?: string,
+): ExecutionPolicyReport {
+  const parsed = AgentExecutionResultSchema.safeParse(execution);
+  if (!parsed.success) return { allowed: false, blockers: ["EXECUTION_RESULT_INVALID"] };
+  if (parsed.data.status !== "completed") return { allowed: false, blockers: ["EXECUTION_NOT_COMPLETED"] };
+  if (parsed.data.checkpoints.some(({ status }) => status !== "completed")) {
+    return { allowed: false, blockers: ["CHECKPOINT_NOT_COMPLETED"] };
+  }
+  const context = ExecutionEvidenceContextSchema.parse(contextInput);
+  const blockers: string[] = [];
+  const evidence = parsed.data.evidence;
+  const artifactReferences: Array<[ArtifactEvidenceReference | undefined, EvidenceRole, string]> = [
+    [evidence.qa, "qa", "QA_EVIDENCE_NOT_CURRENT"],
+    [evidence.security, "security", "SECURITY_EVIDENCE_NOT_CURRENT"],
+    [evidence.data, "data", "DATA_EVIDENCE_NOT_CURRENT"],
+    [evidence.backup, "backup", "BACKUP_VERIFICATION_REQUIRED"],
+    [evidence.dry_run, "dry_run", "DRY_RUN_REQUIRED"],
+    [evidence.rollback, "rollback", "ROLLBACK_PLAN_REQUIRED"],
+  ];
+  for (const [reference, role, blocker] of artifactReferences) {
+    if (reference && !reviewArtifact(reference, role, context, reviewedPhase)) blockers.push(blocker);
+  }
+  const gateReferences = [
+    ...evidence.gate_approvals,
+    evidence.destructive_confirmation,
+    evidence.scope_confirmation,
+  ].filter((reference) => reference !== undefined);
+  for (const reference of gateReferences) {
+    if (!context.approvals.some((approval) => approval.id === reference.approval_id
+      && approval.gate === reference.gate
+      && approval.approved_by.type === "human"
+      && (approval.decision === "approved" || approval.decision === "approved_with_conditions"))) {
+      blockers.push(`${reference.gate}_APPROVAL_REFERENCE_INVALID`);
+    }
+  }
+  return { allowed: blockers.length === 0, blockers };
 }
 
 export function evaluateExecutionPolicy(
