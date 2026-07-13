@@ -1,7 +1,12 @@
 import { createHash } from "node:crypto";
 import {
+  AgentExecutionResultSchema,
   AgentManifestSchema,
+  CapabilityRequirementsSchema,
+  type AgentExecutionResult,
   type AgentManifest,
+  type CapabilityReport,
+  type CapabilityRequirements,
   type PluginInvocationResult,
 } from "@system-design-team/core";
 import type {
@@ -30,9 +35,24 @@ export interface PreparedDispatch {
   dispatch: AgentDispatch;
 }
 
+export interface PreparedExecution {
+  dispatch: AgentDispatch;
+  digest: string;
+  context?: ContextArtifact[];
+  instruction?: string;
+}
+
 export interface ExecutionHandle {
   status: "awaiting_runtime";
   digest: string;
+}
+
+export interface AgentExecutionAdapter {
+  checkCapabilities(requirements: CapabilityRequirements): Promise<CapabilityReport>;
+  prepareExecution(dispatch: AgentDispatch): Promise<PreparedExecution>;
+  execute(prepared: PreparedExecution): Promise<ExecutionHandle>;
+  collectResult(handle: ExecutionHandle, runtimeResult?: unknown): Promise<AgentExecutionResult>;
+  cancel(handle: ExecutionHandle): Promise<void>;
 }
 
 function freezeRecursively<T>(value: T): T {
@@ -43,12 +63,58 @@ function freezeRecursively<T>(value: T): T {
   return value;
 }
 
+const shellControl = /[\r\n;&|`<>]|\$\(/;
+
+function validateDispatchScope(dispatch: AgentDispatch): void {
+  const scope = dispatch.authorized_scope;
+  if (!scope || typeof scope !== "object") throw new Error("AUTHORIZED_SCOPE_REQUIRED");
+  const paths = scope as Record<string, unknown>;
+  for (const kind of ["read", "write"] as const) {
+    const values = paths[kind];
+    if (!Array.isArray(values) || values.some((value) => typeof value !== "string"
+      || value.startsWith("/") || value.includes("\\")
+      || value.split("/").includes(".."))) {
+      throw new Error("AUTHORIZED_PATH_INVALID");
+    }
+  }
+  const commands = paths.execute;
+  if (!Array.isArray(commands) || commands.some((command) =>
+    typeof command !== "string" || shellControl.test(command))) {
+    throw new Error("COMMAND_INJECTION");
+  }
+}
+
+function capabilityReport(input: CapabilityRequirements): CapabilityReport {
+  const requirements = CapabilityRequirementsSchema.parse(input);
+  const allowedClasses = {
+    read_only_assessment: ["safe_read"],
+    documentation_write: ["safe_read", "mutating_local"],
+    code_write: ["safe_read", "local_validation", "mutating_local"],
+    test_execution: ["safe_read", "local_validation"],
+    infrastructure_write: ["safe_read", "local_validation", "mutating_local", "external_side_effect"],
+    production_execution: ["safe_read", "local_validation", "mutating_local", "external_side_effect", "production_impact"],
+  } as const;
+  const writesOutsideProfile = requirements.authorized_paths.write.length > 0
+    && (requirements.permission_profile === "read_only_assessment"
+      || requirements.permission_profile === "test_execution");
+  const commandsOutsideProfile = requirements.authorized_paths.execute.length > 0
+    && (requirements.permission_profile === "read_only_assessment"
+      || requirements.permission_profile === "documentation_write");
+  const allowed = (allowedClasses[requirements.permission_profile] as readonly string[])
+    .includes(requirements.command_class);
+  const blockers = !allowed || writesOutsideProfile || commandsOutsideProfile
+    ? ["PERMISSION_PROFILE_ESCALATION"]
+    : [];
+  return { allowed: blockers.length === 0, blockers };
+}
+
 export function prepareDispatch(
   dispatch: AgentDispatch,
   manifestInput: AgentManifest,
   availableContext: readonly ContextArtifact[],
   pluginRegistry: PluginRegistry,
 ): PreparedDispatch {
+  validateDispatchScope(dispatch);
   const manifest = AgentManifestSchema.parse(manifestInput);
   const report = pluginRegistry.check(manifest);
   if (!report.allowed) {
@@ -112,7 +178,10 @@ export function prepareDispatch(
   });
 }
 
-export class ManualCodexAdapter implements PluginAdapter {
+export class ManualCodexAdapter implements PluginAdapter, AgentExecutionAdapter {
+  readonly #cancelled = new WeakSet<ExecutionHandle>();
+  readonly #prepared = new WeakMap<ExecutionHandle, PreparedExecution>();
+
   async resolve(_uri: string): Promise<PluginResolution> {
     throw new Error("PLUGIN_RUNTIME_REQUIRED");
   }
@@ -125,12 +194,53 @@ export class ManualCodexAdapter implements PluginAdapter {
     throw new Error("PLUGIN_RUNTIME_REQUIRED");
   }
 
-  async execute(prepared: PreparedDispatch): Promise<ExecutionHandle> {
-    return { status: "awaiting_runtime", digest: prepared.digest };
+  async checkCapabilities(requirements: CapabilityRequirements): Promise<CapabilityReport> {
+    return capabilityReport(requirements);
   }
 
-  async collectResult(_handle: ExecutionHandle, runtimeResult?: unknown): Promise<unknown> {
+  async prepareExecution(dispatch: AgentDispatch): Promise<PreparedExecution> {
+    validateDispatchScope(dispatch);
+    const ownedDispatch = structuredClone(dispatch);
+    const requirements = CapabilityRequirementsSchema.parse({
+      permission_profile: ownedDispatch.permission_profile,
+      authorized_paths: ownedDispatch.authorized_scope,
+      command_class: ownedDispatch.command_class,
+    });
+    const report = capabilityReport(requirements);
+    if (!report.allowed) throw new Error(report.blockers[0]);
+    freezeRecursively(ownedDispatch);
+    return freezeRecursively({
+      dispatch: ownedDispatch,
+      digest: createHash("sha256").update(JSON.stringify(ownedDispatch)).digest("hex"),
+    });
+  }
+
+  async execute(prepared: PreparedExecution): Promise<ExecutionHandle> {
+    const handle: ExecutionHandle = { status: "awaiting_runtime", digest: prepared.digest };
+    this.#prepared.set(handle, prepared);
+    return handle;
+  }
+
+  async collectResult(handle: ExecutionHandle, runtimeResult?: unknown): Promise<AgentExecutionResult> {
+    if (this.#cancelled.has(handle)) throw new Error("EXECUTION_CANCELLED");
     if (runtimeResult === undefined) throw new Error("RUNTIME_RESULT_REQUIRED");
-    return runtimeResult;
+    const parsed = AgentExecutionResultSchema.safeParse(runtimeResult);
+    if (!parsed.success) throw new Error("EXECUTION_RESULT_INVALID");
+    if (parsed.data.dispatch_digest !== handle.digest) throw new Error("EXECUTION_DIGEST_MISMATCH");
+    const prepared = this.#prepared.get(handle);
+    if (!prepared) throw new Error("EXECUTION_HANDLE_INVALID");
+    const expected = prepared.dispatch;
+    if ((typeof expected.execution_id === "string" && parsed.data.execution_id !== expected.execution_id)
+      || (typeof expected.permission_profile === "string"
+        && parsed.data.permission_profile !== expected.permission_profile)
+      || (typeof expected.command_class === "string" && parsed.data.command_class !== expected.command_class)
+      || JSON.stringify(parsed.data.authorized_paths) !== JSON.stringify(expected.authorized_scope)) {
+      throw new Error("PERMISSION_PROFILE_ESCALATION");
+    }
+    return runtimeResult as AgentExecutionResult;
+  }
+
+  async cancel(handle: ExecutionHandle): Promise<void> {
+    this.#cancelled.add(handle);
   }
 }

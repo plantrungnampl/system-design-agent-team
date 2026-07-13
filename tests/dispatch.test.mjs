@@ -34,6 +34,37 @@ const availableRegistry = new PluginRegistry([
   { uri: pluginUri, status: "available", skills: ["brainstorming"] },
 ]);
 
+function executionResult(prepared, overrides = {}) {
+  return {
+    execution_id: dispatch.execution_id,
+    dispatch_digest: prepared.digest,
+    status: "completed",
+    permission_profile: "documentation_write",
+    authorized_paths: prepared.dispatch.authorized_scope,
+    command_class: "mutating_local",
+    checkpoints: [{
+      id: "artifact-written",
+      status: "completed",
+      timestamp: "2026-07-13T00:00:00.000Z",
+      evidence: ["sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+    }],
+    evidence: {
+      gate_approvals: [],
+      qa: "missing",
+      security: "missing",
+      data: "missing",
+      human_authorization: false,
+      destructive_confirmation: false,
+      scope_confirmation: false,
+      backup: "missing",
+      dry_run: "missing",
+      rollback: "missing",
+    },
+    output: "requirements",
+    ...overrides,
+  };
+}
+
 class FakePluginAdapter {
   constructor({
     publisher = "openai-curated-remote",
@@ -391,6 +422,74 @@ test("manual adapter waits for a supplied runtime result without fabricating evi
   assert.equal("plugin_invocations" in handle, false);
   await assert.rejects(() => adapter.collectResult(handle), /RUNTIME_RESULT_REQUIRED/);
 
-  const runtimeResult = { status: "completed", output: "requirements" };
+  const runtimeResult = executionResult(prepared);
   assert.equal(await adapter.collectResult(handle, runtimeResult), runtimeResult);
+});
+
+test("capability check rejects permission escalation", async () => {
+  const report = await new ManualCodexAdapter().checkCapabilities({
+    permission_profile: "read_only_assessment",
+    authorized_paths: { read: ["docs/**"], write: ["src/**"], execute: [] },
+    command_class: "mutating_local",
+  });
+
+  assert.deepEqual(report, { allowed: false, blockers: ["PERMISSION_PROFILE_ESCALATION"] });
+});
+
+test("preparation rejects shell command injection", () => {
+  assert.throws(() => prepareDispatch({
+    ...dispatch,
+    authorized_scope: {
+      ...dispatch.authorized_scope,
+      execute: ["npm test; Remove-Item -Recurse ."],
+    },
+  }, businessAnalystManifest, [
+    { id: "PROJECT-CHARTER", version: 1, status: "approved", content: "charter" },
+    { id: "STAKEHOLDER-MAP", version: 1, status: "approved", content: "stakeholders" },
+  ], availableRegistry), /COMMAND_INJECTION/);
+});
+
+test("cancelled execution cannot collect a result", async () => {
+  const adapter = new ManualCodexAdapter();
+  const prepared = await adapter.prepareExecution({
+    ...dispatch,
+    permission_profile: "documentation_write",
+    command_class: "mutating_local",
+  });
+  const handle = await adapter.execute(prepared);
+
+  await adapter.cancel(handle);
+
+  await assert.rejects(() => adapter.collectResult(handle, {}), /EXECUTION_CANCELLED/);
+});
+
+test("collectResult rejects a malformed structured result", async () => {
+  const adapter = new ManualCodexAdapter();
+  const prepared = await adapter.prepareExecution({
+    ...dispatch,
+    permission_profile: "documentation_write",
+    command_class: "mutating_local",
+  });
+  const handle = await adapter.execute(prepared);
+
+  await assert.rejects(() => adapter.collectResult(handle, {
+    execution_id: dispatch.execution_id,
+    dispatch_digest: prepared.digest,
+    status: "completed",
+  }), /EXECUTION_RESULT_INVALID/);
+});
+
+test("collectResult rejects runtime permission escalation", async () => {
+  const adapter = new ManualCodexAdapter();
+  const prepared = await adapter.prepareExecution({
+    ...dispatch,
+    permission_profile: "documentation_write",
+    command_class: "mutating_local",
+  });
+  const handle = await adapter.execute(prepared);
+
+  await assert.rejects(() => adapter.collectResult(handle, executionResult(prepared, {
+    permission_profile: "production_execution",
+    command_class: "production_impact",
+  })), /PERMISSION_PROFILE_ESCALATION/);
 });

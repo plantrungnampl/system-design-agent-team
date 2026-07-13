@@ -15,11 +15,16 @@ import { join } from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
 import {
+  diagnostics,
   doctor,
+  gateReadinessReport,
   initProject,
   invokePlugin,
+  issueList,
+  rejectGate,
   repair,
   reviewPhase,
+  secretsScan,
   setPluginStatus,
   startPhase,
   validatePhase,
@@ -60,6 +65,86 @@ async function temporaryDirectory(t, prefix) {
   t.after(() => rm(root, { recursive: true, force: true }));
   return root;
 }
+
+test("required CLI safety routes expose real project state", async (t) => {
+  const root = await temporaryDirectory(t, "system-design-team-safety-routes-");
+  await execFileAsync("git", ["init", "--quiet"], { cwd: root });
+  await initProject(root, {
+    id: "leave-system",
+    name: "Leave System",
+    mode: "greenfield",
+    profile: "standard",
+  });
+
+  assert.deepEqual(await gateReadinessReport(root, "G0"), {
+    gate: "G0",
+    ready: false,
+    blockers: ["PHASE_NOT_APPROVED:intake"],
+  });
+  assert.deepEqual(await diagnostics(root), await doctor(root));
+  assert(Array.isArray((await issueList(root)).issues));
+  assert.deepEqual(await secretsScan(root), { valid: true, findings: [] });
+
+  const bin = join(import.meta.dirname, "../packages/cli/dist/bin.js");
+  const { stdout } = await execFileAsync(process.execPath, [bin, "--help"], { cwd: root });
+  for (const command of ["reject <gate>", "gate readiness <gate>", "secrets scan", "diagnostics", "issue list"]) {
+    assert(stdout.includes(command));
+  }
+});
+
+test("secrets scan reports tracked credential material", async (t) => {
+  const root = await temporaryDirectory(t, "system-design-team-secret-scan-");
+  await execFileAsync("git", ["init", "--quiet"], { cwd: root });
+  await writeFile(join(root, "config.txt"), "api_key = 'not-a-real-secret-value'\n");
+  await execFileAsync("git", ["add", "config.txt"], { cwd: root });
+
+  const result = await secretsScan(root);
+
+  assert.equal(result.valid, false);
+  assert.deepEqual(result.findings.map(({ path }) => path), ["config.txt"]);
+  assert(!JSON.stringify(result).includes("not-a-real-secret-value"));
+});
+
+test("reject records a human decision and append-only audit event", async (t) => {
+  const root = await temporaryDirectory(t, "system-design-team-reject-");
+  await execFileAsync("git", ["init", "--quiet"], { cwd: root });
+  await initProject(root, {
+    id: "leave-system",
+    name: "Leave System",
+    mode: "greenfield",
+    profile: "standard",
+  });
+  await startPhase(root, "intake", "REJECT-START", pluginAdapter);
+  const store = ProjectStore.open(root);
+  const registry = parse(await readFile(join(root, ".agent-team/artifact-registry.yaml"), "utf8"));
+  const artifact = registry.artifacts.find(({ id }) => id === "PROJECT-CHARTER");
+  artifact.status = "in_review";
+  const text = [
+    "---",
+    "artifact_id: PROJECT-CHARTER",
+    "version: 1",
+    "status: in_review",
+    "owner: lead-orchestrator",
+    "reviewer: documentation-reviewer",
+    "---",
+    "# Project Charter",
+    "Ready for review.",
+  ].join("\n");
+  artifact.checksum = `sha256:${createHash("sha256").update(text).digest("hex")}`;
+  await store.writeYamlAtomic(".agent-team/artifact-registry.yaml", registry);
+  await store.writeTextAtomic(`.agent-team/${artifact.path}`, text);
+  await validatePhase(root, "intake", "REJECT-VALIDATE");
+  await reviewPhase(root, "intake", "documentation-reviewer", "approved", "REJECT-REVIEW", pluginAdapter);
+
+  const rejected = await rejectGate(root, "G0", "project-owner", "REJECT-G0");
+  const approvals = parse(await readFile(join(root, ".agent-team/approvals.yaml"), "utf8"));
+  const audit = (await readFile(join(root, ".agent-team/audit/events.jsonl"), "utf8"))
+    .trim().split("\n").map(JSON.parse);
+
+  assert.equal(rejected.phases.intake.status, "revision_required");
+  assert.equal(approvals.approvals.at(-1).decision, "rejected");
+  assert(audit.some(({ action, result }) => action === "reject" && result === "success"));
+});
 
 test("lifecycle lock is cleaned up after its callback fails", async (t) => {
   const root = await temporaryDirectory(t, "system-design-team-security-");

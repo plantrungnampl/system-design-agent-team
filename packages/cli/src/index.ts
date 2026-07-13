@@ -25,6 +25,7 @@ import {
   WorkflowDefinitionSchema,
   WorkflowStateSchema,
   type AgentManifest,
+  type AgentExecutionResult,
   type AuditEvent,
   type ArtifactRecord,
   type ChangeRequest,
@@ -48,7 +49,12 @@ import {
 } from "@system-design-team/plugin-registry";
 import { GENERATED_LOCK_PATHS, ProjectStore } from "@system-design-team/project-store";
 import { propagateStaleness, traceCoverage, validateTraceability } from "@system-design-team/traceability";
-import { approveGate, transitionPhase } from "@system-design-team/workflow-engine";
+import {
+  approveGate,
+  gateReadiness,
+  rejectGate as rejectWorkflowGate,
+  transitionPhase,
+} from "@system-design-team/workflow-engine";
 import { parse, stringify } from "yaml";
 
 export interface InitOptions {
@@ -926,6 +932,7 @@ export async function approve(
   gate: GateId,
   by: string,
   operationId: string,
+  execution?: AgentExecutionResult,
 ): Promise<WorkflowState> {
   requireOperationId(operationId);
   const approver = by.trim();
@@ -994,7 +1001,7 @@ export async function approve(
   const nextApprovals = ApprovalListSchema.parse({
     approvals: existing ? approvals.approvals : [...approvals.approvals, approval],
   });
-  const nextState = approveGate(state, workflow, approval);
+  const nextState = approveGate(state, workflow, approval, execution);
   const { project } = await projectConfig(store);
   await store.transaction(scopedOperation, [
     { path: ".agent-team/approvals.yaml", content: stringify(nextApprovals) },
@@ -1005,6 +1012,59 @@ export async function approve(
     artifactVersions: versions,
   }));
   return nextState;
+  });
+}
+
+export async function rejectGate(
+  root: string,
+  gate: GateId,
+  by: string,
+  operationId: string,
+): Promise<WorkflowState> {
+  requireOperationId(operationId);
+  const actor = by.trim();
+  if (!actor) throw new Error("APPROVER_REQUIRED");
+  const scopedOperation = operationKey("reject", gate, operationId);
+  const store = ProjectStore.open(root);
+  return store.withLock(".agent-team/lifecycle.lock", async () => {
+    const [state, workflow, approvals, registry] = await Promise.all([
+      store.readWorkflowState(),
+      configuredWorkflow(store),
+      store.readYaml(".agent-team/approvals.yaml", ApprovalListSchema),
+      artifactRegistry(store),
+    ]);
+    const existing = approvals.approvals.find(({ id }) => id === scopedOperation);
+    if (state.completed_operations.includes(scopedOperation)) {
+      if (!existing || existing.gate !== gate || existing.decision !== "rejected"
+        || existing.approved_by.identifier !== actor) throw new Error("OPERATION_ID_CONFLICT");
+      await appendOperationAudit(store, scopedOperation, "reject", gate);
+      return state;
+    }
+    const definition = workflow.phases.find((phase) =>
+      phase.gate === gate && state.phases[phase.id]?.status === "awaiting_approval");
+    if (!definition) throw new Error("INVALID_APPROVAL_STATE");
+    const versions = artifactVersions(registry.artifacts.filter((artifact) =>
+      artifact.required_gate === gate && artifact.owner === definition.owner));
+    const rejection = ApprovalRecordSchema.parse({
+      id: scopedOperation,
+      gate,
+      decision: "rejected",
+      approved_by: { type: "human", identifier: actor },
+      artifact_versions: versions,
+      timestamp: new Date().toISOString(),
+    });
+    const nextState = rejectWorkflowGate(state, workflow, rejection);
+    const nextApprovals = ApprovalListSchema.parse({ approvals: [...approvals.approvals, rejection] });
+    const { project } = await projectConfig(store);
+    await store.transaction(scopedOperation, [
+      { path: ".agent-team/approvals.yaml", content: stringify(nextApprovals) },
+      { path: ".agent-team/workflow-state.yaml", content: stringify(nextState) },
+    ], makeAuditEvent(scopedOperation, "reject", gate, project.profile, {
+      actor: { type: "human", identifier: actor },
+      authorizationSource: "gate_policy",
+      artifactVersions: versions,
+    }));
+    return nextState;
   });
 }
 
@@ -1161,6 +1221,53 @@ export async function getStatus(root: string) {
     state_version: state.state_version,
     phases: state.phases,
     plugins: plugins.plugins,
+  };
+}
+
+export async function gateReadinessReport(root: string, gate: GateId) {
+  const store = ProjectStore.open(root);
+  const [state, workflow] = await Promise.all([
+    store.readWorkflowState(),
+    configuredWorkflow(store),
+  ]);
+  return gateReadiness(state, workflow, gate);
+}
+
+export async function secretsScan(root: string) {
+  let stdout = "";
+  try {
+    ({ stdout } = await execFileAsync("git", ["ls-files", "-z"], { cwd: root }));
+  } catch {
+    throw new Error("GIT_REQUIRED");
+  }
+  // ponytail: common credential assignments only; use a dedicated scanner when one is adopted.
+  const secret = /\b(?:api[_-]?key|secret|token|password)\b\s*[:=]\s*["']?[^\s"']{8,}/i;
+  const findings: { path: string; line: number; code: string }[] = [];
+  for (const path of stdout.split("\0").filter(Boolean).sort()) {
+    let content: string;
+    try {
+      content = await readFile(join(root, path), "utf8");
+    } catch {
+      continue;
+    }
+    content.split(/\r?\n/).forEach((line, index) => {
+      if (secret.test(line)) findings.push({ path, line: index + 1, code: "POSSIBLE_SECRET" });
+    });
+  }
+  return { valid: findings.length === 0, findings };
+}
+
+export async function diagnostics(root: string) {
+  return doctor(root);
+}
+
+export async function issueList(root: string) {
+  const report = await doctor(root);
+  return {
+    issues: report.checks.filter(({ ok }) => !ok).map(({ name, detail }) => ({
+      code: name.toUpperCase(),
+      detail,
+    })),
   };
 }
 

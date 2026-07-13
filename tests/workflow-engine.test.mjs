@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   approveGate,
+  evaluateExecutionPolicy,
   gateReadiness,
   transitionPhase,
 } from "@system-design-team/workflow-engine";
@@ -212,4 +213,163 @@ test("reports gate blockers in deterministic phase order", () => {
     ready: false,
     blockers: ["PHASE_NOT_APPROVED:architecture", "PHASE_NOT_APPROVED:backlog"],
   });
+});
+
+const policyInput = {
+  permission_profile: "code_write",
+  authorized_paths: { read: ["src/**"], write: ["src/**"], execute: ["npm test"] },
+  command_class: "mutating_local",
+  destructive: false,
+  evidence: {
+    gate_approvals: [],
+    qa: "missing",
+    security: "missing",
+    data: "missing",
+    human_authorization: false,
+    destructive_confirmation: false,
+    scope_confirmation: false,
+    backup: "missing",
+    dry_run: "missing",
+    rollback: "missing",
+  },
+};
+
+test("G6 blocks code-write execution until approved", () => {
+  assert.deepEqual(evaluateExecutionPolicy(policyInput).blockers, ["G6_APPROVAL_REQUIRED"]);
+});
+
+test("G7 requires current QA, security, and data evidence", () => {
+  assert.deepEqual(evaluateExecutionPolicy({
+    ...policyInput,
+    permission_profile: "test_execution",
+    command_class: "local_validation",
+    target_gate: "G7",
+  }).blockers, [
+    "QA_EVIDENCE_NOT_CURRENT",
+    "SECURITY_EVIDENCE_NOT_CURRENT",
+    "DATA_EVIDENCE_NOT_CURRENT",
+  ]);
+});
+
+test("G8 production execution requires explicit human authorization", () => {
+  const report = evaluateExecutionPolicy({
+    ...policyInput,
+    permission_profile: "production_execution",
+    command_class: "production_impact",
+    evidence: {
+      ...policyInput.evidence,
+      qa: "current",
+      security: "current",
+      data: "current",
+      backup: "passed",
+      rollback: "current",
+    },
+  });
+
+  assert(report.blockers.includes("G8_APPROVAL_REQUIRED"));
+  assert(report.blockers.includes("HUMAN_AUTHORIZATION_REQUIRED"));
+});
+
+test("G8 approval readiness requires human authorization, backup, and rollback", () => {
+  assert.deepEqual(evaluateExecutionPolicy({
+    ...policyInput,
+    permission_profile: "test_execution",
+    command_class: "local_validation",
+    target_gate: "G8",
+    evidence: {
+      ...policyInput.evidence,
+      qa: "current",
+      security: "current",
+      data: "current",
+    },
+  }).blockers, [
+    "HUMAN_AUTHORIZATION_REQUIRED",
+    "BACKUP_VERIFICATION_REQUIRED",
+    "ROLLBACK_PLAN_REQUIRED",
+  ]);
+});
+
+test("destructive execution requires explicit confirmation", () => {
+  const report = evaluateExecutionPolicy({
+    ...policyInput,
+    destructive: true,
+    evidence: {
+      ...policyInput.evidence,
+      gate_approvals: ["G6"],
+      human_authorization: true,
+      scope_confirmation: true,
+      backup: "passed",
+      dry_run: "passed",
+      rollback: "current",
+    },
+  });
+
+  assert.deepEqual(report.blockers, ["DESTRUCTIVE_CONFIRMATION_REQUIRED"]);
+});
+
+test("destructive execution requires verified backup", () => {
+  const report = evaluateExecutionPolicy({
+    ...policyInput,
+    destructive: true,
+    evidence: {
+      ...policyInput.evidence,
+      gate_approvals: ["G6"],
+      human_authorization: true,
+      destructive_confirmation: true,
+      scope_confirmation: true,
+      dry_run: "passed",
+      rollback: "current",
+    },
+  });
+
+  assert.deepEqual(report.blockers, ["BACKUP_VERIFICATION_REQUIRED"]);
+});
+
+test("production execution requires a current rollback plan", () => {
+  const report = evaluateExecutionPolicy({
+    ...policyInput,
+    permission_profile: "production_execution",
+    command_class: "production_impact",
+    evidence: {
+      ...policyInput.evidence,
+      gate_approvals: ["G8"],
+      qa: "current",
+      security: "current",
+      data: "current",
+      human_authorization: true,
+      backup: "passed",
+    },
+  });
+
+  assert.deepEqual(report.blockers, ["ROLLBACK_PLAN_REQUIRED"]);
+});
+
+test("G7 approval rejects policy claims without a structured execution result", () => {
+  const g7Workflow = {
+    ...workflow,
+    phases: [{ id: "release", owner: "developer", reviewer: "code-reviewer", gate: "G7", depends_on: [] }],
+  };
+  const awaiting = {
+    ...state,
+    phases: { release: { status: "awaiting_approval" } },
+  };
+
+  assert.throws(() => approveGate(awaiting, g7Workflow, {
+    id: "APR-G7",
+    gate: "G7",
+    decision: "approved",
+    approved_by: { type: "human", identifier: "project-owner" },
+    artifact_versions: { RELEASE: 1 },
+    timestamp: "2026-07-13T00:00:00Z",
+  }, {
+    ...policyInput,
+    permission_profile: "test_execution",
+    command_class: "local_validation",
+    evidence: {
+      ...policyInput.evidence,
+      qa: "current",
+      security: "current",
+      data: "current",
+    },
+  }), /EXECUTION_RESULT_INVALID/);
 });

@@ -14,12 +14,17 @@ import {
   artifactValidate,
   approve,
   createChange,
+  diagnostics,
   doctor,
+  gateReadinessReport,
   getStatus,
   handover,
   initProject,
+  issueList,
+  rejectGate,
   repair,
   reviewPhase,
+  secretsScan,
   startPhase,
   staleList,
   traceCheck,
@@ -36,6 +41,7 @@ Commands:
   validate <phase> --operation-id <id>
   review <phase> --reviewer <id> --verdict <approved|revision_required> --operation-id <id>
   approve <gate> --by <id> --operation-id <id>
+  reject <gate> --by <id> --operation-id <id>
   handover <phase> --operation-id <id>
   artifact list
   artifact inspect <id>
@@ -44,6 +50,10 @@ Commands:
   trace coverage
   stale list
   change create <id> --by <id> --artifacts <ids> --reason <text> --impact <low|medium|high> --operation-id <id>
+  gate readiness <gate>
+  issue list
+  secrets scan
+  diagnostics
   doctor
   repair --locks --yes`;
 
@@ -54,6 +64,7 @@ const commandShape: Record<string, { positionals: number; options: string[] }> =
   validate: { positionals: 2, options: ["operation-id"] },
   review: { positionals: 2, options: ["reviewer", "verdict", "operation-id"] },
   approve: { positionals: 2, options: ["by", "operation-id"] },
+  reject: { positionals: 2, options: ["by", "operation-id"] },
   handover: { positionals: 2, options: ["operation-id"] },
   "artifact list": { positionals: 2, options: [] },
   "artifact inspect": { positionals: 3, options: [] },
@@ -62,6 +73,10 @@ const commandShape: Record<string, { positionals: number; options: string[] }> =
   "trace coverage": { positionals: 2, options: [] },
   "stale list": { positionals: 2, options: [] },
   "change create": { positionals: 3, options: ["by", "artifacts", "reason", "impact", "reapprovals", "operation-id"] },
+  "gate readiness": { positionals: 3, options: [] },
+  "issue list": { positionals: 2, options: [] },
+  "secrets scan": { positionals: 2, options: [] },
+  diagnostics: { positionals: 1, options: [] },
   doctor: { positionals: 1, options: [] },
   repair: { positionals: 1, options: ["locks", "yes"] },
 };
@@ -115,7 +130,7 @@ async function main(): Promise<void> {
     console.log(usage);
     return;
   }
-  const command = ["artifact", "trace", "stale", "change"].includes(rootCommand)
+  const command = ["artifact", "trace", "stale", "change", "gate", "issue", "secrets"].includes(rootCommand)
     ? `${rootCommand} ${positionals[1] ?? ""}`
     : rootCommand;
   validateInvocation(command, positionals, values);
@@ -147,6 +162,14 @@ async function main(): Promise<void> {
       break;
     case "approve":
       result = await approve(
+        root,
+        GateIdSchema.parse(required(positionals[1], "gate")),
+        required(values.by, "--by"),
+        required(values["operation-id"], "--operation-id"),
+      );
+      break;
+    case "reject":
+      result = await rejectGate(
         root,
         GateIdSchema.parse(required(positionals[1], "gate")),
         required(values.by, "--by"),
@@ -203,6 +226,18 @@ async function main(): Promise<void> {
       }, required(values["operation-id"], "--operation-id"));
       break;
     }
+    case "gate readiness":
+      result = await gateReadinessReport(root, GateIdSchema.parse(required(positionals[2], "gate")));
+      break;
+    case "issue list":
+      result = await issueList(root);
+      break;
+    case "secrets scan":
+      result = await secretsScan(root);
+      break;
+    case "diagnostics":
+      result = await diagnostics(root);
+      break;
     case "validate":
       result = await validatePhase(
         root,

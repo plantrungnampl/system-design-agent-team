@@ -189,6 +189,79 @@ export const PluginStatusListSchema = z.object({
 
 const Sha256DigestSchema = z.string().regex(/^sha256:[a-f0-9]{64}$/);
 
+export const PermissionProfileSchema = z.enum([
+  "read_only_assessment",
+  "documentation_write",
+  "code_write",
+  "test_execution",
+  "infrastructure_write",
+  "production_execution",
+]);
+
+export const CommandClassSchema = z.enum([
+  "safe_read",
+  "local_validation",
+  "mutating_local",
+  "external_side_effect",
+  "production_impact",
+]);
+
+export const AuthorizedPathsSchema = z.object({
+  read: z.array(z.string().min(1)).default([]),
+  write: z.array(z.string().min(1)).default([]),
+  execute: z.array(z.string().min(1)).default([]),
+});
+
+export const CapabilityRequirementsSchema = z.object({
+  permission_profile: PermissionProfileSchema,
+  authorized_paths: AuthorizedPathsSchema,
+  command_class: CommandClassSchema,
+});
+
+export const CapabilityReportSchema = z.object({
+  allowed: z.boolean(),
+  blockers: z.array(z.string().min(1)),
+});
+
+export const ExecutionEvidenceSchema = z.object({
+  gate_approvals: z.array(GateIdSchema).default([]),
+  qa: z.enum(["current", "stale", "missing"]),
+  security: z.enum(["current", "stale", "missing"]),
+  data: z.enum(["current", "stale", "missing"]),
+  human_authorization: z.boolean(),
+  destructive_confirmation: z.boolean(),
+  scope_confirmation: z.boolean(),
+  backup: z.enum(["passed", "failed", "missing"]),
+  dry_run: z.enum(["passed", "failed", "missing"]),
+  rollback: z.enum(["current", "stale", "missing"]),
+});
+
+export const ExecutionPolicyInputSchema = CapabilityRequirementsSchema.extend({
+  target_gate: GateIdSchema.optional(),
+  destructive: z.boolean().optional(),
+  evidence: ExecutionEvidenceSchema,
+});
+
+export const ExecutionCheckpointSchema = z.object({
+  id: z.string().min(1),
+  status: z.enum(["completed", "failed", "cancelled"]),
+  timestamp: z.string().datetime(),
+  evidence: z.array(Sha256DigestSchema).min(1),
+});
+
+export const AgentExecutionResultSchema = z.object({
+  execution_id: z.string().min(1),
+  dispatch_digest: z.string().regex(/^[a-f0-9]{64}$/),
+  status: z.enum(["completed", "failed", "cancelled"]),
+  permission_profile: PermissionProfileSchema,
+  authorized_paths: AuthorizedPathsSchema,
+  command_class: CommandClassSchema,
+  destructive: z.boolean().default(false),
+  checkpoints: z.array(ExecutionCheckpointSchema).min(1),
+  evidence: ExecutionEvidenceSchema,
+  output: z.unknown().optional(),
+});
+
 export const PluginInvocationStatusSchema = z.enum(["success", "failure"]);
 
 const PluginInvocationResultFieldsSchema = z.object({
@@ -395,3 +468,12 @@ export type ReviewRecord = z.infer<typeof ReviewRecordSchema>;
 export type ReviewList = z.infer<typeof ReviewListSchema>;
 export type HandoverRecord = z.infer<typeof HandoverRecordSchema>;
 export type AuditEvent = z.infer<typeof AuditEventSchema>;
+export type PermissionProfile = z.infer<typeof PermissionProfileSchema>;
+export type CommandClass = z.infer<typeof CommandClassSchema>;
+export type AuthorizedPaths = z.infer<typeof AuthorizedPathsSchema>;
+export type CapabilityRequirements = z.infer<typeof CapabilityRequirementsSchema>;
+export type CapabilityReport = z.infer<typeof CapabilityReportSchema>;
+export type ExecutionEvidence = z.infer<typeof ExecutionEvidenceSchema>;
+export type ExecutionPolicyInput = z.infer<typeof ExecutionPolicyInputSchema>;
+export type ExecutionCheckpoint = z.infer<typeof ExecutionCheckpointSchema>;
+export type AgentExecutionResult = z.infer<typeof AgentExecutionResultSchema>;
