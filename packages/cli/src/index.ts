@@ -1429,6 +1429,9 @@ export async function approve(
   const existing = approvals.approvals.find((approval) => approval.id === scopedOperation);
   const receipt = receiptId ? await loadExecutionReceipt(root, receiptId) : undefined;
   const request = requestId ? await loadExecutionRequest(root, requestId) : undefined;
+  if ((gate === "G7" || gate === "G8") && !(await secretsScan(root)).valid) {
+    throw new Error("SECRET_SCAN_FAILED");
+  }
   if (state.completed_operations.includes(scopedOperation)) {
     if (!existing) throw new Error("APPROVAL_EVIDENCE_MISSING");
     if (existing.gate !== gate

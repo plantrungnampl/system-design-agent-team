@@ -117,6 +117,15 @@ test("existing-system performs scoped discovery, modifies existing authorization
   const securityReceipt = await reviewerReceipt(root, mode, "security-review", securityEvidence, "clean");
   await reviewPhase(root, "security-review", "architecture-reviewer", "approved",
     "REVIEW-security-clean", pluginAdapter, securityReceipt.id);
+  const lateSecretPath = join(root, "late-secret.txt");
+  await writeFile(lateSecretPath, "api_key = 'another-not-real-secret-value'\n");
+  await execFileAsync("git", ["add", "late-secret.txt"], { cwd: root });
+  await assert.rejects(
+    () => approve(root, "G7", "project-owner", "APPROVE-security-late-secret", securityReceipt.id),
+    /SECRET_SCAN_FAILED/,
+  );
+  await execFileAsync("git", ["rm", "--quiet", "--cached", "late-secret.txt"], { cwd: root });
+  await rm(lateSecretPath);
   await approveAndHandover(root, mode, "security-review", { receipt: securityReceipt });
   const security = await artifactReference(root, mode, "SECURITY-VERDICT");
 
