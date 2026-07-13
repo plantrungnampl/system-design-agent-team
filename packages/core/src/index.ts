@@ -212,6 +212,7 @@ export const PluginInvocationResultSchema = PluginInvocationResultFieldsSchema.s
 });
 
 export const PluginInvocationRecordSchema = PluginInvocationResultFieldsSchema.omit({ output: true }).extend({
+  operation_id: z.string().min(1),
   skill: z.string().min(1),
   input_digest: Sha256DigestSchema,
   output_digest: Sha256DigestSchema,

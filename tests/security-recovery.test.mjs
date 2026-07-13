@@ -106,7 +106,14 @@ test("verified plugin invocation persists sanitized evidence", async (t) => {
     profile: "standard",
   });
 
-  const result = await invokePlugin(root, new FakePluginAdapter(), {
+  const adapter = new FakePluginAdapter();
+  let runtimeRequest;
+  const invoke = adapter.invoke.bind(adapter);
+  adapter.invoke = async (request) => {
+    runtimeRequest = structuredClone(request);
+    return invoke(request);
+  };
+  const result = await invokePlugin(root, adapter, {
     plugin_uri: pluginUri,
     skill: "brainstorming",
     input: { objective: "requirements", secret: "input-only" },
@@ -115,11 +122,119 @@ test("verified plugin invocation persists sanitized evidence", async (t) => {
   const evidence = parse(evidenceText);
 
   assert.equal(result.output.secret, "runtime-only");
+  assert.equal(runtimeRequest.operation_id, "PLUGIN-EVIDENCE");
   assert.equal(evidence.invocations.length, 1);
+  assert.equal(evidence.invocations[0].operation_id, "PLUGIN-EVIDENCE");
   assert.equal(evidence.invocations[0].execution_reference, "fake-execution-persisted");
   assert(!evidenceText.includes("input-only"));
   assert(!evidenceText.includes("runtime-only"));
   assert(!evidenceText.includes("must never be stored"));
+});
+
+test("plugin invocation replay reuses persisted evidence without invoking twice", async (t) => {
+  const root = await temporaryDirectory(t, "system-design-team-plugin-replay-");
+  await execFileAsync("git", ["init", "--quiet"], { cwd: root });
+  await initProject(root, {
+    id: "leave-system",
+    name: "Leave System",
+    mode: "greenfield",
+    profile: "standard",
+  });
+  const adapter = new FakePluginAdapter();
+  let invocationCount = 0;
+  const invoke = adapter.invoke.bind(adapter);
+  adapter.invoke = async (request) => {
+    invocationCount += 1;
+    return invoke(request);
+  };
+  const request = {
+    plugin_uri: pluginUri,
+    skill: "brainstorming",
+    input: { objective: "requirements" },
+  };
+
+  const first = await invokePlugin(root, adapter, request, "PLUGIN-REPLAY");
+  const auditPath = join(root, ".agent-team/audit/events.jsonl");
+  const audit = (await readFile(auditPath, "utf8")).trim().split("\n").map(JSON.parse);
+  await writeFile(
+    auditPath,
+    `${audit.filter(({ action }) => action !== "plugin-invocation").map(JSON.stringify).join("\n")}\n`,
+  );
+  const replay = await invokePlugin(root, adapter, request, "PLUGIN-REPLAY");
+  const evidence = parse(await readFile(join(root, ".agent-team/plugin-invocations.yaml"), "utf8"));
+  const repairedAudit = (await readFile(auditPath, "utf8")).trim().split("\n").map(JSON.parse);
+
+  assert.equal(invocationCount, 1);
+  assert.deepEqual(replay.evidence, first.evidence);
+  assert.equal(replay.output, undefined);
+  assert.equal(evidence.invocations.length, 1);
+  assert.equal(repairedAudit.filter(({ action, result }) =>
+    action === "plugin-invocation" && result === "success").length, 1);
+});
+
+test("failed plugin invocation appends a redacted failure audit without success evidence", async (t) => {
+  const root = await temporaryDirectory(t, "system-design-team-plugin-failure-");
+  await execFileAsync("git", ["init", "--quiet"], { cwd: root });
+  await initProject(root, {
+    id: "leave-system",
+    name: "Leave System",
+    mode: "greenfield",
+    profile: "standard",
+  });
+  const adapter = new FakePluginAdapter();
+  adapter.invoke = async () => { throw new Error("runtime secret"); };
+
+  await assert.rejects(
+    () => invokePlugin(root, adapter, {
+      plugin_uri: pluginUri,
+      skill: "brainstorming",
+      input: { secret: "input secret" },
+    }, "PLUGIN-FAILED"),
+    /PLUGIN_INVOCATION_FAILED/,
+  );
+  const auditText = await readFile(join(root, ".agent-team/audit/events.jsonl"), "utf8");
+  const events = auditText.trim().split("\n").map(JSON.parse);
+  const evidence = parse(await readFile(join(root, ".agent-team/plugin-invocations.yaml"), "utf8"));
+
+  assert(events.some(({ action, result }) => action === "plugin-invocation" && result === "failure"));
+  assert.deepEqual(evidence.invocations, []);
+  assert(!auditText.includes("runtime secret"));
+  assert(!auditText.includes("input secret"));
+});
+
+test("malformed plugin result appends a redacted failure audit without success evidence", async (t) => {
+  const root = await temporaryDirectory(t, "system-design-team-plugin-malformed-");
+  await execFileAsync("git", ["init", "--quiet"], { cwd: root });
+  await initProject(root, {
+    id: "leave-system",
+    name: "Leave System",
+    mode: "greenfield",
+    profile: "standard",
+  });
+  const adapter = new FakePluginAdapter();
+  adapter.invoke = async (request) => ({
+    plugin_uri: request.plugin_uri,
+    publisher_identity: "openai-curated-remote",
+    status: "success",
+    output: { secret: "output secret" },
+  });
+
+  await assert.rejects(
+    () => invokePlugin(root, adapter, {
+      plugin_uri: pluginUri,
+      skill: "brainstorming",
+      input: { secret: "input secret" },
+    }, "PLUGIN-MALFORMED"),
+    /PLUGIN_INVOCATION_RESULT_INVALID/,
+  );
+  const auditText = await readFile(join(root, ".agent-team/audit/events.jsonl"), "utf8");
+  const events = auditText.trim().split("\n").map(JSON.parse);
+  const evidence = parse(await readFile(join(root, ".agent-team/plugin-invocations.yaml"), "utf8"));
+
+  assert(events.some(({ action, result }) => action === "plugin-invocation" && result === "failure"));
+  assert.deepEqual(evidence.invocations, []);
+  assert(!auditText.includes("output secret"));
+  assert(!auditText.includes("input secret"));
 });
 
 test("lifecycle lock serializes plugin status and phase start", async (t) => {

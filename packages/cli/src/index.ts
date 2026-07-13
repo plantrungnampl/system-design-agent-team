@@ -41,6 +41,7 @@ import {
 } from "@system-design-team/core";
 import {
   PluginRegistry,
+  pluginInvocationDigest,
   type PluginAdapter,
   type PluginInvocationRequest,
   type VerifiedPluginInvocation,
@@ -370,6 +371,7 @@ async function appendOperationAudit(
     authorizationSource?: string;
     artifactVersions?: Record<string, number>;
     adapterId?: string;
+    result?: AuditEvent["result"];
   } = {},
 ): Promise<void> {
   const { project } = await projectConfig(store);
@@ -386,6 +388,7 @@ function makeAuditEvent(
     authorizationSource?: string;
     artifactVersions?: Record<string, number>;
     adapterId?: string;
+    result?: AuditEvent["result"];
   } = {},
 ): AuditEvent {
   const actor = options.actor ?? { type: "system" as const, identifier: "system-design-team" };
@@ -399,7 +402,7 @@ function makeAuditEvent(
     ...(options.adapterId ? { adapter_id: options.adapterId } : {}),
     permission_profile: permissionProfile,
     artifact_versions: options.artifactVersions ?? {},
-    result: "success",
+    result: options.result ?? "success",
     timestamp: new Date().toISOString(),
   });
 }
@@ -451,18 +454,47 @@ async function requireCurrentCapabilities(
 export async function invokePlugin(
   root: string,
   adapter: PluginAdapter,
-  request: PluginInvocationRequest,
+  request: Omit<PluginInvocationRequest, "operation_id">,
   operationId: string,
 ): Promise<VerifiedPluginInvocation> {
   requireOperationId(operationId);
   const store = ProjectStore.open(root);
   return store.withLock(".agent-team/lifecycle.lock", async () => {
-    const result = await new PluginRegistry([]).invoke(adapter, request);
+    const id = operationKey("plugin-invocation", request.plugin_uri, operationId);
     const current = await pluginInvocations(store);
+    const existing = current.invocations.find((invocation) =>
+      invocation.plugin_uri === request.plugin_uri && invocation.operation_id === operationId);
+    if (existing) {
+      if (existing.skill !== request.skill
+        || existing.input_digest !== pluginInvocationDigest(request.input)) {
+        throw new Error("OPERATION_ID_CONFLICT");
+      }
+      await appendOperationAudit(store, id, "plugin-invocation", request.plugin_uri, {
+        authorizationSource: "runtime-adapter",
+        adapterId: request.plugin_uri,
+      });
+      return { evidence: existing, output: undefined };
+    }
+    let result: VerifiedPluginInvocation;
+    try {
+      result = await new PluginRegistry([]).invoke(adapter, { ...request, operation_id: operationId });
+    } catch (error) {
+      await appendOperationAudit(
+        store,
+        operationKey("plugin-invocation-failure", request.plugin_uri, operationId),
+        "plugin-invocation",
+        request.plugin_uri,
+        {
+          authorizationSource: "runtime-adapter",
+          adapterId: request.plugin_uri,
+          result: "failure",
+        },
+      );
+      throw error;
+    }
     const next = PluginInvocationListSchema.parse({
       invocations: [...current.invocations, result.evidence],
     });
-    const id = operationKey("plugin-invocation", request.plugin_uri, operationId);
     const { project } = await projectConfig(store);
     await store.transaction(id, [
       { path: ".agent-team/plugin-invocations.yaml", content: stringify(next) },

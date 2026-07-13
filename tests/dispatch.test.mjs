@@ -105,6 +105,22 @@ test("current capability check rejects a missing verified skill", async () => {
   }]);
 });
 
+test("current capability check rejects a non-boolean skill result", async () => {
+  const adapter = new FakePluginAdapter();
+  adapter.verifySkill = async () => ({ verified: true });
+
+  const report = await new PluginRegistry([]).checkCurrent(
+    businessAnalystManifest,
+    adapter,
+  );
+
+  assert.deepEqual(report.blockers, [{
+    code: "REQUIRED_SKILL_MISSING",
+    uri: pluginUri,
+    skill: "brainstorming",
+  }]);
+});
+
 test("verified invocation rejects a runtime failure", async () => {
   const registry = new PluginRegistry([]);
   const adapter = new FakePluginAdapter({ invocation: {
@@ -122,6 +138,7 @@ test("verified invocation rejects a runtime failure", async () => {
       plugin_uri: pluginUri,
       skill: "brainstorming",
       input: { objective: "requirements" },
+      operation_id: "failed-invocation",
     }),
     /PLUGIN_INVOCATION_FAILED/,
   );
@@ -141,6 +158,7 @@ test("verified invocation rejects a malformed runtime result", async () => {
       plugin_uri: pluginUri,
       skill: "brainstorming",
       input: { objective: "requirements" },
+      operation_id: "malformed-invocation",
     }),
     /PLUGIN_INVOCATION_RESULT_INVALID/,
   );
@@ -153,6 +171,7 @@ test("verified invocation produces only digest evidence", async () => {
       plugin_uri: pluginUri,
       skill: "brainstorming",
       input: { objective: "requirements", secret: "do-not-persist" },
+      operation_id: "successful-invocation",
     },
   );
 

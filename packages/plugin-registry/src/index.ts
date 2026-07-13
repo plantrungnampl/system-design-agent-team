@@ -25,6 +25,7 @@ export interface PluginInvocationRequest {
   plugin_uri: string;
   skill: string;
   input: unknown;
+  operation_id: string;
 }
 
 export interface PluginAdapter {
@@ -46,7 +47,7 @@ const trustedPublishers = new Map([
   ["plugin://superpowers@openai-curated-remote", "openai-curated-remote"],
 ]);
 
-function digest(value: unknown): string {
+export function pluginInvocationDigest(value: unknown): string {
   const serialized = JSON.stringify(value);
   if (serialized === undefined) throw new Error("PLUGIN_INVOCATION_RESULT_INVALID");
   return `sha256:${createHash("sha256").update(serialized).digest("hex")}`;
@@ -139,7 +140,7 @@ export class PluginRegistry {
           for (const skill of requirement.required_skills) {
             let verified = false;
             try {
-              verified = await adapter.verifySkill(requirement.uri, skill);
+              verified = await adapter.verifySkill(requirement.uri, skill) === true;
             } catch {
               verified = false;
             }
@@ -201,9 +202,10 @@ export class PluginRegistry {
     return {
       evidence: PluginInvocationRecordSchema.parse({
         ...result,
+        operation_id: request.operation_id,
         skill: request.skill,
-        input_digest: digest(request.input),
-        output_digest: digest(result.output),
+        input_digest: pluginInvocationDigest(request.input),
+        output_digest: pluginInvocationDigest(result.output),
       }),
       output: result.output,
     };
