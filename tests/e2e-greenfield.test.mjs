@@ -10,9 +10,9 @@ import {
   approve,
   handover,
   initProject,
-  reviewPhase,
+  reviewPhase as reviewPhaseWithAdapter,
   setPluginStatus,
-  startPhase,
+  startPhase as startPhaseWithAdapter,
   validatePhase,
 } from "@system-design-team/cli";
 import { ProjectStore } from "@system-design-team/project-store";
@@ -21,6 +21,22 @@ import { parse } from "yaml";
 const execFileAsync = promisify(execFile);
 const pluginUri = "plugin://superpowers@openai-curated-remote";
 const operationKey = (action, target, raw) => JSON.stringify([action, target, raw]);
+const adapterWithStatus = (status) => ({
+  async resolve(uri) {
+    return { uri, publisher_identity: uri.slice(uri.lastIndexOf("@") + 1), status };
+  },
+  async verifySkill() {
+    return true;
+  },
+  async invoke() {
+    throw new Error("TEST_INVOCATION_NOT_CONFIGURED");
+  },
+});
+const pluginAdapter = adapterWithStatus("available");
+const startPhase = (root, phase, operationId, adapter = pluginAdapter) =>
+  startPhaseWithAdapter(root, phase, operationId, adapter);
+const reviewPhase = (root, phase, reviewer, verdict, operationId, adapter = pluginAdapter) =>
+  reviewPhaseWithAdapter(root, phase, reviewer, verdict, operationId, adapter);
 
 async function temporaryGitRepository(t) {
   const root = await mkdtemp(join(tmpdir(), "system-design-team-e2e-"));
@@ -64,7 +80,7 @@ test("greenfield requirements flow blocks missing plugins and reaches handover w
   });
 
   await assert.rejects(
-    () => startPhase(root, "intake", "OP-START-INTAKE"),
+    () => startPhase(root, "intake", "OP-START-INTAKE", adapterWithStatus("unknown")),
     /REQUIRED_PLUGIN_UNKNOWN/,
   );
   await setPluginStatus(root, pluginUri, "available", ["brainstorming", "writing-plans", "verification-before-completion"]);

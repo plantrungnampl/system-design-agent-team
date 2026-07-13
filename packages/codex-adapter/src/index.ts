@@ -1,6 +1,15 @@
 import { createHash } from "node:crypto";
-import { AgentManifestSchema, type AgentManifest } from "@system-design-team/core";
-import type { PluginRegistry } from "@system-design-team/plugin-registry";
+import {
+  AgentManifestSchema,
+  type AgentManifest,
+  type PluginInvocationResult,
+} from "@system-design-team/core";
+import type {
+  PluginAdapter,
+  PluginInvocationRequest,
+  PluginResolution,
+  PluginRegistry,
+} from "@system-design-team/plugin-registry";
 
 export interface ContextArtifact {
   id: string;
@@ -103,7 +112,19 @@ export function prepareDispatch(
   });
 }
 
-export class ManualCodexAdapter {
+export class ManualCodexAdapter implements PluginAdapter {
+  async resolve(_uri: string): Promise<PluginResolution> {
+    throw new Error("PLUGIN_RUNTIME_REQUIRED");
+  }
+
+  async verifySkill(_uri: string, _skill: string): Promise<boolean> {
+    throw new Error("PLUGIN_RUNTIME_REQUIRED");
+  }
+
+  async invoke(_request: PluginInvocationRequest): Promise<PluginInvocationResult> {
+    throw new Error("PLUGIN_RUNTIME_REQUIRED");
+  }
+
   async execute(prepared: PreparedDispatch): Promise<ExecutionHandle> {
     return { status: "awaiting_runtime", digest: prepared.digest };
   }

@@ -34,6 +34,135 @@ const availableRegistry = new PluginRegistry([
   { uri: pluginUri, status: "available", skills: ["brainstorming"] },
 ]);
 
+class FakePluginAdapter {
+  constructor({
+    publisher = "openai-curated-remote",
+    status = "available",
+    missingSkills = [],
+    invocation,
+  } = {}) {
+    this.publisher = publisher;
+    this.status = status;
+    this.missingSkills = new Set(missingSkills);
+    this.invocation = invocation;
+  }
+
+  async resolve(uri) {
+    return { uri, publisher_identity: this.publisher, status: this.status };
+  }
+
+  async verifySkill(_uri, skill) {
+    return !this.missingSkills.has(skill);
+  }
+
+  async invoke(request) {
+    return this.invocation ?? {
+      plugin_uri: request.plugin_uri,
+      publisher_identity: this.publisher,
+      status: "success",
+      output: { artifact: "requirements" },
+      execution_reference: "fake-execution-1",
+      started_at: "2026-07-13T00:00:00.000Z",
+      completed_at: "2026-07-13T00:00:01.000Z",
+    };
+  }
+}
+
+test("current capability check rejects a spoofed publisher", async () => {
+  const report = await new PluginRegistry([]).checkCurrent(
+    businessAnalystManifest,
+    new FakePluginAdapter({ publisher: "attacker.example" }),
+  );
+
+  assert.deepEqual(report.blockers, [{
+    code: "PLUGIN_PUBLISHER_MISMATCH",
+    uri: pluginUri,
+  }]);
+});
+
+test("current capability check rejects an incompatible plugin", async () => {
+  const report = await new PluginRegistry([]).checkCurrent(
+    businessAnalystManifest,
+    new FakePluginAdapter({ status: "installed_but_incompatible" }),
+  );
+
+  assert.deepEqual(report.blockers, [{
+    code: "REQUIRED_PLUGIN_INSTALLED_BUT_INCOMPATIBLE",
+    uri: pluginUri,
+  }]);
+});
+
+test("current capability check rejects a missing verified skill", async () => {
+  const report = await new PluginRegistry([]).checkCurrent(
+    businessAnalystManifest,
+    new FakePluginAdapter({ missingSkills: ["brainstorming"] }),
+  );
+
+  assert.deepEqual(report.blockers, [{
+    code: "REQUIRED_SKILL_MISSING",
+    uri: pluginUri,
+    skill: "brainstorming",
+  }]);
+});
+
+test("verified invocation rejects a runtime failure", async () => {
+  const registry = new PluginRegistry([]);
+  const adapter = new FakePluginAdapter({ invocation: {
+    plugin_uri: pluginUri,
+    publisher_identity: "openai-curated-remote",
+    status: "failure",
+    output: { error: "runtime failed" },
+    execution_reference: "fake-execution-failed",
+    started_at: "2026-07-13T00:00:00.000Z",
+    completed_at: "2026-07-13T00:00:01.000Z",
+  } });
+
+  await assert.rejects(
+    () => registry.invoke(adapter, {
+      plugin_uri: pluginUri,
+      skill: "brainstorming",
+      input: { objective: "requirements" },
+    }),
+    /PLUGIN_INVOCATION_FAILED/,
+  );
+});
+
+test("verified invocation rejects a malformed runtime result", async () => {
+  const registry = new PluginRegistry([]);
+  const adapter = new FakePluginAdapter({ invocation: {
+    plugin_uri: pluginUri,
+    publisher_identity: "openai-curated-remote",
+    status: "success",
+    output: { artifact: "requirements" },
+  } });
+
+  await assert.rejects(
+    () => registry.invoke(adapter, {
+      plugin_uri: pluginUri,
+      skill: "brainstorming",
+      input: { objective: "requirements" },
+    }),
+    /PLUGIN_INVOCATION_RESULT_INVALID/,
+  );
+});
+
+test("verified invocation produces only digest evidence", async () => {
+  const { evidence, output } = await new PluginRegistry([]).invoke(
+    new FakePluginAdapter(),
+    {
+      plugin_uri: pluginUri,
+      skill: "brainstorming",
+      input: { objective: "requirements", secret: "do-not-persist" },
+    },
+  );
+
+  assert.deepEqual(output, { artifact: "requirements" });
+  assert.match(evidence.input_digest, /^sha256:[a-f0-9]{64}$/);
+  assert.match(evidence.output_digest, /^sha256:[a-f0-9]{64}$/);
+  assert.equal("input" in evidence, false);
+  assert.equal("output" in evidence, false);
+});
+
 test("blocks a required plugin whose status is unknown", () => {
   const report = new PluginRegistry([]).check(businessAnalystManifest);
 

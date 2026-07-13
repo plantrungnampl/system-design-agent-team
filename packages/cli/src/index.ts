@@ -15,6 +15,7 @@ import {
   FRAMEWORK_VERSION,
   FrameworkLockSchema,
   HandoverRecordSchema,
+  PluginInvocationListSchema,
   PluginStatusListSchema,
   ProjectConfigSchema,
   ReviewListSchema,
@@ -29,6 +30,7 @@ import {
   type ChangeRequest,
   type GateId,
   type HandoverRecord,
+  type PluginInvocationList,
   type PluginStatusRecord,
   type ProjectConfig,
   type ProjectMode,
@@ -37,7 +39,12 @@ import {
   type WorkflowDefinition,
   type WorkflowState,
 } from "@system-design-team/core";
-import { PluginRegistry } from "@system-design-team/plugin-registry";
+import {
+  PluginRegistry,
+  type PluginAdapter,
+  type PluginInvocationRequest,
+  type VerifiedPluginInvocation,
+} from "@system-design-team/plugin-registry";
 import { GENERATED_LOCK_PATHS, ProjectStore } from "@system-design-team/project-store";
 import { propagateStaleness, traceCoverage, validateTraceability } from "@system-design-team/traceability";
 import { approveGate, transitionPhase } from "@system-design-team/workflow-engine";
@@ -225,6 +232,7 @@ export async function initProject(root: string, options: InitOptions): Promise<P
       agent.required_plugins.map((plugin) => plugin.uri),
     ))].sort().map((uri) => ({ uri, status: "unknown", skills: [] })),
   });
+  const pluginInvocations = PluginInvocationListSchema.parse({ invocations: [] });
   const approvals = ApprovalListSchema.parse({ approvals: [] });
   const reviews = ReviewListSchema.parse({ reviews: [] });
   const artifactTexts = new Map(workflow.phases.map((phase) => [phase.id, renderPhaseArtifact(phase)]));
@@ -285,6 +293,7 @@ export async function initProject(root: string, options: InitOptions): Promise<P
       { path: ".agent-team/project.yaml", content: stringify(project) },
       { path: ".agent-team/workflow-state.yaml", content: stringify(state) },
       { path: ".agent-team/plugin-status.yaml", content: stringify(plugins) },
+      { path: ".agent-team/plugin-invocations.yaml", content: stringify(pluginInvocations) },
       { path: ".agent-team/approvals.yaml", content: stringify(approvals) },
       { path: ".agent-team/reviews.yaml", content: stringify(reviews) },
       { path: ".agent-team/artifact-registry.yaml", content: stringify(registry) },
@@ -333,6 +342,10 @@ async function configuredWorkflow(store: ProjectStore): Promise<WorkflowDefiniti
 
 async function pluginStatus(store: ProjectStore) {
   return store.readYaml(".agent-team/plugin-status.yaml", PluginStatusListSchema);
+}
+
+async function pluginInvocations(store: ProjectStore): Promise<PluginInvocationList> {
+  return store.readYaml(".agent-team/plugin-invocations.yaml", PluginInvocationListSchema);
 }
 
 async function artifactRegistry(store: ProjectStore) {
@@ -419,10 +432,53 @@ export async function setPluginStatus(
   });
 }
 
+function capabilityError(report: Awaited<ReturnType<PluginRegistry["checkCurrent"]>>): Error | undefined {
+  const blocker = report.blockers[0];
+  return blocker
+    ? new Error(`${blocker.code}: ${blocker.uri}${blocker.skill ? ` (${blocker.skill})` : ""}`)
+    : undefined;
+}
+
+async function requireCurrentCapabilities(
+  manifest: AgentManifest,
+  adapter?: PluginAdapter,
+): Promise<void> {
+  if (!adapter) throw new Error("PLUGIN_ADAPTER_REQUIRED");
+  const error = capabilityError(await new PluginRegistry([]).checkCurrent(manifest, adapter));
+  if (error) throw error;
+}
+
+export async function invokePlugin(
+  root: string,
+  adapter: PluginAdapter,
+  request: PluginInvocationRequest,
+  operationId: string,
+): Promise<VerifiedPluginInvocation> {
+  requireOperationId(operationId);
+  const store = ProjectStore.open(root);
+  return store.withLock(".agent-team/lifecycle.lock", async () => {
+    const result = await new PluginRegistry([]).invoke(adapter, request);
+    const current = await pluginInvocations(store);
+    const next = PluginInvocationListSchema.parse({
+      invocations: [...current.invocations, result.evidence],
+    });
+    const id = operationKey("plugin-invocation", request.plugin_uri, operationId);
+    const { project } = await projectConfig(store);
+    await store.transaction(id, [
+      { path: ".agent-team/plugin-invocations.yaml", content: stringify(next) },
+    ], makeAuditEvent(id, "plugin-invocation", request.plugin_uri, project.profile, {
+      authorizationSource: "runtime-adapter",
+      adapterId: request.plugin_uri,
+    }));
+    return result;
+  });
+}
+
 export async function startPhase(
   root: string,
   phase: string,
   operationId: string,
+  adapter?: PluginAdapter,
 ): Promise<WorkflowState> {
   requireOperationId(operationId);
   const scopedOperation = operationKey("start", phase, operationId);
@@ -438,18 +494,12 @@ export async function startPhase(
   if ((await inspectArtifacts(root, registry.artifacts.filter(({ id }) => inputIds.has(id)))).length > 0) {
     throw new Error("APPROVED_INPUT_STALE");
   }
+  const owner = (await readCatalogue()).find((agent) => agent.id === definition.owner);
+  if (!owner) throw new Error(`AGENT_NOT_CONFIGURED: ${definition.owner}`);
+  await requireCurrentCapabilities(owner, adapter);
   if (state.completed_operations.includes(scopedOperation)) {
     await appendOperationAudit(store, scopedOperation, "start", phase);
     return state;
-  }
-  const owner = (await readCatalogue()).find((agent) => agent.id === definition.owner);
-  if (!owner) throw new Error(`AGENT_NOT_CONFIGURED: ${definition.owner}`);
-  const report = new PluginRegistry((await pluginStatus(store)).plugins).check(owner);
-  if (!report.allowed) {
-    const blocker = report.blockers[0];
-    throw new Error(blocker
-      ? `${blocker.code}: ${blocker.uri}${blocker.skill ? ` (${blocker.skill})` : ""}`
-      : "PLUGIN_CAPABILITY_BLOCKED");
   }
 
   const next = await store.updateWorkflowState(state.state_version, (current) => transitionPhase(
@@ -735,6 +785,7 @@ export async function reviewPhase(
   reviewer: string,
   verdictInput: ReviewVerdict,
   operationId: string,
+  adapter?: PluginAdapter,
 ): Promise<WorkflowState> {
   requireOperationId(operationId);
   const reviewerId = reviewer.trim();
@@ -758,6 +809,9 @@ export async function reviewPhase(
     if (existing.phase !== phase || existing.reviewer !== reviewerId || existing.verdict !== verdict) {
       throw new Error("OPERATION_ID_CONFLICT");
     }
+    const reviewerManifest = (await readCatalogue()).find((agent) => agent.id === reviewerId);
+    if (!reviewerManifest) throw new Error("REVIEWER_NOT_CONFIGURED");
+    await requireCurrentCapabilities(reviewerManifest, adapter);
     if (state.phases[phase]?.review_id !== existing.id) throw new Error("REVIEW_EVIDENCE_MISSING");
     const replayDefinition = workflow.phases.find((candidate) => candidate.id === phase);
     const [finding] = await inspectArtifacts(root, registry.artifacts.filter((artifact) =>
@@ -771,13 +825,7 @@ export async function reviewPhase(
   }
   const reviewerManifest = (await readCatalogue()).find((agent) => agent.id === reviewerId);
   if (!reviewerManifest) throw new Error("REVIEWER_NOT_CONFIGURED");
-  const capability = new PluginRegistry((await pluginStatus(store)).plugins).check(reviewerManifest);
-  if (!capability.allowed) {
-    const blocker = capability.blockers[0];
-    throw new Error(blocker
-      ? `${blocker.code}: ${blocker.uri}${blocker.skill ? ` (${blocker.skill})` : ""}`
-      : "PLUGIN_CAPABILITY_BLOCKED");
-  }
+  await requireCurrentCapabilities(reviewerManifest, adapter);
   const artifacts = registry.artifacts.filter(
     (artifact) => artifact.owner === definition.owner && artifact.required_gate === definition.gate,
   );

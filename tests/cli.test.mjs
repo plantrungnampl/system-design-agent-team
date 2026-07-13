@@ -27,9 +27,9 @@ import {
   getStatus,
   handover,
   initProject,
-  reviewPhase,
+  reviewPhase as reviewPhaseWithAdapter,
   setPluginStatus,
-  startPhase,
+  startPhase as startPhaseWithAdapter,
   staleList,
   traceCheck,
   traceCoverageReport,
@@ -48,6 +48,23 @@ const execFileAsync = promisify(execFile);
 const repository = join(dirname(fileURLToPath(import.meta.url)), "..");
 const pluginUri = "plugin://superpowers@openai-curated-remote";
 const operationKey = (action, target, raw) => JSON.stringify([action, target, raw]);
+const adapterWithStatus = (status) => ({
+  async resolve(uri) {
+    return { uri, publisher_identity: uri.slice(uri.lastIndexOf("@") + 1), status };
+  },
+  async verifySkill() {
+    return true;
+  },
+  async invoke() {
+    throw new Error("TEST_INVOCATION_NOT_CONFIGURED");
+  },
+});
+const pluginAdapter = adapterWithStatus("available");
+const unavailablePluginAdapter = adapterWithStatus("unknown");
+const startPhase = (root, phase, operationId, adapter = pluginAdapter) =>
+  startPhaseWithAdapter(root, phase, operationId, adapter);
+const reviewPhase = (root, phase, reviewer, verdict, operationId, adapter = pluginAdapter) =>
+  reviewPhaseWithAdapter(root, phase, reviewer, verdict, operationId, adapter);
 
 async function temporaryGitRepository() {
   const root = await mkdtemp(join(tmpdir(), "system-design-team-cli-"));
@@ -532,7 +549,7 @@ test("start checks the phase owner plugin before changing state and replays safe
   const before = await ProjectStore.open(root).readWorkflowState();
 
   await assert.rejects(
-    startPhase(root, "intake", "OP-START-INTAKE"),
+    startPhase(root, "intake", "OP-START-INTAKE", unavailablePluginAdapter),
     /REQUIRED_PLUGIN_UNKNOWN/,
   );
   assert.deepEqual(await ProjectStore.open(root).readWorkflowState(), before);
@@ -719,14 +736,14 @@ test("review checks the configured reviewer plugin before recording evidence", a
   state.phases.ux.status = "artifact_validation";
   state.current_phase = "ux";
   await store.writeYamlAtomic(".agent-team/workflow-state.yaml", state);
+  await setPluginStatus(root, "plugin://ux-design@wondelai-skills", "available", []);
 
   await assert.rejects(
-    () => reviewPhase(root, "ux", "ux-reviewer", "approved", "OP-UX-REVIEW"),
+    () => reviewPhase(root, "ux", "ux-reviewer", "approved", "OP-UX-REVIEW", unavailablePluginAdapter),
     /REQUIRED_PLUGIN_UNKNOWN/,
   );
   assert.deepEqual((await readYaml(root, ".agent-team/reviews.yaml")).reviews, []);
 
-  await setPluginStatus(root, "plugin://ux-design@wondelai-skills", "available", []);
   const reviewed = await reviewPhase(root, "ux", "ux-reviewer", "approved", "OP-UX-REVIEW");
   assert.equal(reviewed.phases.ux.status, "awaiting_approval");
 });
@@ -1028,13 +1045,23 @@ test("CLI help lists the first-slice commands", async () => {
   );
   await setArtifactStatus(root, "PROJECT-CHARTER");
   await validatePhase(root, "intake", "CLI-VALID");
-  const reviewed = JSON.parse((await execFileAsync(process.execPath, [
-    bin,
-    "review",
+  await assert.rejects(
+    () => execFileAsync(process.execPath, [
+      bin,
+      "review",
+      "intake",
+      "--reviewer", "documentation-reviewer",
+      "--verdict", "approved",
+      "--operation-id", "CLI-REVIEW",
+    ], { cwd: root }),
+    /PLUGIN_ADAPTER_REQUIRED/,
+  );
+  const reviewed = await reviewPhase(
+    root,
     "intake",
-    "--reviewer", "documentation-reviewer",
-    "--verdict", "approved",
-    "--operation-id", "CLI-REVIEW",
-  ], { cwd: root })).stdout);
+    "documentation-reviewer",
+    "approved",
+    "CLI-REVIEW",
+  );
   assert.equal(reviewed.phases.intake.status, "awaiting_approval");
 });

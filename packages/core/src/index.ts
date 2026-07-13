@@ -187,6 +187,48 @@ export const PluginStatusListSchema = z.object({
   plugins: z.array(PluginStatusRecordSchema),
 });
 
+const Sha256DigestSchema = z.string().regex(/^sha256:[a-f0-9]{64}$/);
+
+export const PluginInvocationStatusSchema = z.enum(["success", "failure"]);
+
+const PluginInvocationResultFieldsSchema = z.object({
+  plugin_uri: z.string().min(1),
+  publisher_identity: z.string().min(1),
+  status: PluginInvocationStatusSchema,
+  output: z.unknown(),
+  execution_reference: z.string().min(1),
+  started_at: z.string().datetime(),
+  completed_at: z.string().datetime(),
+});
+
+export const PluginInvocationResultSchema = PluginInvocationResultFieldsSchema.superRefine((result, context) => {
+  if (result.completed_at < result.started_at) {
+    context.addIssue({
+      code: "custom",
+      message: "Plugin invocation cannot complete before it starts",
+      path: ["completed_at"],
+    });
+  }
+});
+
+export const PluginInvocationRecordSchema = PluginInvocationResultFieldsSchema.omit({ output: true }).extend({
+  skill: z.string().min(1),
+  input_digest: Sha256DigestSchema,
+  output_digest: Sha256DigestSchema,
+}).superRefine((record, context) => {
+  if (record.completed_at < record.started_at) {
+    context.addIssue({
+      code: "custom",
+      message: "Plugin invocation cannot complete before it starts",
+      path: ["completed_at"],
+    });
+  }
+});
+
+export const PluginInvocationListSchema = z.object({
+  invocations: z.array(PluginInvocationRecordSchema),
+});
+
 export const ApprovalDecisionSchema = z.enum([
   "approved",
   "approved_with_conditions",
@@ -337,6 +379,9 @@ export type WorkflowState = z.infer<typeof WorkflowStateSchema>;
 export type AgentManifest = z.infer<typeof AgentManifestSchema>;
 export type PluginStatusRecord = z.infer<typeof PluginStatusRecordSchema>;
 export type PluginStatusList = z.infer<typeof PluginStatusListSchema>;
+export type PluginInvocationResult = z.infer<typeof PluginInvocationResultSchema>;
+export type PluginInvocationRecord = z.infer<typeof PluginInvocationRecordSchema>;
+export type PluginInvocationList = z.infer<typeof PluginInvocationListSchema>;
 export type ApprovalRecord = z.infer<typeof ApprovalRecordSchema>;
 export type ApprovalList = z.infer<typeof ApprovalListSchema>;
 export type ArtifactRecord = z.infer<typeof ArtifactRecordSchema>;
