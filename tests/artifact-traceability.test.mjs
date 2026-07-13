@@ -102,6 +102,9 @@ test("rejects unsupported completion claims even with filler but accepts concret
     "Everything passed.\nReceipt: pending",
     "Everything passed.\nReceipt: this is evidence",
     "Everything passed.\nReceipt: receipt-review",
+    "Everything passed.\nReceipt: receipt-review-final",
+    "Everything passed.\nReceipt: this-is-evidence",
+    "Everything passed.\nReceipt: foo-bar-baz",
     "Everything passed.\nArtifact: none",
     "Everything passed.\nPath: n/a",
     "Everything passed.\nCommand: run tests\nResult: ok",
@@ -139,6 +142,7 @@ Receipt: RECEIPT-REVIEW-123`), { valid: true, findings: [] });
 
   for (const receipt of [
     "EXEC-REVIEW-requirements-1",
+    "EXEC-POLICY",
     "019c6e27-e55b-73d1-87d8-4e01f1f75043",
   ]) {
     assert.deepEqual(validateReviewReadyArtifact(`---

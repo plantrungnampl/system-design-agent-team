@@ -45,13 +45,10 @@ function isProjectRelativeFile(value: string) {
 }
 
 function isReceiptIdentifier(value: string) {
-  if (value.length < 8 || /\s/.test(value)) return false;
-  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value)) {
+  if (/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(value)) {
     return true;
   }
-  if (!/^[a-z0-9.]+(?:[-_:][a-z0-9.]+)+$/i.test(value)) return false;
-  const parts = value.split(/[-_:]/);
-  return parts.length >= 3 || /\d/.test(value);
+  return /^(?:EXEC|RECEIPT)-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*$/.test(value);
 }
 
 function boundedFrontMatter(text: string): { yaml: string; body: string } | undefined {
