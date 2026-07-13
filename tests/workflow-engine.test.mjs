@@ -705,8 +705,10 @@ test("all shipped workflows progress shared G7 phases before enforcing final rel
     const qa = definition.phases.find(({ owner, artifact }) => owner === "qa-lead"
       && artifact.path.startsWith("testing/"));
     const security = definition.phases.find(({ owner }) => owner === "security-reviewer");
-    const data = definition.phases.find(({ artifact, owner, reviewer }) => artifact.path.startsWith("data/")
-      && (owner === "data-reviewer" || reviewer === "data-reviewer"));
+    const data = file === "migration.yaml"
+      ? definition.phases.find(({ id }) => id === "transition-architecture")
+      : definition.phases.find(({ artifact, owner, reviewer }) => artifact.path.startsWith("data/")
+        && (owner === "data-reviewer" || reviewer === "data-reviewer"));
     const evidencePhases = [...new Set([qa, security, data, ...gatePhases].filter(Boolean))];
     const artifacts = evidencePhases.map((phase) => ({
       id: phase.artifact.id,
@@ -785,7 +787,17 @@ test("all shipped workflows progress shared G7 phases before enforcing final rel
     });
 
     for (const [index, phase] of gatePhases.entries()) {
-      lifecycle = withPhase(lifecycle, phase.id, "awaiting_approval");
+      lifecycle = withPhase(lifecycle, phase.id, "artifact_validation");
+      lifecycle = transitionPhase(lifecycle, definition, {
+        phase: phase.id,
+        to: "under_review",
+        operation_id: `REVIEW-${phase.id}`,
+      });
+      lifecycle = transitionPhase(lifecycle, definition, {
+        phase: phase.id,
+        to: "awaiting_approval",
+        operation_id: `VERDICT-${phase.id}`,
+      });
       reviews.push({
         id: `REV-${phase.artifact.id}`,
         phase: phase.id,
@@ -821,5 +833,158 @@ test("all shipped workflows progress shared G7 phases before enforcing final rel
       approvals.push(approval);
       assert.equal(lifecycle.phases[phase.id].status, "approved", `${file}:${phase.id}`);
     }
+
+    if (file === "migration.yaml") {
+      const cutover = definition.phases.find(({ id }) => id === "cutover");
+      const artifact = {
+        id: cutover.artifact.id,
+        path: cutover.artifact.path,
+        type: "document",
+        version: 1,
+        status: "in_review",
+        owner: cutover.owner,
+        reviewer: cutover.reviewer,
+        dependencies: [],
+        consumers: [],
+        required_gate: cutover.gate,
+        checksum: `sha256:${"c".repeat(64)}`,
+      };
+      artifacts.push(artifact);
+      reviews.push({
+        id: "REV-CUTOVER-PLAN",
+        phase: cutover.id,
+        reviewer: cutover.reviewer,
+        verdict: "approved",
+        artifact_versions: { "CUTOVER-PLAN": 1 },
+        timestamp: "2026-07-13T00:00:00Z",
+      });
+      lifecycle = withPhase(lifecycle, cutover.id, "artifact_validation");
+      lifecycle.phases[cutover.id].review_id = "REV-CUTOVER-PLAN";
+      lifecycle = transitionPhase(lifecycle, definition, {
+        phase: cutover.id,
+        to: "under_review",
+        operation_id: "REVIEW-cutover",
+      });
+      lifecycle = transitionPhase(lifecycle, definition, {
+        phase: cutover.id,
+        to: "awaiting_approval",
+        operation_id: "VERDICT-cutover",
+      });
+      const authorization = {
+        execution_id: "EXEC-MIGRATION-CUTOVER",
+        dispatch_digest: "c".repeat(64),
+        permission_profile: "production_execution",
+        authorized_paths: { read: ["release/**"], write: ["release/**"], execute: ["cutover"] },
+        command_class: "production_impact",
+        destructive: false,
+      };
+      const cutoverReference = {
+        artifact_id: "CUTOVER-PLAN",
+        version: 1,
+        status: "in_review",
+        review_id: "PENDING-CUTOVER-REVIEW",
+      };
+      const request = {
+        authorization,
+        evidence: {
+          gate_approvals: [],
+          qa: reference(qa),
+          data: reference(data),
+          backup: cutoverReference,
+          rollback: cutoverReference,
+        },
+      };
+      const approval = {
+        id: "APR-CUTOVER-PLAN",
+        gate: "G8",
+        decision: "approved",
+        approved_by: { type: "human", identifier: "project-owner" },
+        artifact_versions: { "CUTOVER-PLAN": 1 },
+        execution_authorization: authorization,
+        timestamp: "2026-07-13T00:00:00Z",
+      };
+      lifecycle = approveGate(lifecycle, definition, approval, undefined, context(), request);
+      assert.equal(lifecycle.phases.cutover.status, "approved");
+      assert.equal(artifacts.some(({ id }) => id === "RECONCILIATION-RESULT"), false);
+    }
   }
+});
+
+test("migration cutover accepts upstream data design and rejects downstream reconciliation evidence", async () => {
+  const definition = parse(await readFile(new URL("../workflows/migration.yaml", import.meta.url), "utf8"));
+  const phases = Object.fromEntries([
+    "transition-architecture",
+    "parallel-validation",
+    "cutover",
+    "post-migration-reconciliation",
+  ].map((id) => [id, definition.phases.find((phase) => phase.id === id)]));
+  const artifacts = Object.fromEntries(Object.entries(phases).map(([id, phase]) => [id, {
+    id: phase.artifact.id,
+    path: phase.artifact.path,
+    type: "document",
+    version: 1,
+    status: id === "cutover" ? "in_review" : "approved",
+    owner: phase.owner,
+    reviewer: phase.reviewer,
+    dependencies: [],
+    consumers: [],
+    required_gate: phase.gate,
+    checksum: `sha256:${id === "cutover" ? "c" : "a"}`.padEnd(71, id === "cutover" ? "c" : "a"),
+  }]));
+  const authorization = {
+    execution_id: "EXEC-MIGRATION-CUTOVER-POLICY",
+    dispatch_digest: "c".repeat(64),
+    permission_profile: "production_execution",
+    authorized_paths: { read: ["release/**"], write: ["release/**"], execute: ["cutover"] },
+    command_class: "production_impact",
+    destructive: false,
+  };
+  const approvals = Object.entries(phases).map(([id, phase]) => ({
+    id: `APR-${phase.artifact.id}`,
+    gate: phase.gate,
+    decision: "approved",
+    approved_by: { type: "human", identifier: "project-owner" },
+    artifact_versions: { [phase.artifact.id]: 1 },
+    ...(id === "cutover" ? { execution_authorization: authorization } : {}),
+    timestamp: "2026-07-13T00:00:00Z",
+  }));
+  const context = {
+    workflow: definition,
+    artifacts: Object.values(artifacts),
+    approvals,
+    reviews: Object.entries(phases).map(([id, phase]) => ({
+      id: `REV-${phase.artifact.id}`,
+      phase: id,
+      reviewer: phase.reviewer,
+      verdict: "approved",
+      artifact_versions: { [phase.artifact.id]: 1 },
+      timestamp: "2026-07-13T00:00:00Z",
+    })),
+    verified_checksums: Object.fromEntries(Object.values(artifacts).map(({ id, checksum }) => [id, checksum])),
+  };
+  const reference = (phaseId) => ({
+    artifact_id: phases[phaseId].artifact.id,
+    version: 1,
+    status: phaseId === "cutover" ? "in_review" : "approved",
+    review_id: `REV-${phases[phaseId].artifact.id}`,
+    approval_id: `APR-${phases[phaseId].artifact.id}`,
+  });
+  const input = {
+    ...authorization,
+    target_gate: "G8",
+    evidence: {
+      gate_approvals: [],
+      qa: reference("parallel-validation"),
+      data: reference("transition-architecture"),
+      backup: reference("cutover"),
+      rollback: reference("cutover"),
+    },
+  };
+
+  assert.deepEqual(evaluateExecutionPolicy(input, context).blockers, []);
+  const downstream = evaluateExecutionPolicy({
+    ...input,
+    evidence: { ...input.evidence, data: reference("post-migration-reconciliation") },
+  }, context);
+  assert(downstream.blockers.includes("DATA_EVIDENCE_NOT_CURRENT"));
 });
