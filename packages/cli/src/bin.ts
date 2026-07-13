@@ -21,7 +21,6 @@ import {
   handover,
   initProject,
   issueList,
-  loadExecutionResult,
   rejectGate,
   repair,
   reviewPhase,
@@ -40,8 +39,8 @@ Commands:
   status
   start <phase> --operation-id <id>
   validate <phase> --operation-id <id>
-  review <phase> --reviewer <id> --verdict <approved|revision_required> --operation-id <id> [--execution-evidence <path>]
-  approve <gate> --by <id> --operation-id <id> [--execution-evidence <path>]
+  review <phase> --reviewer <id> --verdict <approved|revision_required> --operation-id <id> [--execution-receipt <id>]
+  approve <gate> --by <id> --operation-id <id> [--execution-receipt <id>]
   reject <gate> --by <id> --operation-id <id>
   handover <phase> --operation-id <id>
   artifact list
@@ -51,7 +50,7 @@ Commands:
   trace coverage
   stale list
   change create <id> --by <id> --artifacts <ids> --reason <text> --impact <low|medium|high> --operation-id <id>
-  gate readiness <gate> [--execution-evidence <path>]
+  gate readiness <gate> [--execution-receipt <id>]
   issue list
   secrets scan
   diagnostics
@@ -63,8 +62,8 @@ const commandShape: Record<string, { positionals: number; options: string[] }> =
   status: { positionals: 1, options: [] },
   start: { positionals: 2, options: ["operation-id"] },
   validate: { positionals: 2, options: ["operation-id"] },
-  review: { positionals: 2, options: ["reviewer", "verdict", "operation-id", "execution-evidence"] },
-  approve: { positionals: 2, options: ["by", "operation-id", "execution-evidence"] },
+  review: { positionals: 2, options: ["reviewer", "verdict", "operation-id", "execution-receipt"] },
+  approve: { positionals: 2, options: ["by", "operation-id", "execution-receipt"] },
   reject: { positionals: 2, options: ["by", "operation-id"] },
   handover: { positionals: 2, options: ["operation-id"] },
   "artifact list": { positionals: 2, options: [] },
@@ -74,7 +73,7 @@ const commandShape: Record<string, { positionals: number; options: string[] }> =
   "trace coverage": { positionals: 2, options: [] },
   "stale list": { positionals: 2, options: [] },
   "change create": { positionals: 3, options: ["by", "artifacts", "reason", "impact", "reapprovals", "operation-id"] },
-  "gate readiness": { positionals: 3, options: ["execution-evidence"] },
+  "gate readiness": { positionals: 3, options: ["execution-receipt"] },
   "issue list": { positionals: 2, options: [] },
   "secrets scan": { positionals: 2, options: [] },
   diagnostics: { positionals: 1, options: [] },
@@ -118,7 +117,7 @@ async function main(): Promise<void> {
       reviewer: { type: "string" },
       verdict: { type: "string" },
       "operation-id": { type: "string" },
-      "execution-evidence": { type: "string" },
+      "execution-receipt": { type: "string" },
       artifacts: { type: "string" },
       reason: { type: "string" },
       impact: { type: "string" },
@@ -142,9 +141,7 @@ async function main(): Promise<void> {
   }
 
   const root = process.cwd();
-  const execution = values["execution-evidence"]
-    ? await loadExecutionResult(root, values["execution-evidence"])
-    : undefined;
+  const receiptId = values["execution-receipt"];
   let result: unknown;
   switch (command) {
     case "init":
@@ -171,7 +168,7 @@ async function main(): Promise<void> {
         GateIdSchema.parse(required(positionals[1], "gate")),
         required(values.by, "--by"),
         required(values["operation-id"], "--operation-id"),
-        execution,
+        receiptId,
       );
       break;
     case "reject":
@@ -190,7 +187,7 @@ async function main(): Promise<void> {
         ReviewVerdictSchema.parse(required(values.verdict, "--verdict")),
         required(values["operation-id"], "--operation-id"),
         undefined,
-        execution,
+        receiptId,
       );
       break;
     case "handover":
@@ -238,7 +235,7 @@ async function main(): Promise<void> {
       result = await gateReadinessReport(
         root,
         GateIdSchema.parse(required(positionals[2], "gate")),
-        execution,
+        receiptId,
       );
       break;
     case "issue list":

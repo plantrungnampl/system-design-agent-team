@@ -8,6 +8,7 @@
   "include": ["src/**/*.ts"],
   "references": [
     { "path": "../core" },
+    { "path": "../codex-adapter" },
     { "path": "../workflow-engine" },
     { "path": "../project-store" },
     { "path": "../artifact-validator" },

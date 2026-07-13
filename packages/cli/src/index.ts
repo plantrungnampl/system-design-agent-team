@@ -7,7 +7,6 @@ import { promisify } from "node:util";
 import { parseArtifact, validateReviewReadyArtifact } from "@system-design-team/artifact-validator";
 import {
   AgentManifestSchema,
-  AgentExecutionResultSchema,
   AuditEventSchema,
   ApprovalListSchema,
   ApprovalRecordSchema,
@@ -15,6 +14,8 @@ import {
   ChangeRequestSchema,
   FRAMEWORK_VERSION,
   FrameworkLockSchema,
+  ExecutionReceiptListSchema,
+  ExecutionReceiptSchema,
   HandoverRecordSchema,
   PluginInvocationListSchema,
   PluginStatusListSchema,
@@ -27,6 +28,8 @@ import {
   WorkflowStateSchema,
   type AgentManifest,
   type AgentExecutionResult,
+  type ExecutionReceipt,
+  type ExecutionReceiptList,
   type AuditEvent,
   type ArtifactRecord,
   type ChangeRequest,
@@ -41,6 +44,7 @@ import {
   type WorkflowDefinition,
   type WorkflowState,
 } from "@system-design-team/core";
+import { ManualCodexAdapter } from "@system-design-team/codex-adapter";
 import {
   PluginRegistry,
   pluginInvocationDigest,
@@ -242,6 +246,7 @@ export async function initProject(root: string, options: InitOptions): Promise<P
     ))].sort().map((uri) => ({ uri, status: "unknown", skills: [] })),
   });
   const pluginInvocations = PluginInvocationListSchema.parse({ invocations: [] });
+  const executionReceipts = ExecutionReceiptListSchema.parse({ receipts: [] });
   const approvals = ApprovalListSchema.parse({ approvals: [] });
   const reviews = ReviewListSchema.parse({ reviews: [] });
   const artifactTexts = new Map(workflow.phases.map((phase) => [phase.id, renderPhaseArtifact(phase)]));
@@ -303,6 +308,7 @@ export async function initProject(root: string, options: InitOptions): Promise<P
       { path: ".agent-team/workflow-state.yaml", content: stringify(state) },
       { path: ".agent-team/plugin-status.yaml", content: stringify(plugins) },
       { path: ".agent-team/plugin-invocations.yaml", content: stringify(pluginInvocations) },
+      { path: ".agent-team/execution-receipts.yaml", content: stringify(executionReceipts) },
       { path: ".agent-team/approvals.yaml", content: stringify(approvals) },
       { path: ".agent-team/reviews.yaml", content: stringify(reviews) },
       { path: ".agent-team/artifact-registry.yaml", content: stringify(registry) },
@@ -361,13 +367,32 @@ async function artifactRegistry(store: ProjectStore) {
   return store.readYaml(".agent-team/artifact-registry.yaml", ArtifactRegistrySchema);
 }
 
-async function executionEvidenceContext(store: ProjectStore) {
-  const [registry, reviews, approvals] = await Promise.all([
+async function executionReceipts(store: ProjectStore): Promise<ExecutionReceiptList> {
+  return store.readYaml(".agent-team/execution-receipts.yaml", ExecutionReceiptListSchema);
+}
+
+async function executionEvidenceContext(root: string, store: ProjectStore) {
+  const [registry, reviews, approvals, workflow] = await Promise.all([
     artifactRegistry(store),
     store.readYaml(".agent-team/reviews.yaml", ReviewListSchema),
     store.readYaml(".agent-team/approvals.yaml", ApprovalListSchema),
+    configuredWorkflow(store),
   ]);
-  return { artifacts: registry.artifacts, reviews: reviews.reviews, approvals: approvals.approvals };
+  const verified = await Promise.all(registry.artifacts.map(async (artifact) => {
+    try {
+      if ((await inspectArtifacts(root, [artifact])).length > 0) return undefined;
+      return [artifact.id, artifactChecksum(await readArtifact(root, artifact))] as const;
+    } catch {
+      return undefined;
+    }
+  }));
+  return {
+    artifacts: registry.artifacts,
+    reviews: reviews.reviews,
+    approvals: approvals.approvals,
+    workflow,
+    verified_checksums: Object.fromEntries(verified.filter((entry) => entry !== undefined)),
+  };
 }
 
 function requireOperationId(operationId: string): void {
@@ -388,6 +413,8 @@ async function appendOperationAudit(
     authorizationSource?: string;
     artifactVersions?: Record<string, number>;
     adapterId?: string;
+    executionReceiptId?: string;
+    executionReceiptDigest?: string;
     result?: AuditEvent["result"];
   } = {},
 ): Promise<void> {
@@ -405,6 +432,8 @@ function makeAuditEvent(
     authorizationSource?: string;
     artifactVersions?: Record<string, number>;
     adapterId?: string;
+    executionReceiptId?: string;
+    executionReceiptDigest?: string;
     result?: AuditEvent["result"];
   } = {},
 ): AuditEvent {
@@ -417,6 +446,8 @@ function makeAuditEvent(
     authorization_source: options.authorizationSource ?? "workflow",
     ...(actor.type === "agent" ? { agent_id: actor.identifier } : {}),
     ...(options.adapterId ? { adapter_id: options.adapterId } : {}),
+    ...(options.executionReceiptId ? { execution_receipt_id: options.executionReceiptId } : {}),
+    ...(options.executionReceiptDigest ? { execution_receipt_digest: options.executionReceiptDigest } : {}),
     permission_profile: permissionProfile,
     artifact_versions: options.artifactVersions ?? {},
     result: options.result ?? "success",
@@ -835,7 +866,7 @@ export async function reviewPhase(
   verdictInput: ReviewVerdict,
   operationId: string,
   adapter?: PluginAdapter,
-  execution?: AgentExecutionResult,
+  receiptId?: string,
 ): Promise<WorkflowState> {
   requireOperationId(operationId);
   const reviewerId = reviewer.trim();
@@ -854,13 +885,23 @@ export async function reviewPhase(
   const definition = workflow.phases.find((candidate) => candidate.id === phase);
   if (!definition) throw new Error("PHASE_NOT_CONFIGURED");
   if (definition.gate === "G7" || definition.gate === "G8") {
-    if (!execution) throw new Error("REVIEW_EXECUTION_REQUIRED");
-    const report = evaluateExecutionResult(execution, "G7", {
-      artifacts: registry.artifacts,
-      reviews: reviews.reviews,
-      approvals: (await store.readYaml(".agent-team/approvals.yaml", ApprovalListSchema)).approvals,
-    });
-    if (!report.allowed) throw new Error(report.blockers[0]);
+    if (!receiptId) throw new Error("REVIEW_EXECUTION_RECEIPT_REQUIRED");
+    const receipt = await loadExecutionReceipt(root, receiptId);
+    if (receipt.agent_id !== reviewerId || receipt.agent_id === definition.owner) {
+      throw new Error("REVIEWER_EXECUTION_IDENTITY_MISMATCH");
+    }
+    if (receipt.phase !== phase) throw new Error("REVIEWER_EXECUTION_PHASE_MISMATCH");
+    if (receipt.review_verdict !== verdict) throw new Error("REVIEWER_EXECUTION_VERDICT_MISMATCH");
+    const report = evaluateExecutionResult(
+      receipt.result,
+      definition.gate,
+      await executionEvidenceContext(root, store),
+    );
+    if (!report.allowed) {
+      throw new Error(definition.gate === "G8"
+        ? report.blockers.find((blocker) => blocker === "HUMAN_AUTHORIZATION_REQUIRED") ?? report.blockers[0]
+        : report.blockers[0]);
+    }
   }
   const existing = reviews.reviews.find((review) => review.id === evidenceId);
   if (state.completed_operations.includes(verdictId)) {
@@ -953,7 +994,7 @@ export async function approve(
   gate: GateId,
   by: string,
   operationId: string,
-  execution?: AgentExecutionResult,
+  receiptId?: string,
 ): Promise<WorkflowState> {
   requireOperationId(operationId);
   const approver = by.trim();
@@ -1022,11 +1063,14 @@ export async function approve(
   const nextApprovals = ApprovalListSchema.parse({
     approvals: existing ? approvals.approvals : [...approvals.approvals, approval],
   });
-  const nextState = approveGate(state, workflow, approval, execution, {
-    artifacts: registry.artifacts,
-    reviews: reviews.reviews,
-    approvals: approvals.approvals,
-  });
+  const receipt = receiptId ? await loadExecutionReceipt(root, receiptId) : undefined;
+  const nextState = approveGate(
+    state,
+    workflow,
+    approval,
+    receipt?.result,
+    await executionEvidenceContext(root, store),
+  );
   const { project } = await projectConfig(store);
   await store.transaction(scopedOperation, [
     { path: ".agent-team/approvals.yaml", content: stringify(nextApprovals) },
@@ -1249,37 +1293,107 @@ export async function getStatus(root: string) {
   };
 }
 
-export async function gateReadinessReport(root: string, gate: GateId, execution?: AgentExecutionResult) {
+export async function gateReadinessReport(root: string, gate: GateId, receiptId?: string) {
   const store = ProjectStore.open(root);
-  const [state, workflow, context] = await Promise.all([
+  const [state, workflow, context, receipt] = await Promise.all([
     store.readWorkflowState(),
     configuredWorkflow(store),
-    executionEvidenceContext(store),
+    executionEvidenceContext(root, store),
+    receiptId ? loadExecutionReceipt(root, receiptId) : undefined,
   ]);
-  return gateReadiness(state, workflow, gate, execution, context);
+  return gateReadiness(state, workflow, gate, receipt?.result, context);
 }
 
-export async function loadExecutionResult(root: string, reference: string): Promise<AgentExecutionResult> {
-  if (!reference || isAbsolute(reference) || reference.includes("\\")
-    || reference.split("/").some((segment) => segment === "" || segment === "." || segment === "..")) {
-    throw new Error("PATH_OUTSIDE_PROJECT");
+function attestationDigest(receipt: Pick<ExecutionReceipt,
+  "adapter_id" | "agent_id" | "phase" | "review_verdict" | "result">): `sha256:${string}` {
+  const binding = {
+    adapter_id: receipt.adapter_id,
+    ...(receipt.agent_id ? { agent_id: receipt.agent_id } : {}),
+    ...(receipt.phase ? { phase: receipt.phase } : {}),
+    ...(receipt.review_verdict ? { review_verdict: receipt.review_verdict } : {}),
+    result: receipt.result,
+  };
+  return `sha256:${createHash("sha256").update(JSON.stringify(binding)).digest("hex")}`;
+}
+
+export async function recordExecutionReceipt(
+  root: string,
+  adapter: ManualCodexAdapter,
+  result: AgentExecutionResult,
+  operationId: string,
+): Promise<ExecutionReceipt> {
+  requireOperationId(operationId);
+  if (!(adapter instanceof ManualCodexAdapter)) throw new Error("EXECUTION_ADAPTER_REQUIRED");
+  const attested = adapter.createExecutionReceipt(result);
+  const store = ProjectStore.open(root);
+  return store.withLock(".agent-team/lifecycle.lock", async () => {
+    const current = await executionReceipts(store);
+    const byOperation = current.receipts.find((receipt) => receipt.operation_id === operationId);
+    const byExecution = current.receipts.find((receipt) => receipt.id === result.execution_id);
+    const existing = byOperation ?? byExecution;
+    if (existing) {
+      if (existing.operation_id !== operationId
+        || existing.id !== result.execution_id
+        || existing.attestation_digest !== attested.attestation_digest) {
+        throw new Error("OPERATION_ID_CONFLICT");
+      }
+      await loadExecutionReceipt(root, existing.id);
+      return existing;
+    }
+    const auditId = operationKey("execution-receipt", result.execution_id, operationId);
+    const receipt = ExecutionReceiptSchema.parse({
+      id: result.execution_id,
+      operation_id: operationId,
+      ...attested,
+      recorded_at: new Date().toISOString(),
+      audit_id: auditId,
+    });
+    const next = ExecutionReceiptListSchema.parse({ receipts: [...current.receipts, receipt] });
+    const { project } = await projectConfig(store);
+    await store.transaction(auditId, [
+      { path: ".agent-team/execution-receipts.yaml", content: stringify(next) },
+    ], makeAuditEvent(auditId, "execution-receipt", receipt.id, project.profile, {
+      actor: receipt.agent_id
+        ? { type: "agent", identifier: receipt.agent_id }
+        : { type: "system", identifier: "codex-runtime" },
+      authorizationSource: "runtime-adapter",
+      adapterId: receipt.adapter_id,
+      executionReceiptId: receipt.id,
+      executionReceiptDigest: receipt.attestation_digest,
+    }));
+    return receipt;
+  });
+}
+
+export async function loadExecutionReceipt(root: string, reference: string): Promise<ExecutionReceipt> {
+  if (!reference) throw new Error("EXECUTION_RECEIPT_NOT_FOUND");
+  const receipt = (await executionReceipts(ProjectStore.open(root))).receipts
+    .find(({ id }) => id === reference);
+  if (!receipt) throw new Error("EXECUTION_RECEIPT_NOT_FOUND");
+  if (attestationDigest(receipt) !== receipt.attestation_digest) {
+    throw new Error("EXECUTION_RECEIPT_DIGEST_MISMATCH");
   }
-  const projectRoot = await realpath(root);
-  const target = resolve(projectRoot, reference);
-  if (!inside(projectRoot, target)) throw new Error("PATH_OUTSIDE_PROJECT");
-  await execFileAsync("git", ["ls-files", "--error-unmatch", "--", reference], { cwd: projectRoot })
-    .catch(() => { throw new Error("EXECUTION_EVIDENCE_NOT_TRACKED"); });
-  const actual = await realpath(target);
-  if (!inside(projectRoot, actual)) throw new Error("PATH_OUTSIDE_PROJECT");
-  let value: unknown;
+  const auditPath = join(resolve(root), ".agent-team/audit/events.jsonl");
+  let audit: AuditEvent | undefined;
   try {
-    value = parse(await readFile(actual, "utf8"));
-  } catch {
-    throw new Error("EXECUTION_RESULT_INVALID");
+    const projectRoot = await realpath(root);
+    if (!inside(projectRoot, await realpath(auditPath))) throw new Error("PATH_OUTSIDE_PROJECT");
+    audit = (await readFile(auditPath, "utf8")).split(/\r?\n/).filter(Boolean)
+      .map((line) => AuditEventSchema.parse(JSON.parse(line)))
+      .find(({ id }) => id === receipt.audit_id);
+  } catch (error) {
+    if (error instanceof Error && error.message === "PATH_OUTSIDE_PROJECT") throw error;
+    throw new Error("EXECUTION_RECEIPT_AUDIT_MISSING");
   }
-  const result = AgentExecutionResultSchema.safeParse(value);
-  if (!result.success) throw new Error("EXECUTION_RESULT_INVALID");
-  return result.data;
+  if (audit?.action !== "execution-receipt"
+    || audit.target !== receipt.id
+    || audit.adapter_id !== receipt.adapter_id
+    || audit.execution_receipt_id !== receipt.id
+    || audit.execution_receipt_digest !== receipt.attestation_digest
+    || audit.result !== "success") {
+    throw new Error("EXECUTION_RECEIPT_AUDIT_MISMATCH");
+  }
+  return receipt;
 }
 
 export async function secretsScan(root: string) {

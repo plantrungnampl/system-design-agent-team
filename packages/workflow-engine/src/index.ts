@@ -166,29 +166,70 @@ export function rejectGate(
   });
 }
 
-function approvedGate(reference: GateApprovalReference | undefined, context: ExecutionEvidenceContext): boolean {
+function approvedGate(
+  reference: GateApprovalReference | undefined,
+  context: ExecutionEvidenceContext,
+  policy: ExecutionPolicyInput,
+): boolean {
   if (!reference) return false;
   return context.approvals.some((approval) => approval.id === reference.approval_id
     && approval.gate === reference.gate
     && (approval.decision === "approved" || approval.decision === "approved_with_conditions")
-    && approval.approved_by.type === "human");
+    && approval.approved_by.type === "human"
+    && approval.execution_authorization?.execution_id === policy.execution_id
+    && approval.execution_authorization.dispatch_digest === policy.dispatch_digest
+    && approval.execution_authorization.permission_profile === policy.permission_profile
+    && approval.execution_authorization.command_class === policy.command_class
+    && approval.execution_authorization.destructive === policy.destructive
+    && JSON.stringify(approval.execution_authorization.authorized_paths)
+      === JSON.stringify(policy.authorized_paths));
+}
+
+type EvidenceRole = "qa" | "security" | "data" | "backup" | "dry_run" | "rollback";
+
+function phaseMatchesRole(role: EvidenceRole, phase: WorkflowDefinition["phases"][number]): boolean {
+  const purpose = `${phase.id} ${phase.artifact.path} ${phase.artifact.title}`.toLowerCase();
+  switch (role) {
+    case "qa": return phase.owner === "qa-lead"
+      && phase.artifact.path.startsWith("testing/")
+      && /test|qa|verification|validation|regression/.test(purpose);
+    case "security": return phase.owner === "security-reviewer"
+      && (phase.artifact.path.startsWith("security/") || phase.artifact.path.startsWith("release/"))
+      && /security|release-readiness|release readiness/.test(purpose);
+    case "data": return phase.artifact.path.startsWith("data/")
+      && (phase.owner === "data-reviewer" || phase.reviewer === "data-reviewer")
+      && /data|reconciliation/.test(purpose);
+    case "backup": return /backup/.test(purpose);
+    case "dry_run": return /dry[- ]?run|rehearsal|parallel-validation|parallel validation/.test(purpose);
+    case "rollback": return /rollback|backout/.test(purpose);
+  }
 }
 
 function currentArtifact(
   reference: ArtifactEvidenceReference | undefined,
+  role: EvidenceRole,
   context: ExecutionEvidenceContext,
 ): boolean {
   if (!reference?.approval_id) return false;
   const artifact = context.artifacts.find(({ id }) => id === reference.artifact_id);
+  const phase = context.workflow.phases.find(({ artifact: configured }) => configured.id === reference.artifact_id);
   const review = context.reviews.find(({ id }) => id === reference.review_id);
   const approval = context.approvals.find(({ id }) => id === reference.approval_id);
   return artifact?.version === reference.version
     && artifact.status === reference.status
+    && context.verified_checksums[artifact.id] === artifact.checksum
+    && phase?.artifact.path === artifact.path
+    && phase.owner === artifact.owner
+    && phase.reviewer === artifact.reviewer
+    && phase.gate === artifact.required_gate
+    && phaseMatchesRole(role, phase)
     && review?.verdict === "approved"
+    && review.phase === phase.id
+    && review.reviewer === phase.reviewer
     && review.artifact_versions[reference.artifact_id] === reference.version
     && (approval?.decision === "approved" || approval?.decision === "approved_with_conditions")
     && approval.approved_by.type === "human"
-    && approval.gate === artifact.required_gate
+    && approval.gate === phase.gate
     && approval.artifact_versions[reference.artifact_id] === reference.version;
 }
 
@@ -208,27 +249,27 @@ export function evaluateExecutionPolicy(
   const gate = (id: GateId) => policy.evidence.gate_approvals.find((reference) => reference.gate === id);
 
   add(policy.permission_profile === "code_write"
-    && !approvedGate(gate("G6"), context), "G6_APPROVAL_REQUIRED");
+    && !approvedGate(gate("G6"), context, policy), "G6_APPROVAL_REQUIRED");
   if (policy.target_gate === "G7" || policy.target_gate === "G8" || production) {
-    add(!currentArtifact(policy.evidence.qa, context), "QA_EVIDENCE_NOT_CURRENT");
-    add(!currentArtifact(policy.evidence.security, context), "SECURITY_EVIDENCE_NOT_CURRENT");
-    add(!currentArtifact(policy.evidence.data, context), "DATA_EVIDENCE_NOT_CURRENT");
+    add(!currentArtifact(policy.evidence.qa, "qa", context), "QA_EVIDENCE_NOT_CURRENT");
+    add(!currentArtifact(policy.evidence.security, "security", context), "SECURITY_EVIDENCE_NOT_CURRENT");
+    add(!currentArtifact(policy.evidence.data, "data", context), "DATA_EVIDENCE_NOT_CURRENT");
   }
   if (production) {
-    add(!approvedGate(gate("G8"), context), "G8_APPROVAL_REQUIRED");
+    add(!approvedGate(gate("G8"), context, policy), "G8_APPROVAL_REQUIRED");
   }
   if (policy.target_gate === "G8" || production) {
-    add(production ? !approvedGate(gate("G8"), context) : authorizingActor?.type !== "human",
+    add(production ? !approvedGate(gate("G8"), context, policy) : authorizingActor?.type !== "human",
       "HUMAN_AUTHORIZATION_REQUIRED");
-    add(!currentArtifact(policy.evidence.backup, context), "BACKUP_VERIFICATION_REQUIRED");
-    add(!currentArtifact(policy.evidence.rollback, context), "ROLLBACK_PLAN_REQUIRED");
+    add(!currentArtifact(policy.evidence.backup, "backup", context), "BACKUP_VERIFICATION_REQUIRED");
+    add(!currentArtifact(policy.evidence.rollback, "rollback", context), "ROLLBACK_PLAN_REQUIRED");
   }
   if (policy.destructive) {
-    add(!approvedGate(policy.evidence.destructive_confirmation, context), "DESTRUCTIVE_CONFIRMATION_REQUIRED");
-    add(!approvedGate(policy.evidence.scope_confirmation, context), "SCOPE_CONFIRMATION_REQUIRED");
-    add(!currentArtifact(policy.evidence.backup, context), "BACKUP_VERIFICATION_REQUIRED");
-    add(!currentArtifact(policy.evidence.dry_run, context), "DRY_RUN_REQUIRED");
-    add(!currentArtifact(policy.evidence.rollback, context), "ROLLBACK_PLAN_REQUIRED");
+    add(!approvedGate(policy.evidence.destructive_confirmation, context, policy), "DESTRUCTIVE_CONFIRMATION_REQUIRED");
+    add(!approvedGate(policy.evidence.scope_confirmation, context, policy), "SCOPE_CONFIRMATION_REQUIRED");
+    add(!currentArtifact(policy.evidence.backup, "backup", context), "BACKUP_VERIFICATION_REQUIRED");
+    add(!currentArtifact(policy.evidence.dry_run, "dry_run", context), "DRY_RUN_REQUIRED");
+    add(!currentArtifact(policy.evidence.rollback, "rollback", context), "ROLLBACK_PLAN_REQUIRED");
   }
   return { allowed: blockers.length === 0, blockers };
 }
@@ -246,6 +287,8 @@ export function evaluateExecutionResult(
     return { allowed: false, blockers: ["CHECKPOINT_NOT_COMPLETED"] };
   }
   return evaluateExecutionPolicy({
+    execution_id: parsed.data.execution_id,
+    dispatch_digest: parsed.data.dispatch_digest,
     permission_profile: parsed.data.permission_profile,
     authorized_paths: parsed.data.authorized_paths,
     command_class: parsed.data.command_class,

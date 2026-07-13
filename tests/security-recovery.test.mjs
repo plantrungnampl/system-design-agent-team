@@ -21,7 +21,8 @@ import {
   initProject,
   invokePlugin,
   issueList,
-  loadExecutionResult,
+  loadExecutionReceipt,
+  recordExecutionReceipt,
   rejectGate,
   repair,
   reviewPhase,
@@ -30,6 +31,7 @@ import {
   startPhase,
   validatePhase,
 } from "@system-design-team/cli";
+import { ManualCodexAdapter } from "@system-design-team/codex-adapter";
 import { ProjectStore } from "@system-design-team/project-store";
 import { parse } from "yaml";
 
@@ -87,6 +89,27 @@ function reviewerResult(overrides = {}) {
   };
 }
 
+async function collectedReviewerResult(adapter, dispatchOverrides = {}, resultOverrides = {}) {
+  const dispatch = {
+    execution_id: "EXEC-REVIEW",
+    agent_id: "code-reviewer",
+    phase: "implementation",
+    review_verdict: "approved",
+    authorized_scope: { read: [".agent-team/**"], write: [], execute: [] },
+    required_inputs: [],
+    permission_profile: "read_only_assessment",
+    command_class: "safe_read",
+    ...dispatchOverrides,
+  };
+  const prepared = await adapter.prepareExecution(dispatch);
+  return adapter.collectResult(await adapter.execute(prepared), reviewerResult({
+    execution_id: dispatch.execution_id,
+    dispatch_digest: prepared.digest,
+    authorized_paths: dispatch.authorized_scope,
+    ...resultOverrides,
+  }));
+}
+
 test("required CLI safety routes expose real project state", async (t) => {
   const root = await temporaryDirectory(t, "system-design-team-safety-routes-");
   await execFileAsync("git", ["init", "--quiet"], { cwd: root });
@@ -111,7 +134,7 @@ test("required CLI safety routes expose real project state", async (t) => {
   for (const command of ["reject <gate>", "gate readiness <gate>", "secrets scan", "diagnostics", "issue list"]) {
     assert(stdout.includes(command));
   }
-  assert(stdout.includes("--execution-evidence <path>"));
+  assert(stdout.includes("--execution-receipt <id>"));
 });
 
 test("secrets scan reports tracked credential material", async (t) => {
@@ -137,22 +160,66 @@ test("secrets scan reports tracked credential material", async (t) => {
   assert(!JSON.stringify(result).includes("not-a-real-secret-value"));
 });
 
-test("CLI loads only contained Git-tracked structured execution evidence", async (t) => {
+test("hand-written tracked execution result is not a trusted receipt", async (t) => {
   const root = await temporaryDirectory(t, "system-design-team-execution-file-");
   await execFileAsync("git", ["init", "--quiet"], { cwd: root });
+  await initProject(root, {
+    id: "leave-system",
+    name: "Leave System",
+    mode: "greenfield",
+    profile: "standard",
+  });
   await writeFile(join(root, "g7-execution.yaml"), JSON.stringify(reviewerResult()));
-  await writeFile(join(root, "invalid-execution.yaml"), "status: completed\n");
-  await execFileAsync("git", ["add", "."], { cwd: root });
+  await execFileAsync("git", ["add", "g7-execution.yaml"], { cwd: root });
 
-  assert.deepEqual(await loadExecutionResult(root, "g7-execution.yaml"), reviewerResult());
-  await assert.rejects(
-    () => loadExecutionResult(root, "invalid-execution.yaml"),
-    /EXECUTION_RESULT_INVALID/,
-  );
-  await assert.rejects(() => loadExecutionResult(root, "../outside.yaml"), /PATH_OUTSIDE_PROJECT/);
+  await assert.rejects(() => loadExecutionReceipt(root, "g7-execution.yaml"), /EXECUTION_RECEIPT_NOT_FOUND/);
 });
 
-test("gate readiness CLI accepts an execution evidence reference for G7 and G8", async (t) => {
+test("only an adapter-collected result records an audited receipt with safe replay", async (t) => {
+  const root = await temporaryDirectory(t, "system-design-team-execution-receipt-");
+  await execFileAsync("git", ["init", "--quiet"], { cwd: root });
+  await initProject(root, {
+    id: "leave-system",
+    name: "Leave System",
+    mode: "greenfield",
+    profile: "standard",
+  });
+  const adapter = new ManualCodexAdapter();
+  const collected = await collectedReviewerResult(adapter);
+
+  await assert.rejects(
+    () => recordExecutionReceipt(root, adapter, structuredClone(collected), "RECEIPT-1"),
+    /EXECUTION_RESULT_NOT_COLLECTED/,
+  );
+  await assert.rejects(
+    () => recordExecutionReceipt(root, {
+      createExecutionReceipt: (result) => adapter.createExecutionReceipt(result),
+    }, collected, "RECEIPT-WRAPPER"),
+    /EXECUTION_ADAPTER_REQUIRED/,
+  );
+  const first = await recordExecutionReceipt(root, adapter, collected, "RECEIPT-1");
+  assert.deepEqual(await recordExecutionReceipt(root, adapter, collected, "RECEIPT-1"), first);
+  assert.deepEqual(await loadExecutionReceipt(root, first.id), first);
+  const audit = await readFile(join(root, ".agent-team/audit/events.jsonl"), "utf8");
+  assert.equal(audit.split(/\r?\n/).filter((line) => line.includes(first.id)).length, 1);
+
+  const other = await collectedReviewerResult(adapter, { execution_id: "EXEC-OTHER" });
+  await assert.rejects(
+    () => recordExecutionReceipt(root, adapter, other, "RECEIPT-1"),
+    /OPERATION_ID_CONFLICT/,
+  );
+
+  const receiptPath = join(root, ".agent-team/execution-receipts.yaml");
+  const tampered = parse(await readFile(receiptPath, "utf8"));
+  tampered.receipts[0].result.command_class = "local_validation";
+  await writeFile(receiptPath, JSON.stringify(tampered));
+  await assert.rejects(
+    () => loadExecutionReceipt(root, first.id),
+    /EXECUTION_RECEIPT_DIGEST_MISMATCH/,
+  );
+});
+
+test("gate readiness CLI accepts an audited execution receipt for G7 and G8", async (t) => {
   const root = await temporaryDirectory(t, "system-design-team-gate-evidence-");
   await execFileAsync("git", ["init", "--quiet"], { cwd: root });
   await initProject(root, {
@@ -161,8 +228,9 @@ test("gate readiness CLI accepts an execution evidence reference for G7 and G8",
     mode: "greenfield",
     profile: "standard",
   });
-  await writeFile(join(root, "gates.yaml"), JSON.stringify(reviewerResult()));
-  await execFileAsync("git", ["add", "gates.yaml"], { cwd: root });
+  const adapter = new ManualCodexAdapter();
+  const collected = await collectedReviewerResult(adapter);
+  const receipt = await recordExecutionReceipt(root, adapter, collected, "GATE-RECEIPT");
   const bin = join(import.meta.dirname, "../packages/cli/dist/bin.js");
 
   for (const gate of ["G7", "G8"]) {
@@ -171,8 +239,8 @@ test("gate readiness CLI accepts an execution evidence reference for G7 and G8",
       "gate",
       "readiness",
       gate,
-      "--execution-evidence",
-      "gates.yaml",
+      "--execution-receipt",
+      receipt.id,
     ], { cwd: root });
     const result = JSON.parse(stdout);
     assert.equal(result.gate, gate);
@@ -181,7 +249,7 @@ test("gate readiness CLI accepts an execution evidence reference for G7 and G8",
   }
 });
 
-test("G7 review requires a completed verified reviewer execution result", async (t) => {
+test("G7 review binds its receipt to reviewer identity, phase, and verdict", async (t) => {
   const root = await temporaryDirectory(t, "system-design-team-review-execution-");
   await execFileAsync("git", ["init", "--quiet"], { cwd: root });
   await initProject(root, {
@@ -220,7 +288,37 @@ test("G7 review requires a completed verified reviewer execution result", async 
     "approved",
     "G7-REVIEW",
     pluginAdapter,
-  ), /REVIEW_EXECUTION_REQUIRED/);
+  ), /REVIEW_EXECUTION_RECEIPT_REQUIRED/);
+
+  const adapter = new ManualCodexAdapter();
+  for (const [dispatchOverride, expected] of [
+    [{ agent_id: "wrong-reviewer" }, /REVIEWER_EXECUTION_IDENTITY_MISMATCH/],
+    [{ phase: "verification" }, /REVIEWER_EXECUTION_PHASE_MISMATCH/],
+    [{ review_verdict: "revision_required" }, /REVIEWER_EXECUTION_VERDICT_MISMATCH/],
+  ]) {
+    const collected = await collectedReviewerResult(adapter, {
+      execution_id: `EXEC-${Object.keys(dispatchOverride)[0]}`,
+      ...dispatchOverride,
+    });
+    const receipt = await recordExecutionReceipt(
+      root,
+      adapter,
+      collected,
+      `RECEIPT-${Object.keys(dispatchOverride)[0]}`,
+    );
+    await assert.rejects(() => reviewPhase(
+      root,
+      "implementation",
+      "code-reviewer",
+      "approved",
+      "G7-REVIEW",
+      pluginAdapter,
+      receipt.id,
+    ), expected);
+  }
+
+  const collected = await collectedReviewerResult(adapter, { execution_id: "EXEC-MATCHING" });
+  const receipt = await recordExecutionReceipt(root, adapter, collected, "RECEIPT-MATCHING");
   await assert.rejects(() => reviewPhase(
     root,
     "implementation",
@@ -228,11 +326,58 @@ test("G7 review requires a completed verified reviewer execution result", async 
     "approved",
     "G7-REVIEW",
     pluginAdapter,
-    reviewerResult({ checkpoints: [{
-      ...reviewerResult().checkpoints[0],
-      status: "failed",
-    }] }),
-  ), /CHECKPOINT_NOT_COMPLETED/);
+    receipt.id,
+  ), /QA_EVIDENCE_NOT_CURRENT/);
+});
+
+test("G8 review evaluates G8 authorization instead of G7", async (t) => {
+  const root = await temporaryDirectory(t, "system-design-team-g8-review-");
+  await execFileAsync("git", ["init", "--quiet"], { cwd: root });
+  await initProject(root, {
+    id: "leave-system",
+    name: "Leave System",
+    mode: "greenfield",
+    profile: "standard",
+  });
+  const store = ProjectStore.open(root);
+  const state = await store.readWorkflowState();
+  state.phases.deployment.status = "artifact_validation";
+  state.current_phase = "deployment";
+  await store.writeYamlAtomic(".agent-team/workflow-state.yaml", state);
+  const registry = parse(await readFile(join(root, ".agent-team/artifact-registry.yaml"), "utf8"));
+  const artifact = registry.artifacts.find(({ id }) => id === "DEPLOYMENT-PLAN");
+  artifact.status = "in_review";
+  const content = [
+    "---",
+    "artifact_id: DEPLOYMENT-PLAN",
+    "version: 1",
+    "status: in_review",
+    "owner: devops-lead",
+    "reviewer: operations-reviewer",
+    "---",
+    "# Deployment Plan",
+    "Current evidence.",
+  ].join("\n");
+  artifact.checksum = `sha256:${createHash("sha256").update(content).digest("hex")}`;
+  await store.writeYamlAtomic(".agent-team/artifact-registry.yaml", registry);
+  await store.writeTextAtomic(`.agent-team/${artifact.path}`, content);
+  const adapter = new ManualCodexAdapter();
+  const collected = await collectedReviewerResult(adapter, {
+    execution_id: "EXEC-G8-REVIEW",
+    agent_id: "operations-reviewer",
+    phase: "deployment",
+  });
+  const receipt = await recordExecutionReceipt(root, adapter, collected, "RECEIPT-G8-REVIEW");
+
+  await assert.rejects(() => reviewPhase(
+    root,
+    "deployment",
+    "operations-reviewer",
+    "approved",
+    "G8-REVIEW",
+    pluginAdapter,
+    receipt.id,
+  ), /HUMAN_AUTHORIZATION_REQUIRED/);
 });
 
 test("reject records a human decision and append-only audit event", async (t) => {

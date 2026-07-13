@@ -215,25 +215,57 @@ test("reports gate blockers in deterministic phase order", () => {
   });
 });
 
-const evidenceArtifacts = ["QA", "SECURITY", "DATA", "BACKUP", "DRY-RUN", "ROLLBACK"].map((id) => ({
+const evidenceRoles = {
+  QA: ["verification", "qa-lead", "tester", "testing/qa.md", "QA Evidence", "G7"],
+  SECURITY: ["security-review", "security-reviewer", "architecture-reviewer", "security/verdict.md", "Security Verdict", "G7"],
+  DATA: ["data-mapping", "system-analyst", "data-reviewer", "data/mapping.md", "Data Reconciliation", "G7"],
+  BACKUP: ["backup-verification", "devops-lead", "operations-reviewer", "operations/backup-verification.md", "Backup Verification", "G8"],
+  "DRY-RUN": ["deployment-rehearsal", "devops-lead", "operations-reviewer", "release/deployment-rehearsal.md", "Deployment Dry Run", "G8"],
+  ROLLBACK: ["rollback-planning", "devops-lead", "operations-reviewer", "release/rollback-plan.md", "Rollback Plan", "G8"],
+};
+const evidenceArtifacts = Object.entries(evidenceRoles).map(([id, [, owner, reviewer, path, , gate]]) => ({
   id,
-  path: `${id.toLowerCase()}.md`,
+  path,
   type: "document",
   version: 1,
   status: "approved",
-  owner: "qa-lead",
-  reviewer: "tester",
+  owner,
+  reviewer,
   dependencies: [],
   consumers: [],
-  required_gate: "G7",
+  required_gate: gate,
   checksum: `sha256:${"a".repeat(64)}`,
 }));
+const evidenceWorkflow = {
+  id: "evidence-workflow",
+  version: "1.0.0",
+  mode: "greenfield",
+  phases: Object.entries(evidenceRoles).map(([id, [phase, owner, reviewer, path, title, gate]]) => ({
+    id: phase,
+    owner,
+    reviewer,
+    gate,
+    depends_on: [],
+    required_plugins: [],
+    artifact: { id, path, title },
+  })),
+};
+const executionAuthorization = {
+  execution_id: "EXEC-POLICY",
+  dispatch_digest: "b".repeat(64),
+  permission_profile: "code_write",
+  authorized_paths: { read: ["src/**"], write: ["src/**"], execute: ["npm test"] },
+  command_class: "mutating_local",
+  destructive: false,
+};
 const evidenceContext = {
   artifacts: evidenceArtifacts,
-  reviews: evidenceArtifacts.map(({ id }) => ({
+  workflow: evidenceWorkflow,
+  verified_checksums: Object.fromEntries(evidenceArtifacts.map(({ id, checksum }) => [id, checksum])),
+  reviews: evidenceArtifacts.map(({ id, reviewer }) => ({
     id: `REV-${id}`,
-    phase: "release-readiness",
-    reviewer: "tester",
+    phase: evidenceRoles[id][0],
+    reviewer,
     verdict: "approved",
     artifact_versions: { [id]: 1 },
     timestamp: "2026-07-13T00:00:00Z",
@@ -244,6 +276,7 @@ const evidenceContext = {
     decision: "approved",
     approved_by: { type: "human", identifier: "project-owner" },
     artifact_versions: Object.fromEntries(evidenceArtifacts.map(({ id }) => [id, 1])),
+    execution_authorization: executionAuthorization,
     timestamp: "2026-07-13T00:00:00Z",
   })),
 };
@@ -252,16 +285,32 @@ const artifactReference = (id) => ({
   version: 1,
   status: "approved",
   review_id: `REV-${id}`,
-  approval_id: "APR-G7",
+  approval_id: ["BACKUP", "DRY-RUN", "ROLLBACK"].includes(id) ? "APR-G8" : "APR-G7",
 });
 const gateReference = (gate) => ({ gate, approval_id: `APR-${gate}` });
 const policyInput = {
+  execution_id: "EXEC-POLICY",
+  dispatch_digest: "b".repeat(64),
   permission_profile: "code_write",
   authorized_paths: { read: ["src/**"], write: ["src/**"], execute: ["npm test"] },
   command_class: "mutating_local",
   destructive: false,
   evidence: { gate_approvals: [] },
 };
+const contextAuthorizedFor = (input) => ({
+  ...evidenceContext,
+  approvals: evidenceContext.approvals.map((approval) => ({
+    ...approval,
+    execution_authorization: {
+      execution_id: input.execution_id,
+      dispatch_digest: input.dispatch_digest,
+      permission_profile: input.permission_profile,
+      authorized_paths: input.authorized_paths,
+      command_class: input.command_class,
+      destructive: input.destructive,
+    },
+  })),
+});
 
 test("G6 blocks code-write execution until authoritatively approved", () => {
   assert.deepEqual(evaluateExecutionPolicy(policyInput, evidenceContext).blockers, ["G6_APPROVAL_REQUIRED"]);
@@ -312,7 +361,7 @@ test("G8 approval readiness requires human authorization, backup, and rollback",
 });
 
 test("destructive execution requires explicit confirmation", () => {
-  const report = evaluateExecutionPolicy({
+  const input = {
     ...policyInput,
     destructive: true,
     evidence: {
@@ -322,13 +371,14 @@ test("destructive execution requires explicit confirmation", () => {
       dry_run: artifactReference("DRY-RUN"),
       rollback: artifactReference("ROLLBACK"),
     },
-  }, evidenceContext);
+  };
+  const report = evaluateExecutionPolicy(input, contextAuthorizedFor(input));
 
   assert.deepEqual(report.blockers, ["DESTRUCTIVE_CONFIRMATION_REQUIRED"]);
 });
 
 test("destructive execution requires verified backup", () => {
-  const report = evaluateExecutionPolicy({
+  const input = {
     ...policyInput,
     destructive: true,
     evidence: {
@@ -338,13 +388,14 @@ test("destructive execution requires verified backup", () => {
       dry_run: artifactReference("DRY-RUN"),
       rollback: artifactReference("ROLLBACK"),
     },
-  }, evidenceContext);
+  };
+  const report = evaluateExecutionPolicy(input, contextAuthorizedFor(input));
 
   assert.deepEqual(report.blockers, ["BACKUP_VERIFICATION_REQUIRED"]);
 });
 
 test("production execution requires a current rollback plan", () => {
-  const report = evaluateExecutionPolicy({
+  const input = {
     ...policyInput,
     permission_profile: "production_execution",
     command_class: "production_impact",
@@ -355,7 +406,8 @@ test("production execution requires a current rollback plan", () => {
       data: artifactReference("DATA"),
       backup: artifactReference("BACKUP"),
     },
-  }, evidenceContext);
+  };
+  const report = evaluateExecutionPolicy(input, contextAuthorizedFor(input));
 
   assert.deepEqual(report.blockers, ["ROLLBACK_PLAN_REQUIRED"]);
 });
@@ -475,4 +527,127 @@ test("G8 approval rejects a failed execution checkpoint", () => {
     artifact_versions: { DEPLOYMENT: 1 },
     timestamp: "2026-07-13T00:00:00Z",
   }, execution, evidenceContext), /CHECKPOINT_NOT_COMPLETED/);
+});
+
+test("one project charter cannot satisfy execution evidence roles", () => {
+  const charter = {
+    ...evidenceArtifacts[0],
+    id: "PROJECT-CHARTER",
+    path: "context/project-charter.md",
+    owner: "lead-orchestrator",
+    reviewer: "documentation-reviewer",
+    required_gate: "G0",
+  };
+  const context = {
+    artifacts: [charter],
+    workflow: {
+      id: "charter-only",
+      version: "1.0.0",
+      mode: "greenfield",
+      phases: [{
+        id: "intake",
+        owner: charter.owner,
+        reviewer: charter.reviewer,
+        gate: "G0",
+        depends_on: [],
+        required_plugins: [],
+        artifact: { id: charter.id, path: charter.path, title: "Project Charter" },
+      }],
+    },
+    verified_checksums: { "PROJECT-CHARTER": charter.checksum },
+    reviews: [{ ...evidenceContext.reviews[0], artifact_versions: { "PROJECT-CHARTER": 1 } }],
+    approvals: [{
+      ...evidenceContext.approvals[0],
+      gate: "G0",
+      artifact_versions: { "PROJECT-CHARTER": 1 },
+    }],
+  };
+  const reference = {
+    artifact_id: "PROJECT-CHARTER",
+    version: 1,
+    status: "approved",
+    review_id: context.reviews[0].id,
+    approval_id: context.approvals[0].id,
+  };
+  const report = evaluateExecutionPolicy({
+    ...policyInput,
+    permission_profile: "test_execution",
+    command_class: "local_validation",
+    target_gate: "G8",
+    evidence: {
+      gate_approvals: [],
+      qa: reference,
+      security: reference,
+      data: reference,
+      backup: reference,
+      rollback: reference,
+    },
+  }, context, { type: "human", identifier: "owner" });
+
+  for (const blocker of [
+    "QA_EVIDENCE_NOT_CURRENT",
+    "SECURITY_EVIDENCE_NOT_CURRENT",
+    "DATA_EVIDENCE_NOT_CURRENT",
+    "BACKUP_VERIFICATION_REQUIRED",
+    "ROLLBACK_PLAN_REQUIRED",
+  ]) assert(report.blockers.includes(blocker));
+});
+
+test("checksum drift invalidates otherwise current evidence", () => {
+  const report = evaluateExecutionPolicy({
+    ...policyInput,
+    permission_profile: "test_execution",
+    command_class: "local_validation",
+    target_gate: "G7",
+    evidence: {
+      gate_approvals: [],
+      qa: artifactReference("QA"),
+      security: artifactReference("SECURITY"),
+      data: artifactReference("DATA"),
+    },
+  }, {
+    ...evidenceContext,
+    verified_checksums: { ...evidenceContext.verified_checksums, QA: `sha256:${"c".repeat(64)}` },
+  });
+
+  assert(report.blockers.includes("QA_EVIDENCE_NOT_CURRENT"));
+});
+
+test("execution approval must bind digest, paths, action, and execution id", () => {
+  const mismatches = [
+    { execution_id: "OTHER" },
+    { dispatch_digest: "c".repeat(64) },
+    { authorized_paths: { ...policyInput.authorized_paths, write: ["other/**"] } },
+    { command_class: "safe_read" },
+  ];
+  for (const mismatch of mismatches) {
+    const context = {
+      ...evidenceContext,
+      approvals: evidenceContext.approvals.map((approval) => approval.id === "APR-G6"
+        ? { ...approval, execution_authorization: { ...executionAuthorization, ...mismatch } }
+        : approval),
+    };
+    assert(evaluateExecutionPolicy({
+      ...policyInput,
+      evidence: { gate_approvals: [gateReference("G6")] },
+    }, context).blockers.includes("G6_APPROVAL_REQUIRED"));
+  }
+});
+
+test("unrelated approval cannot authorize destructive confirmation or scope", () => {
+  const report = evaluateExecutionPolicy({
+    ...policyInput,
+    destructive: true,
+    evidence: {
+      gate_approvals: [gateReference("G6")],
+      destructive_confirmation: gateReference("G6"),
+      scope_confirmation: gateReference("G6"),
+      backup: artifactReference("BACKUP"),
+      dry_run: artifactReference("DRY-RUN"),
+      rollback: artifactReference("ROLLBACK"),
+    },
+  }, evidenceContext);
+
+  assert(report.blockers.includes("DESTRUCTIVE_CONFIRMATION_REQUIRED"));
+  assert(report.blockers.includes("SCOPE_CONFIRMATION_REQUIRED"));
 });

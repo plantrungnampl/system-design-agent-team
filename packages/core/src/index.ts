@@ -223,6 +223,12 @@ export const CapabilityReportSchema = z.object({
   blockers: z.array(z.string().min(1)),
 });
 
+export const ExecutionAuthorizationSchema = CapabilityRequirementsSchema.extend({
+  execution_id: z.string().min(1),
+  dispatch_digest: z.string().regex(/^[a-f0-9]{64}$/),
+  destructive: z.boolean(),
+});
+
 export const GateApprovalReferenceSchema = z.object({
   gate: GateIdSchema,
   approval_id: z.string().min(1),
@@ -249,6 +255,8 @@ export const ExecutionEvidenceSchema = z.object({
 });
 
 export const ExecutionPolicyInputSchema = CapabilityRequirementsSchema.extend({
+  execution_id: z.string().min(1),
+  dispatch_digest: z.string().regex(/^[a-f0-9]{64}$/),
   target_gate: GateIdSchema.optional(),
   destructive: z.boolean(),
   evidence: ExecutionEvidenceSchema,
@@ -273,6 +281,21 @@ export const AgentExecutionResultSchema = z.object({
   evidence: ExecutionEvidenceSchema,
   output: z.unknown().optional(),
 });
+
+export const ExecutionReceiptSchema = z.object({
+  id: z.string().min(1),
+  operation_id: z.string().min(1),
+  adapter_id: z.string().min(1),
+  agent_id: z.string().min(1).optional(),
+  phase: z.string().min(1).optional(),
+  review_verdict: z.enum(["approved", "revision_required"]).optional(),
+  result: AgentExecutionResultSchema,
+  attestation_digest: Sha256DigestSchema,
+  recorded_at: z.string().datetime(),
+  audit_id: z.string().min(1),
+});
+
+export const ExecutionReceiptListSchema = z.object({ receipts: z.array(ExecutionReceiptSchema) });
 
 export const PluginInvocationStatusSchema = z.enum(["success", "failure"]);
 
@@ -332,6 +355,7 @@ export const ApprovalRecordSchema = z.object({
     identifier: z.string().min(1),
   }),
   artifact_versions: z.record(z.string().min(1), z.number().int().positive()),
+  execution_authorization: ExecutionAuthorizationSchema.optional(),
   timestamp: z.string().min(1),
 });
 
@@ -442,6 +466,8 @@ export const AuditEventSchema = z.object({
   adapter_id: z.string().min(1).optional(),
   permission_profile: z.string().min(1),
   artifact_versions: z.record(z.string().min(1), z.number().int().positive()),
+  execution_receipt_id: z.string().min(1).optional(),
+  execution_receipt_digest: Sha256DigestSchema.optional(),
   result: z.enum(["success", "failure"]),
   timestamp: z.string().datetime(),
 }).superRefine((event, context) => {
@@ -458,6 +484,8 @@ export const ExecutionEvidenceContextSchema = z.object({
   artifacts: z.array(ArtifactRecordSchema),
   reviews: z.array(ReviewRecordSchema),
   approvals: z.array(ApprovalRecordSchema),
+  workflow: WorkflowDefinitionSchema,
+  verified_checksums: z.record(z.string().min(1), Sha256DigestSchema),
 });
 
 export type ProjectMode = z.infer<typeof ProjectModeSchema>;
@@ -491,6 +519,7 @@ export type CommandClass = z.infer<typeof CommandClassSchema>;
 export type AuthorizedPaths = z.infer<typeof AuthorizedPathsSchema>;
 export type CapabilityRequirements = z.infer<typeof CapabilityRequirementsSchema>;
 export type CapabilityReport = z.infer<typeof CapabilityReportSchema>;
+export type ExecutionAuthorization = z.infer<typeof ExecutionAuthorizationSchema>;
 export type ExecutionEvidence = z.infer<typeof ExecutionEvidenceSchema>;
 export type GateApprovalReference = z.infer<typeof GateApprovalReferenceSchema>;
 export type ArtifactEvidenceReference = z.infer<typeof ArtifactEvidenceReferenceSchema>;
@@ -498,3 +527,5 @@ export type ExecutionEvidenceContext = z.infer<typeof ExecutionEvidenceContextSc
 export type ExecutionPolicyInput = z.infer<typeof ExecutionPolicyInputSchema>;
 export type ExecutionCheckpoint = z.infer<typeof ExecutionCheckpointSchema>;
 export type AgentExecutionResult = z.infer<typeof AgentExecutionResultSchema>;
+export type ExecutionReceipt = z.infer<typeof ExecutionReceiptSchema>;
+export type ExecutionReceiptList = z.infer<typeof ExecutionReceiptListSchema>;

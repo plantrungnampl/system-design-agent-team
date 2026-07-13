@@ -34,6 +34,27 @@ const availableRegistry = new PluginRegistry([
   { uri: pluginUri, status: "available", skills: ["brainstorming"] },
 ]);
 
+const emptyEvidenceContext = {
+  artifacts: [],
+  reviews: [],
+  approvals: [],
+  verified_checksums: {},
+  workflow: {
+    id: "test-workflow",
+    version: "1.0.0",
+    mode: "greenfield",
+    phases: [{
+      id: "intake",
+      owner: "lead-orchestrator",
+      reviewer: "documentation-reviewer",
+      gate: "G0",
+      depends_on: [],
+      required_plugins: [],
+      artifact: { id: "PROJECT-CHARTER", path: "context/project-charter.md", title: "Project Charter" },
+    }],
+  },
+};
+
 function executionResult(prepared, overrides = {}) {
   return {
     execution_id: dispatch.execution_id,
@@ -498,7 +519,7 @@ test("execute rejects a caller-forged prepared execution", async () => {
 });
 
 test("prepareExecution blocks code write without authoritative G6 approval", async () => {
-  const adapter = new ManualCodexAdapter(async () => ({ artifacts: [], reviews: [], approvals: [] }));
+  const adapter = new ManualCodexAdapter(async () => emptyEvidenceContext);
   await assert.rejects(() => adapter.prepareExecution({
     ...dispatch,
     permission_profile: "code_write",
@@ -508,7 +529,7 @@ test("prepareExecution blocks code write without authoritative G6 approval", asy
 });
 
 test("prepareExecution blocks production impact without authoritative G8 safety evidence", async () => {
-  const adapter = new ManualCodexAdapter(async () => ({ artifacts: [], reviews: [], approvals: [] }));
+  const adapter = new ManualCodexAdapter(async () => emptyEvidenceContext);
   await assert.rejects(() => adapter.prepareExecution({
     ...dispatch,
     permission_profile: "production_execution",
@@ -555,9 +576,24 @@ test("collectResult rejects destructive work downcast to non-destructive", async
   }));
   const context = {
     artifacts,
+    verified_checksums: Object.fromEntries(artifacts.map(({ id, checksum }) => [id, checksum])),
+    workflow: {
+      id: "destructive-workflow",
+      version: "1.0.0",
+      mode: "greenfield",
+      phases: artifacts.map(({ id, path, owner, reviewer, required_gate }) => ({
+        id: id.toLowerCase(),
+        owner,
+        reviewer,
+        gate: required_gate,
+        depends_on: [],
+        required_plugins: [],
+        artifact: { id, path, title: id },
+      })),
+    },
     reviews: artifacts.map(({ id }) => ({
       id: `REV-${id}`,
-      phase: "implementation-planning",
+      phase: id.toLowerCase(),
       reviewer: "reviewer",
       verdict: "approved",
       artifact_versions: { [id]: 1 },
@@ -580,14 +616,23 @@ test("collectResult rejects destructive work downcast to non-destructive", async
     dry_run: reference("DRY-RUN"),
     rollback: reference("ROLLBACK"),
   };
-  const adapter = new ManualCodexAdapter(async () => context);
-  const prepared = await adapter.prepareExecution({
+  const destructiveDispatch = {
     ...dispatch,
     permission_profile: "code_write",
     command_class: "mutating_local",
     destructive: true,
     execution_evidence: evidence,
-  });
+  };
+  context.approvals[0].execution_authorization = {
+    execution_id: destructiveDispatch.execution_id,
+    dispatch_digest: createHash("sha256").update(JSON.stringify(destructiveDispatch)).digest("hex"),
+    permission_profile: destructiveDispatch.permission_profile,
+    authorized_paths: destructiveDispatch.authorized_scope,
+    command_class: destructiveDispatch.command_class,
+    destructive: true,
+  };
+  const adapter = new ManualCodexAdapter(async () => context);
+  const prepared = await adapter.prepareExecution(destructiveDispatch);
   const handle = await adapter.execute(prepared);
 
   await assert.rejects(() => adapter.collectResult(handle, executionResult(prepared, {
@@ -626,4 +671,33 @@ test("collectResult returns the parsed normalized result", async () => {
   });
 
   assert.equal("private_reasoning" in result, false);
+});
+
+test("only a result collected by the same adapter can create an execution receipt", async () => {
+  const adapter = new ManualCodexAdapter();
+  const prepared = await adapter.prepareExecution({
+    ...dispatch,
+    agent_id: "requirements-reviewer",
+    phase: "requirements",
+    review_verdict: "approved",
+    permission_profile: "documentation_write",
+    command_class: "mutating_local",
+  });
+  const result = await adapter.collectResult(
+    await adapter.execute(prepared),
+    executionResult(prepared),
+  );
+
+  const receipt = adapter.createExecutionReceipt(result);
+  assert.equal(receipt.agent_id, "requirements-reviewer");
+  assert.equal(receipt.phase, "requirements");
+  assert.equal(receipt.review_verdict, "approved");
+  assert.throws(
+    () => adapter.createExecutionReceipt(structuredClone(result)),
+    /EXECUTION_RESULT_NOT_COLLECTED/,
+  );
+  assert.throws(
+    () => new ManualCodexAdapter().createExecutionReceipt(result),
+    /EXECUTION_RESULT_NOT_COLLECTED/,
+  );
 });

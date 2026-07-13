@@ -10,6 +10,7 @@ import {
   type CapabilityReport,
   type CapabilityRequirements,
   type ExecutionEvidenceContext,
+  type ExecutionPolicyInput,
   type PluginInvocationResult,
 } from "@system-design-team/core";
 import type {
@@ -57,6 +58,15 @@ export interface AgentExecutionAdapter {
   execute(prepared: PreparedExecution): Promise<ExecutionHandle>;
   collectResult(handle: ExecutionHandle, runtimeResult?: unknown): Promise<AgentExecutionResult>;
   cancel(handle: ExecutionHandle): Promise<void>;
+}
+
+export interface AttestedExecutionReceipt {
+  adapter_id: "manual-codex-adapter";
+  agent_id?: string;
+  phase?: string;
+  review_verdict?: "approved" | "revision_required";
+  result: AgentExecutionResult;
+  attestation_digest: `sha256:${string}`;
 }
 
 export type ExecutionContextResolver = (dispatch: AgentDispatch) => Promise<ExecutionEvidenceContext>;
@@ -186,8 +196,13 @@ export function prepareDispatch(
 
 export class ManualCodexAdapter implements PluginAdapter, AgentExecutionAdapter {
   readonly #cancelled = new WeakSet<ExecutionHandle>();
-  readonly #authorized = new WeakMap<PreparedExecution, { digest: string; dispatch: AgentDispatch }>();
+  readonly #authorized = new WeakMap<PreparedExecution, {
+    digest: string;
+    dispatch: AgentDispatch;
+    policy?: ExecutionPolicyInput;
+  }>();
   readonly #executions = new WeakMap<ExecutionHandle, { digest: string; dispatch: AgentDispatch }>();
+  readonly #collected = new WeakMap<AgentExecutionResult, { digest: string; dispatch: AgentDispatch }>();
 
   constructor(readonly contextResolver?: ExecutionContextResolver) {}
 
@@ -217,42 +232,52 @@ export class ManualCodexAdapter implements PluginAdapter, AgentExecutionAdapter 
     });
     const report = capabilityReport(requirements);
     if (!report.allowed) throw new Error(report.blockers[0]);
+    const digest = createHash("sha256").update(JSON.stringify(ownedDispatch)).digest("hex");
     const destructive = ownedDispatch.destructive === true;
     const sensitive = requirements.permission_profile === "code_write"
       || requirements.permission_profile === "production_execution"
       || requirements.command_class === "production_impact"
       || destructive;
+    let policy: ExecutionPolicyInput | undefined;
     if (sensitive) {
       if (!this.contextResolver) throw new Error("EXECUTION_POLICY_CONTEXT_REQUIRED");
       const evidence = ExecutionEvidenceSchema.safeParse(ownedDispatch.execution_evidence);
       if (!evidence.success) throw new Error("EXECUTION_EVIDENCE_REQUIRED");
-      const policy = evaluateExecutionPolicy({
+      policy = {
         ...requirements,
+        execution_id: String(ownedDispatch.execution_id ?? ""),
+        dispatch_digest: digest,
         destructive,
         evidence: evidence.data,
         ...(typeof ownedDispatch.target_gate === "string"
           ? { target_gate: GateIdSchema.parse(ownedDispatch.target_gate) }
           : {}),
-      }, await this.contextResolver(ownedDispatch));
-      if (!policy.allowed) {
-        throw new Error(policy.blockers.find((blocker) => /G[68]_APPROVAL_REQUIRED/.test(blocker))
-          ?? policy.blockers[0]);
+      };
+      const policyReport = evaluateExecutionPolicy(policy, await this.contextResolver(ownedDispatch));
+      if (!policyReport.allowed) {
+        throw new Error(policyReport.blockers.find((blocker) => /G[68]_APPROVAL_REQUIRED/.test(blocker))
+          ?? policyReport.blockers[0]);
       }
     }
     freezeRecursively(ownedDispatch);
     const prepared = freezeRecursively({
       dispatch: ownedDispatch,
-      digest: createHash("sha256").update(JSON.stringify(ownedDispatch)).digest("hex"),
+      digest,
     });
-    this.#authorized.set(prepared, { digest: prepared.digest, dispatch: structuredClone(ownedDispatch) });
+    this.#authorized.set(prepared, { digest, dispatch: structuredClone(ownedDispatch), policy });
     return prepared;
   }
 
   async execute(prepared: PreparedExecution): Promise<ExecutionHandle> {
     const state = this.#authorized.get(prepared);
     if (!state) throw new Error("PREPARED_EXECUTION_INVALID");
+    if (state.policy) {
+      if (!this.contextResolver) throw new Error("EXECUTION_POLICY_CONTEXT_REQUIRED");
+      const report = evaluateExecutionPolicy(state.policy, await this.contextResolver(state.dispatch));
+      if (!report.allowed) throw new Error(report.blockers[0]);
+    }
     const handle: ExecutionHandle = Object.freeze({ status: "awaiting_runtime", digest: state.digest });
-    this.#executions.set(handle, state);
+    this.#executions.set(handle, { digest: state.digest, dispatch: state.dispatch });
     return handle;
   }
 
@@ -278,7 +303,32 @@ export class ManualCodexAdapter implements PluginAdapter, AgentExecutionAdapter 
     if (parsed.data.destructive !== (expected.destructive === true)) {
       throw new Error("DESTRUCTIVE_SCOPE_MISMATCH");
     }
-    return parsed.data;
+    const result = freezeRecursively(parsed.data);
+    this.#collected.set(result, state);
+    return result;
+  }
+
+  createExecutionReceipt(result: AgentExecutionResult): AttestedExecutionReceipt {
+    const state = this.#collected.get(result);
+    if (!state) throw new Error("EXECUTION_RESULT_NOT_COLLECTED");
+    const optionalString = (value: unknown) => typeof value === "string" && value ? value : undefined;
+    const verdict = state.dispatch.review_verdict;
+    if (verdict !== undefined && verdict !== "approved" && verdict !== "revision_required") {
+      throw new Error("REVIEW_VERDICT_INVALID");
+    }
+    const reviewVerdict: AttestedExecutionReceipt["review_verdict"] =
+      verdict === "approved" || verdict === "revision_required" ? verdict : undefined;
+    const binding = {
+      adapter_id: "manual-codex-adapter" as const,
+      ...(optionalString(state.dispatch.agent_id) ? { agent_id: String(state.dispatch.agent_id) } : {}),
+      ...(optionalString(state.dispatch.phase) ? { phase: String(state.dispatch.phase) } : {}),
+      ...(reviewVerdict ? { review_verdict: reviewVerdict } : {}),
+      result,
+    };
+    return freezeRecursively({
+      ...binding,
+      attestation_digest: `sha256:${createHash("sha256").update(JSON.stringify(binding)).digest("hex")}` as const,
+    });
   }
 
   async cancel(handle: ExecutionHandle): Promise<void> {
