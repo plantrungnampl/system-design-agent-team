@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
+import { CacheConfigSchema } from "@system-design-team/core";
 import {
   CACHE_SCHEMA_VERSION,
   inspectCache,
@@ -113,4 +114,85 @@ test("rejects a cache path outside the project", async () => {
     () => rebuildCache(root, "../index.db"),
     /PATH_OUTSIDE_PROJECT/,
   );
+});
+
+test("cache configuration rejects targets outside the canonical cache directory", () => {
+  assert.throws(
+    () => CacheConfigSchema.parse({ provider: "sqlite", path: ".agent-team/project.yaml" }),
+    /SQLite cache path must be under \.agent-team\/cache/,
+  );
+  assert.throws(
+    () => CacheConfigSchema.parse({ provider: "sqlite", path: ".agent-team/cache" }),
+    /SQLite cache path must be under \.agent-team\/cache/,
+  );
+});
+
+test("runtime cache paths cannot overwrite authoritative project files", async () => {
+  const root = await repository();
+  await mkdir(join(root, ".agent-team"), { recursive: true });
+  const projectPath = join(root, ".agent-team/project.yaml");
+  await writeFile(projectPath, "project:\n  id: leave-system\n");
+  await commit(root, "add project");
+
+  await assert.rejects(
+    () => rebuildCache(root, ".agent-team/project.yaml"),
+    /CACHE_PATH_INVALID/,
+  );
+  assert.equal(await readFile(projectPath, "utf8"), "project:\n  id: leave-system\n");
+});
+
+test("rejects a linked cache ancestor before creating directories through it", async () => {
+  const root = await repository();
+  const outside = await mkdtemp(join(tmpdir(), "system-design-cache-outside-"));
+  await mkdir(join(root, ".agent-team/cache"), { recursive: true });
+  await symlink(outside, join(root, ".agent-team/cache/linked"), process.platform === "win32" ? "junction" : "dir");
+
+  await assert.rejects(
+    () => rebuildCache(root, ".agent-team/cache/linked/created/index.db"),
+    /PATH_OUTSIDE_PROJECT/,
+  );
+  await assert.rejects(
+    () => access(join(outside, "created")),
+    (error) => error.code === "ENOENT",
+  );
+});
+
+test("uncommitted authoritative edits make the cache stale", async () => {
+  const root = await repository();
+  await mkdir(join(root, ".agent-team"), { recursive: true });
+  const projectPath = join(root, ".agent-team/project.yaml");
+  await writeFile(projectPath, "project:\n  id: before\n");
+  await commit(root, "add project");
+  await rebuildCache(root);
+
+  await writeFile(projectPath, "project:\n  id: after\n");
+
+  assert.deepEqual(await queryCache(root, "before"), { available: false, reason: "stale", results: [] });
+});
+
+test("uncommitted authoritative additions make the cache stale", async () => {
+  const root = await repository();
+  await mkdir(join(root, ".agent-team"), { recursive: true });
+  await writeFile(join(root, ".agent-team/project.yaml"), "project:\n  id: leave-system\n");
+  await commit(root, "add project");
+  await rebuildCache(root);
+
+  await writeFile(join(root, ".agent-team/new.md"), "# New source\n");
+
+  assert.equal((await inspectCache(root)).available, false);
+  assert.equal((await inspectCache(root)).reason, "stale");
+});
+
+test("uncommitted authoritative deletions make the cache stale", async () => {
+  const root = await repository();
+  await mkdir(join(root, ".agent-team"), { recursive: true });
+  const projectPath = join(root, ".agent-team/project.yaml");
+  await writeFile(projectPath, "project:\n  id: leave-system\n");
+  await commit(root, "add project");
+  await rebuildCache(root);
+
+  await rm(projectPath);
+
+  assert.equal((await inspectCache(root)).available, false);
+  assert.equal((await inspectCache(root)).reason, "stale");
 });

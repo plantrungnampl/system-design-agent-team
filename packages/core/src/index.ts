@@ -67,6 +67,17 @@ export const CacheConfigSchema = z.object({
   if (cache.provider === "sqlite" && !cache.path) {
     context.addIssue({ code: "custom", message: "SQLite cache requires a path", path: ["path"] });
   }
+  if (cache.provider === "sqlite" && cache.path
+    && (!cache.path.startsWith(".agent-team/cache/")
+      || cache.path.includes("\\")
+      || cache.path.slice(".agent-team/cache/".length).split("/")
+        .some((segment) => segment === "" || segment === "." || segment === ".."))) {
+    context.addIssue({
+      code: "custom",
+      message: "SQLite cache path must be under .agent-team/cache/",
+      path: ["path"],
+    });
+  }
   if (cache.provider === "none" && cache.path) {
     context.addIssue({ code: "custom", message: "Disabled cache cannot have a path", path: ["path"] });
   }
