@@ -6,7 +6,7 @@ export interface ParsedArtifact {
 }
 
 export interface ArtifactFinding {
-  code: "INVALID_FRONT_MATTER" | "PROHIBITED_PLACEHOLDER";
+  code: "INVALID_FRONT_MATTER" | "PROHIBITED_PLACEHOLDER" | "UNSUPPORTED_COMPLETION_CLAIM";
   message: string;
 }
 
@@ -69,6 +69,12 @@ export function validateReviewReadyArtifact(text: string): ArtifactValidation {
       code: "PROHIBITED_PLACEHOLDER",
       message: `Prohibited placeholder: ${name}`,
     }));
+  if (/^\s*(?:everything|all (?:requirements|tests|checks)) (?:has |have )?passed[.!]?\s*$/im.test(artifact.body)) {
+    findings.push({
+      code: "UNSUPPORTED_COMPLETION_CLAIM",
+      message: "Completion claims require concrete, reproducible evidence",
+    });
+  }
   findings.sort((left, right) => left.message.localeCompare(right.message));
   return { valid: findings.length === 0, findings };
 }

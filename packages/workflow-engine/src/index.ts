@@ -254,7 +254,7 @@ function approvedGate(
         === JSON.stringify(policy.authorized_paths))));
 }
 
-type EvidenceRole = "qa" | "security" | "data" | "backup" | "dry_run" | "rollback";
+type EvidenceRole = "qa" | "security" | "data" | "data_loss" | "backup" | "dry_run" | "rollback";
 
 function phaseMatchesRole(role: EvidenceRole, phase: WorkflowDefinition["phases"][number]): boolean {
   const purpose = `${phase.id} ${phase.artifact.path} ${phase.artifact.title}`.toLowerCase();
@@ -268,6 +268,9 @@ function phaseMatchesRole(role: EvidenceRole, phase: WorkflowDefinition["phases"
     case "data": return (phase.owner === "data-reviewer"
       || (phase.artifact.path.startsWith("data/") && phase.reviewer === "data-reviewer"))
       && /data|mapping|transition|migration|reconciliation/.test(purpose);
+    case "data_loss": return phase.artifact.id === "BUSINESS-CONTINUITY"
+      && phase.artifact.path.startsWith("requirements/")
+      && /business continuity|data[- ]?loss/.test(purpose);
     case "backup": return phase.owner === "devops-lead" && phase.artifact.path.startsWith("release/")
       && /release|deployment|cutover|backup/.test(purpose);
     case "dry_run": return (phase.owner === "qa-lead" || phase.owner === "devops-lead")
@@ -361,6 +364,7 @@ export function evaluateReviewExecutionResult(
     [evidence.qa, "qa", "QA_EVIDENCE_NOT_CURRENT"],
     [evidence.security, "security", "SECURITY_EVIDENCE_NOT_CURRENT"],
     [evidence.data, "data", "DATA_EVIDENCE_NOT_CURRENT"],
+    [evidence.data_loss, "data_loss", "DATA_LOSS_POLICY_CONFIRMATION_REQUIRED"],
     [evidence.backup, "backup", "BACKUP_VERIFICATION_REQUIRED"],
     [evidence.dry_run, "dry_run", "DRY_RUN_REQUIRED"],
     [evidence.rollback, "rollback", "ROLLBACK_PLAN_REQUIRED"],
@@ -432,6 +436,9 @@ export function evaluateExecutionPolicy(
   if (policy.destructive) {
     add(!approvedGate(policy.evidence.destructive_confirmation, context, policy), "DESTRUCTIVE_CONFIRMATION_REQUIRED");
     add(!approvedGate(policy.evidence.scope_confirmation, context, policy), "SCOPE_CONFIRMATION_REQUIRED");
+    add(context.workflow.mode === "migration"
+      && !currentArtifact(policy.evidence.data_loss, "data_loss", evidenceContext),
+      "DATA_LOSS_POLICY_CONFIRMATION_REQUIRED");
     add(!currentArtifact(policy.evidence.backup, "backup", evidenceContext), "BACKUP_VERIFICATION_REQUIRED");
     add(!currentArtifact(policy.evidence.dry_run, "dry_run", evidenceContext), "DRY_RUN_REQUIRED");
     add(!currentArtifact(policy.evidence.rollback, "rollback", evidenceContext), "ROLLBACK_PLAN_REQUIRED");

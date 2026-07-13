@@ -1284,6 +1284,9 @@ export async function reviewPhase(
   ]);
   const definition = workflow.phases.find((candidate) => candidate.id === phase);
   if (!definition) throw new Error("PHASE_NOT_CONFIGURED");
+  if ((definition.gate === "G7" || definition.gate === "G8") && !(await secretsScan(root)).valid) {
+    throw new Error("SECRET_SCAN_FAILED");
+  }
   let reviewReceipt: ExecutionReceipt | undefined;
   if (definition.gate === "G7" || definition.gate === "G8") {
     if (!receiptId) throw new Error("REVIEW_EXECUTION_RECEIPT_REQUIRED");

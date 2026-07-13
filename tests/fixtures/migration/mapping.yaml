@@ -1,0 +1,7 @@
+mappings:
+  - source: ORDER_ID
+    target: orders.id
+    transform: integer
+  - source: CUSTOMER_ID
+    target: orders.customer_id
+    transform: trim

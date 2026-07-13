@@ -408,6 +408,7 @@ export const ExecutionEvidenceSchema = z.object({
   data: ArtifactEvidenceReferenceSchema.optional(),
   destructive_confirmation: GateApprovalReferenceSchema.optional(),
   scope_confirmation: GateApprovalReferenceSchema.optional(),
+  data_loss: ArtifactEvidenceReferenceSchema.optional(),
   backup: ArtifactEvidenceReferenceSchema.optional(),
   dry_run: ArtifactEvidenceReferenceSchema.optional(),
   rollback: ArtifactEvidenceReferenceSchema.optional(),
