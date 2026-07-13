@@ -22,17 +22,23 @@ import {
   artifactList,
   artifactValidate,
   approve,
+  adoptProject,
   createChange,
   doctor,
+  ejectProject,
   getStatus,
   handover,
   initProject,
+  inspectProject,
+  planUpgrade,
+  resolveProjectConfig,
   reviewPhase as reviewPhaseWithAdapter,
   setPluginStatus,
   startPhase as startPhaseWithAdapter,
   staleList,
   traceCheck,
   traceCoverageReport,
+  uninstallProject,
   validatePhase,
 } from "@system-design-team/cli";
 import {
@@ -183,6 +189,207 @@ test("init creates a valid project without overwriting source", async () => {
   assert.equal(await readFile(join(root, ".codex/generated/existing.txt"), "utf8"), "keep\n");
   assert.equal(await readFile(join(root, ".codex/generated/.gitkeep"), "utf8"), "");
   await assert.rejects(readFile(join(root, "src")), /ENOENT/);
+});
+
+test("fresh initialization persists complete profile-derived configuration", async () => {
+  const root = await temporaryGitRepository();
+  await initProject(root, {
+    id: "configured-system",
+    name: "Configured System",
+    mode: "greenfield",
+    profile: "regulated",
+    environments: {
+      production: { security: { classification: "confidential" } },
+    },
+  });
+
+  const project = await readYaml(root, ".agent-team/project.yaml");
+  assert.equal(project.project.language, "en");
+  assert.deepEqual(project.adapter, { primary: "codex" });
+  assert.equal(project.approvals.production_deployment, "human_required");
+  assert.deepEqual(project.plugins, {
+    enforcement: "strict",
+    fallback_requires_human_approval: true,
+  });
+  assert.deepEqual(project.cache, { provider: "none" });
+  assert.deepEqual(project.security, {
+    classification: "restricted",
+    secret_scan: "required",
+  });
+  assert.equal(project.environments.production.security.classification, "confidential");
+  assert.equal(project.framework.management, "managed");
+
+  const inspected = await inspectProject(root, { environment: "production" });
+  assert.equal(inspected.configuration.security.classification, "confidential");
+  assert.equal(inspected.configuration.approvals.production_deployment, "human_required");
+});
+
+test("explicit configuration overrides environment and clears superseded cache settings", async () => {
+  const root = await temporaryGitRepository();
+  await initProject(root, {
+    id: "precedence-system",
+    name: "Precedence System",
+    mode: "greenfield",
+    profile: "standard",
+    cache: "sqlite",
+    environments: {
+      production: { security: { classification: "confidential" } },
+    },
+  });
+  const project = await readYaml(root, ".agent-team/project.yaml");
+
+  const effective = resolveProjectConfig(project, "production", {
+    cache: { provider: "none" },
+    security: { classification: "public" },
+  });
+
+  assert.deepEqual(effective.cache, { provider: "none" });
+  assert.equal(effective.security.classification, "public");
+  assert.equal(effective.approvals.production_deployment, "human_required");
+});
+
+test("adopt inventories an existing repository without mutating source", async () => {
+  const root = await temporaryGitRepository();
+  await mkdir(join(root, "src"));
+  await writeFile(join(root, "src/application.ts"), "export const source = true;\n");
+  await writeFile(join(root, "README.md"), "# Existing system\n");
+  await execFileAsync("git", ["add", "src/application.ts", "README.md"], { cwd: root });
+  const before = await readFile(join(root, "src/application.ts"), "utf8");
+
+  const adopted = await adoptProject(root, {
+    id: "existing-system",
+    name: "Existing System",
+    profile: "standard",
+  });
+
+  assert.equal(adopted.project.project.mode, "existing_system");
+  assert.deepEqual(adopted.inventory.languages, ["TypeScript"]);
+  assert.equal(adopted.inventory.git.tracked_files, 2);
+  assert.equal(await readFile(join(root, "src/application.ts"), "utf8"), before);
+  assert.deepEqual(await readYaml(root, ".agent-team/inventory.yaml"), adopted.inventory);
+});
+
+test("inspect reports dirty and detached Git state", async () => {
+  const root = await temporaryGitRepository();
+  await writeFile(join(root, "tracked.txt"), "tracked\n");
+  await execFileAsync("git", ["add", "tracked.txt"], { cwd: root });
+  await execFileAsync("git", ["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "--quiet", "-m", "initial"], { cwd: root });
+  await writeFile(join(root, "tracked.txt"), "dirty\n");
+  assert.equal((await inspectProject(root)).repository.git.dirty, true);
+
+  await execFileAsync("git", ["checkout", "--quiet", "--detach", "HEAD"], { cwd: root });
+  const detached = await inspectProject(root);
+  assert.equal(detached.repository.git.detached, true);
+  assert.equal(detached.repository.git.branch, null);
+});
+
+test("adopt requires Git and leaves a non-repository untouched", async () => {
+  const root = await mkdtemp(join(tmpdir(), "system-design-team-no-git-"));
+  await writeFile(join(root, "source.txt"), "keep\n");
+
+  await assert.rejects(() => adoptProject(root, {
+    id: "no-git",
+    name: "No Git",
+    profile: "standard",
+  }), /GIT_REQUIRED/);
+  assert.equal(await readFile(join(root, "source.txt"), "utf8"), "keep\n");
+  await assert.rejects(() => access(join(root, ".agent-team")), { code: "ENOENT" });
+});
+
+test("upgrade check and dry-run preserve overrides and approved content", async () => {
+  const root = await temporaryGitRepository();
+  await initProject(root, {
+    id: "upgrade-system",
+    name: "Upgrade System",
+    mode: "greenfield",
+    profile: "standard",
+  });
+  const agentPath = join(root, ".codex/agents/lead-orchestrator.md");
+  const overriddenAgent = `${await readFile(agentPath, "utf8")}\nLocal override.\n`;
+  await writeFile(agentPath, overriddenAgent);
+  const approvalsBefore = await readFile(join(root, ".agent-team/approvals.yaml"), "utf8");
+  const artifactBefore = await readFile(join(root, ".agent-team/context/project-charter.md"), "utf8");
+  const lock = await readYaml(root, ".agent-team/framework-lock.yaml");
+  lock.framework.version = "0.0.0";
+  await ProjectStore.open(root).writeYamlAtomic(".agent-team/framework-lock.yaml", lock);
+
+  const check = await planUpgrade(root, "check");
+  const dryRun = await planUpgrade(root, "dry-run");
+  assert.equal(check.conflicts[0].path, ".codex/agents/lead-orchestrator.md");
+  assert.equal(check.conflicts[0].proposal_path, ".agent-team/overrides/upgrade/lead-orchestrator.md");
+  assert.equal(check.current_version, "0.0.0");
+  assert(check.changes.some(({ path, action }) => path === ".agent-team/framework-lock.yaml" && action === "update"));
+  assert.deepEqual(dryRun, { ...check, mode: "dry-run" });
+  assert.equal(await readFile(agentPath, "utf8"), overriddenAgent);
+  assert.equal(await readFile(join(root, ".agent-team/approvals.yaml"), "utf8"), approvalsBefore);
+  assert.equal(await readFile(join(root, ".agent-team/context/project-charter.md"), "utf8"), artifactBefore);
+  await assert.rejects(() => access(join(root, ".agent-team/overrides/upgrade/lead-orchestrator.md")), { code: "ENOENT" });
+});
+
+test("eject materializes project-owned overrides and disables upgrades", async () => {
+  const root = await temporaryGitRepository();
+  await initProject(root, {
+    id: "ejected-system",
+    name: "Ejected System",
+    mode: "greenfield",
+    profile: "standard",
+  });
+
+  const result = await ejectProject(root);
+  const project = await readYaml(root, ".agent-team/project.yaml");
+  assert.equal(project.framework.management, "ejected");
+  assert.deepEqual(result.materialized, [
+    ".agent-team/overrides/agents.yaml",
+    ".agent-team/overrides/workflow.yaml",
+  ]);
+  assert.equal((await readYaml(root, ".agent-team/overrides/workflow.yaml")).mode, "greenfield");
+  assert(Array.isArray(await readYaml(root, ".agent-team/overrides/agents.yaml")));
+  assert.equal((await planUpgrade(root, "check")).status, "ejected");
+});
+
+test("uninstall removes generated adapter files and preserves project memory", async () => {
+  const root = await temporaryGitRepository();
+  await mkdir(join(root, ".codex"));
+  await writeFile(join(root, ".codex/keep.txt"), "user-owned\n");
+  await initProject(root, {
+    id: "uninstalled-system",
+    name: "Uninstalled System",
+    mode: "greenfield",
+    profile: "standard",
+  });
+  const approvalsBefore = await readFile(join(root, ".agent-team/approvals.yaml"), "utf8");
+
+  const result = await uninstallProject(root);
+  assert.deepEqual(result.preserved, [".agent-team"]);
+  assert.equal(await readFile(join(root, ".codex/keep.txt"), "utf8"), "user-owned\n");
+  assert.equal(await readFile(join(root, ".agent-team/approvals.yaml"), "utf8"), approvalsBefore);
+  await access(join(root, ".agent-team/project.yaml"));
+  await assert.rejects(() => access(join(root, ".codex/agents/lead-orchestrator.md")), { code: "ENOENT" });
+  const audit = (await readFile(join(root, ".agent-team/audit/events.jsonl"), "utf8"))
+    .trim().split(/\r?\n/).map(JSON.parse);
+  assert(audit.some(({ action, result }) => action === "uninstall" && result === "success"));
+});
+
+test("uninstall does not follow a generated-path link outside the project", async (t) => {
+  const root = await temporaryGitRepository();
+  await initProject(root, {
+    id: "linked-uninstall",
+    name: "Linked Uninstall",
+    mode: "greenfield",
+    profile: "standard",
+  });
+  const generated = join(root, ".codex/agents/lead-orchestrator.md");
+  const outside = await mkdtemp(join(tmpdir(), "system-design-team-outside-agent-"));
+  t.after(() => rm(outside, { recursive: true, force: true }));
+  const outsideFile = join(outside, "lead-orchestrator.md");
+  await writeFile(outsideFile, await readFile(generated, "utf8"));
+  await rm(join(root, ".codex/agents"), { recursive: true });
+  await symlink(outside, join(root, ".codex/agents"), "junction");
+
+  const result = await uninstallProject(root);
+
+  assert(!result.removed.includes(".codex/agents/lead-orchestrator.md"));
+  assert.equal(await readFile(outsideFile, "utf8"), await readFile(generated, "utf8"));
 });
 
 test("lifecycle audit records carry authorization and artifact context", async () => {
@@ -990,7 +1197,10 @@ test("CLI help lists the first-slice commands", async () => {
     process.execPath,
     [bin, "--help"],
   );
-  for (const command of ["init", "status", "start", "review", "approve", "handover", "validate", "doctor", "repair"]) {
+  for (const command of [
+    "init", "adopt", "inspect", "status", "start", "review", "approve", "handover",
+    "validate", "doctor", "repair", "upgrade", "eject", "uninstall",
+  ]) {
     assert.match(stdout, new RegExp(`\\b${command}\\b`));
   }
   assert.match(stdout, /review <phase> --reviewer <id> --verdict <approved\|revision_required> --operation-id <id>/);
@@ -1004,9 +1214,15 @@ test("CLI help lists the first-slice commands", async () => {
     "--name", "Leave System",
     "--mode", "greenfield",
     "--profile", "standard",
+    "--language", "en",
+    "--cache", "none",
+    "--codex",
   ], { cwd: root });
   const status = JSON.parse((await execFileAsync(process.execPath, [bin, "status"], { cwd: root })).stdout);
   assert.equal(status.project.id, "leave-system");
+  assert.equal(JSON.parse((await execFileAsync(process.execPath, [bin, "inspect"], { cwd: root })).stdout).installed, true);
+  assert.equal(JSON.parse((await execFileAsync(process.execPath, [bin, "upgrade", "--check"], { cwd: root })).stdout).mode, "check");
+  assert.equal(JSON.parse((await execFileAsync(process.execPath, [bin, "upgrade", "--dry-run"], { cwd: root })).stdout).mode, "dry-run");
   await assert.rejects(
     () => execFileAsync(process.execPath, [bin, "repair", "--locks"], { cwd: root }),
     /QUIESCENCE_CONFIRMATION_REQUIRED/,
@@ -1064,4 +1280,22 @@ test("CLI help lists the first-slice commands", async () => {
     "CLI-REVIEW",
   );
   assert.equal(reviewed.phases.intake.status, "awaiting_approval");
+
+  assert.equal(JSON.parse((await execFileAsync(process.execPath, [bin, "eject"], { cwd: root })).stdout).status, "ejected");
+  assert.deepEqual(
+    JSON.parse((await execFileAsync(process.execPath, [bin, "uninstall"], { cwd: root })).stdout).preserved,
+    [".agent-team"],
+  );
+
+  const adoptedRoot = await temporaryGitRepository();
+  await writeFile(join(adoptedRoot, "source.ts"), "export {};\n");
+  await execFileAsync("git", ["add", "source.ts"], { cwd: adoptedRoot });
+  const adopted = JSON.parse((await execFileAsync(process.execPath, [
+    bin,
+    "adopt",
+    "--id", "adopted-system",
+    "--name", "Adopted System",
+    "--profile", "standard",
+  ], { cwd: adoptedRoot })).stdout);
+  assert.equal(adopted.project.project.mode, "existing_system");
 });

@@ -22,6 +22,7 @@ import {
   initProject,
   invokePlugin,
   issueList,
+  inspectProject,
   loadExecutionReceipt,
   loadExecutionRequest,
   recordExecutionReceipt,
@@ -138,6 +139,21 @@ test("required CLI safety routes expose real project state", async (t) => {
     assert(stdout.includes(command));
   }
   assert(stdout.includes("--execution-receipt <id>"));
+});
+
+test("repository inspection is read-only for source and authoritative project evidence", async (t) => {
+  const root = await temporaryDirectory(t, "system-design-team-read-only-inspect-");
+  await execFileAsync("git", ["init", "--quiet"], { cwd: root });
+  await writeFile(join(root, "source.txt"), "immutable source\n");
+  await execFileAsync("git", ["add", "source.txt"], { cwd: root });
+  const before = await readFile(join(root, "source.txt"), "utf8");
+
+  const first = await inspectProject(root);
+  const second = await inspectProject(root);
+
+  assert.deepEqual(second, first);
+  assert.equal(await readFile(join(root, "source.txt"), "utf8"), before);
+  await assert.rejects(() => access(join(root, ".agent-team")), { code: "ENOENT" });
 });
 
 test("secrets scan reports tracked credential material", async (t) => {

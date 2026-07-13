@@ -22,6 +22,51 @@ export const PhaseStatusSchema = z.enum([
 
 export const ProjectModeSchema = z.enum(["greenfield", "existing_system", "migration"]);
 export const ProjectProfileSchema = z.enum(["small", "standard", "enterprise", "regulated", "custom"]);
+export const AdapterIdSchema = z.enum(["codex"]);
+export const ApprovalPolicySchema = z.enum(["human_required"]);
+export const PluginEnforcementSchema = z.enum(["strict"]);
+export const CacheProviderSchema = z.enum(["none", "sqlite"]);
+export const SecurityClassificationSchema = z.enum(["public", "internal", "confidential", "restricted"]);
+
+export const ProjectApprovalPolicySchema = z.object({
+  business_scope: ApprovalPolicySchema.default("human_required"),
+  requirements: ApprovalPolicySchema.default("human_required"),
+  product_backlog: ApprovalPolicySchema.default("human_required"),
+  ux: ApprovalPolicySchema.default("human_required"),
+  architecture: ApprovalPolicySchema.default("human_required"),
+  implementation_plan: ApprovalPolicySchema.default("human_required"),
+  release_candidate: ApprovalPolicySchema.default("human_required"),
+  production_deployment: ApprovalPolicySchema.default("human_required"),
+});
+
+export const AdapterConfigSchema = z.object({ primary: AdapterIdSchema.default("codex") });
+export const PluginEnforcementConfigSchema = z.object({
+  enforcement: PluginEnforcementSchema.default("strict"),
+  fallback_requires_human_approval: z.literal(true).default(true),
+});
+export const CacheConfigSchema = z.object({
+  provider: CacheProviderSchema.default("none"),
+  path: z.string().min(1).optional(),
+}).superRefine((cache, context) => {
+  if (cache.provider === "sqlite" && !cache.path) {
+    context.addIssue({ code: "custom", message: "SQLite cache requires a path", path: ["path"] });
+  }
+  if (cache.provider === "none" && cache.path) {
+    context.addIssue({ code: "custom", message: "Disabled cache cannot have a path", path: ["path"] });
+  }
+});
+export const SecurityConfigSchema = z.object({
+  classification: SecurityClassificationSchema.default("internal"),
+  secret_scan: z.literal("required").default("required"),
+});
+
+export const EnvironmentOverlaySchema = z.object({
+  adapter: AdapterConfigSchema.partial().optional(),
+  approvals: ProjectApprovalPolicySchema.partial().optional(),
+  plugins: PluginEnforcementConfigSchema.partial().optional(),
+  cache: z.object({ provider: CacheProviderSchema, path: z.string().min(1).optional() }).optional(),
+  security: SecurityConfigSchema.partial().optional(),
+});
 
 const VersionedReferenceSchema = z.object({
   id: z.string().min(1),
@@ -35,9 +80,31 @@ export const ProjectConfigSchema = z.object({
     name: z.string().min(1),
     mode: ProjectModeSchema,
     profile: ProjectProfileSchema,
+    language: z.string().min(2).default("en"),
   }),
-  framework: z.object({ version: z.string().min(1) }),
+  framework: z.object({
+    version: z.string().min(1),
+    management: z.enum(["managed", "ejected"]).default("managed"),
+  }),
+  adapter: AdapterConfigSchema.default({ primary: "codex" }),
   workflow: VersionedReferenceSchema,
+  approvals: ProjectApprovalPolicySchema.default({
+    business_scope: "human_required",
+    requirements: "human_required",
+    product_backlog: "human_required",
+    ux: "human_required",
+    architecture: "human_required",
+    implementation_plan: "human_required",
+    release_candidate: "human_required",
+    production_deployment: "human_required",
+  }),
+  plugins: PluginEnforcementConfigSchema.default({
+    enforcement: "strict",
+    fallback_requires_human_approval: true,
+  }),
+  cache: CacheConfigSchema.default({ provider: "none" }),
+  security: SecurityConfigSchema.default({ classification: "internal", secret_scan: "required" }),
+  environments: z.record(z.string().min(1), EnvironmentOverlaySchema).default({}),
 });
 
 export const FrameworkLockSchema = z.object({
@@ -513,6 +580,8 @@ export const ExecutionEvidenceContextSchema = z.object({
 export type ProjectMode = z.infer<typeof ProjectModeSchema>;
 export type ProjectProfile = z.infer<typeof ProjectProfileSchema>;
 export type ProjectConfig = z.infer<typeof ProjectConfigSchema>;
+export type EnvironmentOverlay = z.infer<typeof EnvironmentOverlaySchema>;
+export type CacheProvider = z.infer<typeof CacheProviderSchema>;
 export type FrameworkLock = z.infer<typeof FrameworkLockSchema>;
 export type GateId = z.infer<typeof GateIdSchema>;
 export type PhaseStatus = z.infer<typeof PhaseStatusSchema>;

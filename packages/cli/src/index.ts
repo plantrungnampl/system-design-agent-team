@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { lstat, readFile, realpath, rm, rmdir } from "node:fs/promises";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { parseArtifact, validateReviewReadyArtifact } from "@system-design-team/artifact-validator";
@@ -42,6 +42,7 @@ import {
   type PluginInvocationList,
   type PluginStatusRecord,
   type ProjectConfig,
+  type EnvironmentOverlay,
   type ProjectMode,
   type ProjectProfile,
   type ReviewVerdict,
@@ -73,7 +74,15 @@ export interface InitOptions {
   name: string;
   mode: ProjectMode;
   profile: ProjectProfile;
+  language?: string;
+  adapter?: "codex";
+  cache?: "none" | "sqlite";
+  environments?: Record<string, EnvironmentOverlay>;
 }
+
+export interface AdoptOptions extends Omit<InitOptions, "mode"> {}
+
+export type UpgradeMode = "check" | "dry-run";
 
 const assetsRoot = join(dirname(fileURLToPath(import.meta.url)), "assets");
 const execFileAsync = promisify(execFile);
@@ -82,6 +91,49 @@ const workflowFiles: Record<ProjectMode, string> = {
   existing_system: "existing-system.yaml",
   migration: "migration.yaml",
 };
+
+const humanApprovals = {
+  business_scope: "human_required" as const,
+  requirements: "human_required" as const,
+  product_backlog: "human_required" as const,
+  ux: "human_required" as const,
+  architecture: "human_required" as const,
+  implementation_plan: "human_required" as const,
+  release_candidate: "human_required" as const,
+  production_deployment: "human_required" as const,
+};
+
+function profileSecurity(profile: ProjectProfile) {
+  if (profile === "regulated") return "restricted" as const;
+  if (profile === "enterprise") return "confidential" as const;
+  return "internal" as const;
+}
+
+function applyOverlay(config: ProjectConfig, overlay: EnvironmentOverlay): ProjectConfig {
+  return ProjectConfigSchema.parse({
+    ...config,
+    adapter: { ...config.adapter, ...overlay.adapter },
+    approvals: { ...config.approvals, ...overlay.approvals },
+    plugins: { ...config.plugins, ...overlay.plugins },
+    cache: overlay.cache
+      ? overlay.cache.provider === config.cache.provider
+        ? { ...config.cache, ...overlay.cache }
+        : overlay.cache
+      : config.cache,
+    security: { ...config.security, ...overlay.security },
+  });
+}
+
+export function resolveProjectConfig(
+  input: ProjectConfig,
+  environment?: string,
+  explicit: EnvironmentOverlay = {},
+): ProjectConfig {
+  const config = ProjectConfigSchema.parse(input);
+  const environmentOverlay = environment ? config.environments[environment] : undefined;
+  if (environment && !environmentOverlay) throw new Error("ENVIRONMENT_NOT_CONFIGURED");
+  return applyOverlay(environmentOverlay ? applyOverlay(config, environmentOverlay) : config, explicit);
+}
 
 async function exists(path: string): Promise<boolean> {
   try {
@@ -230,9 +282,23 @@ export async function initProject(root: string, options: InitOptions): Promise<P
   const { workflow, catalogue } = await readBootstrapAssets(options.mode);
   const project = ProjectConfigSchema.parse({
     schema_version: 1,
-    project: options,
-    framework: { version: FRAMEWORK_VERSION },
+    project: {
+      id: options.id,
+      name: options.name,
+      mode: options.mode,
+      profile: options.profile,
+      language: options.language ?? "en",
+    },
+    framework: { version: FRAMEWORK_VERSION, management: "managed" },
+    adapter: { primary: options.adapter ?? "codex" },
     workflow: { id: workflow.id, version: workflow.version },
+    approvals: humanApprovals,
+    plugins: { enforcement: "strict", fallback_requires_human_approval: true },
+    cache: options.cache === "sqlite"
+      ? { provider: "sqlite", path: ".agent-team/cache/index.db" }
+      : { provider: "none" },
+    security: { classification: profileSecurity(options.profile), secret_scan: "required" },
+    environments: options.environments ?? {},
   });
   const state = WorkflowStateSchema.parse({
     schema_version: 1,
@@ -349,13 +415,94 @@ export async function initProject(root: string, options: InitOptions): Promise<P
   });
 }
 
+const languageByExtension: Record<string, string> = {
+  ".cs": "C#",
+  ".go": "Go",
+  ".java": "Java",
+  ".js": "JavaScript",
+  ".jsx": "JavaScript",
+  ".kt": "Kotlin",
+  ".mjs": "JavaScript",
+  ".py": "Python",
+  ".rb": "Ruby",
+  ".rs": "Rust",
+  ".swift": "Swift",
+  ".ts": "TypeScript",
+  ".tsx": "TypeScript",
+};
+
+async function repositoryInventory(root: string) {
+  const projectRoot = resolve(root);
+  let gitRoot: string;
+  let status: string;
+  let tracked: string;
+  try {
+    [{ stdout: gitRoot }, { stdout: status }, { stdout: tracked }] = await Promise.all([
+      execFileAsync("git", ["rev-parse", "--show-toplevel"], { cwd: projectRoot }),
+      execFileAsync("git", ["status", "--porcelain=v1"], { cwd: projectRoot }),
+      execFileAsync("git", ["ls-files", "-z"], { cwd: projectRoot }),
+    ]);
+  } catch {
+    throw new Error("GIT_REQUIRED");
+  }
+  let branch: string | null = null;
+  try {
+    branch = (await execFileAsync("git", ["symbolic-ref", "--quiet", "--short", "HEAD"], {
+      cwd: projectRoot,
+    })).stdout.trim() || null;
+  } catch {
+    branch = null;
+  }
+  const files = tracked.split("\0").filter(Boolean).sort();
+  return {
+    git: {
+      root: gitRoot.trim(),
+      dirty: status.trim().length > 0,
+      detached: branch === null,
+      branch,
+      tracked_files: files.length,
+    },
+    languages: [...new Set(files.map((path) => languageByExtension[extname(path).toLowerCase()])
+      .filter((language): language is string => language !== undefined))].sort(),
+  };
+}
+
+export async function inspectProject(root: string, options: { environment?: string } = {}) {
+  const projectRoot = resolve(root);
+  const repository = await repositoryInventory(projectRoot);
+  const installed = await exists(join(projectRoot, ".agent-team/project.yaml"));
+  if (!installed) return { installed, repository };
+  const project = await projectConfig(ProjectStore.open(projectRoot));
+  return {
+    installed,
+    repository,
+    configuration: resolveProjectConfig(project, options.environment),
+  };
+}
+
+export async function adoptProject(root: string, options: AdoptOptions) {
+  const projectRoot = resolve(root);
+  const inventory = await repositoryInventory(projectRoot);
+  const project = await initProject(projectRoot, { ...options, mode: "existing_system" });
+  const id = operationKey("adopt", project.project.id, "bootstrap");
+  await ProjectStore.open(projectRoot).transaction(id, [{
+    path: ".agent-team/inventory.yaml",
+    content: stringify(inventory),
+  }], makeAuditEvent(id, "adopt", project.project.id, project.project.profile, {
+    authorizationSource: "bootstrap",
+  }));
+  return { project, inventory };
+}
+
 async function projectConfig(store: ProjectStore): Promise<ProjectConfig> {
   return store.readYaml(".agent-team/project.yaml", ProjectConfigSchema);
 }
 
 async function configuredWorkflow(store: ProjectStore): Promise<WorkflowDefinition> {
   const project = await projectConfig(store);
-  const workflow = await readWorkflow(project.project.mode);
+  const workflow = project.framework.management === "ejected"
+    ? await store.readYaml(".agent-team/overrides/workflow.yaml", WorkflowDefinitionSchema)
+    : await readWorkflow(project.project.mode);
   if (workflow.id !== project.workflow.id || workflow.version !== project.workflow.version) {
     throw new Error("WORKFLOW_MISMATCH");
   }
@@ -1347,6 +1494,115 @@ export async function getStatus(root: string) {
     phases: state.phases,
     plugins: plugins.plugins,
   };
+}
+
+export async function planUpgrade(root: string, mode: UpgradeMode) {
+  const projectRoot = resolve(root);
+  const store = ProjectStore.open(projectRoot);
+  const [project, catalogue, lock] = await Promise.all([
+    projectConfig(store),
+    readCatalogue(),
+    store.readYaml(".agent-team/framework-lock.yaml", FrameworkLockSchema),
+  ]);
+  const base = {
+    mode,
+    current_version: lock.framework.version,
+    target_version: FRAMEWORK_VERSION,
+  };
+  if (project.framework.management === "ejected") {
+    return { ...base, status: "ejected" as const, changes: [], conflicts: [], proposals: [] };
+  }
+  const changes: { path: string; action: "create" | "update" }[] = [];
+  const conflicts: { path: string; proposal_path: string }[] = [];
+  const proposals: { path: string; content: string }[] = [];
+  for (const agent of catalogue) {
+    const path = `.codex/agents/${agent.id}.md`;
+    const proposalPath = `.agent-team/overrides/upgrade/${agent.id}.md`;
+    const expected = renderAgentInstruction(agent);
+    try {
+      const target = join(projectRoot, path);
+      if (!inside(await realpath(projectRoot), await realpath(target))) throw new Error("PATH_OUTSIDE_PROJECT");
+      if (await readFile(target, "utf8") !== expected) {
+        conflicts.push({ path, proposal_path: proposalPath });
+        proposals.push({ path: proposalPath, content: expected });
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") changes.push({ path, action: "create" });
+      else throw error;
+    }
+  }
+  if (lock.framework.version !== FRAMEWORK_VERSION) {
+    changes.push({ path: ".agent-team/framework-lock.yaml", action: "update" });
+  }
+  changes.sort((left, right) => left.path.localeCompare(right.path));
+  conflicts.sort((left, right) => left.path.localeCompare(right.path));
+  proposals.sort((left, right) => left.path.localeCompare(right.path));
+  return {
+    ...base,
+    status: conflicts.length > 0 ? "blocked" as const
+      : changes.length > 0 ? "upgrade_available" as const
+        : "current" as const,
+    changes,
+    conflicts,
+    proposals,
+  };
+}
+
+export async function ejectProject(root: string) {
+  const projectRoot = resolve(root);
+  const store = ProjectStore.open(projectRoot);
+  return store.withLock(".agent-team/lifecycle.lock", async () => {
+    const [project, workflow, catalogue] = await Promise.all([
+      projectConfig(store),
+      configuredWorkflow(store),
+      readCatalogue(),
+    ]);
+    const ejected = ProjectConfigSchema.parse({
+      ...project,
+      framework: { ...project.framework, management: "ejected" },
+    });
+    const id = operationKey("eject", project.project.id, "lifecycle");
+    const materialized = [
+      ".agent-team/overrides/agents.yaml",
+      ".agent-team/overrides/workflow.yaml",
+    ];
+    await store.transaction(id, [
+      { path: ".agent-team/project.yaml", content: stringify(ejected) },
+      { path: materialized[0]!, content: stringify(catalogue) },
+      { path: materialized[1]!, content: stringify(workflow) },
+    ], makeAuditEvent(id, "eject", project.project.id, project.project.profile, {
+      authorizationSource: "user_cli",
+    }));
+    return { status: "ejected" as const, materialized };
+  });
+}
+
+export async function uninstallProject(root: string) {
+  const projectRoot = resolve(root);
+  const store = ProjectStore.open(projectRoot);
+  return store.withLock(".agent-team/lifecycle.lock", async () => {
+    const [project, catalogue] = await Promise.all([projectConfig(store), readCatalogue()]);
+    const removed: string[] = [];
+    const realRoot = await realpath(projectRoot);
+    for (const agent of catalogue) {
+      const path = `.codex/agents/${agent.id}.md`;
+      try {
+        const target = join(projectRoot, path);
+        if (!inside(realRoot, await realpath(target))) continue;
+        if (await readFile(target, "utf8") !== renderAgentInstruction(agent)) continue;
+        await removeGeneratedPaths(projectRoot, [path]);
+        removed.push(path);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+    }
+    await removeEmptyGeneratedDirectory(projectRoot, ".codex/agents");
+    const id = operationKey("uninstall", project.project.id, "adapter");
+    await store.transaction(id, [], makeAuditEvent(id, "uninstall", project.project.id, project.project.profile, {
+      authorizationSource: "user_cli",
+    }));
+    return { removed: removed.sort(), preserved: [".agent-team"] };
+  });
 }
 
 export async function gateReadinessReport(root: string, gate: GateId, receiptId?: string) {

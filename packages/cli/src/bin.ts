@@ -3,12 +3,14 @@
 import process from "node:process";
 import { parseArgs } from "node:util";
 import {
+  CacheProviderSchema,
   GateIdSchema,
   ProjectModeSchema,
   ProjectProfileSchema,
   ReviewVerdictSchema,
 } from "@system-design-team/core";
 import {
+  adoptProject,
   artifactInspect,
   artifactList,
   artifactValidate,
@@ -16,26 +18,32 @@ import {
   createChange,
   diagnostics,
   doctor,
+  ejectProject,
   gateReadinessReport,
   getStatus,
   handover,
   initProject,
+  inspectProject,
   issueList,
   rejectGate,
   repair,
   reviewPhase,
+  planUpgrade,
   secretsScan,
   startPhase,
   staleList,
   traceCheck,
   traceCoverageReport,
+  uninstallProject,
   validatePhase,
 } from "./index.js";
 
 const usage = `Usage: system-design-team <command> [options]
 
 Commands:
-  init --id <id> --name <name> --mode <mode> --profile <profile>
+  init --id <id> --name <name> --mode <mode> --profile <profile> [--language <language>] [--cache <none|sqlite>] [--codex]
+  adopt --id <id> --name <name> --profile <profile> [--language <language>] [--cache <none|sqlite>] [--codex]
+  inspect [--environment <name>]
   status
   start <phase> --operation-id <id>
   validate <phase> --operation-id <id>
@@ -55,10 +63,16 @@ Commands:
   secrets scan
   diagnostics
   doctor
-  repair --locks --yes`;
+  repair --locks --yes
+  upgrade --check
+  upgrade --dry-run
+  eject
+  uninstall`;
 
 const commandShape: Record<string, { positionals: number; options: string[] }> = {
-  init: { positionals: 1, options: ["id", "name", "mode", "profile"] },
+  init: { positionals: 1, options: ["id", "name", "mode", "profile", "language", "cache", "codex"] },
+  adopt: { positionals: 1, options: ["id", "name", "profile", "language", "cache", "codex"] },
+  inspect: { positionals: 1, options: ["environment"] },
   status: { positionals: 1, options: [] },
   start: { positionals: 2, options: ["operation-id"] },
   validate: { positionals: 2, options: ["operation-id"] },
@@ -79,6 +93,9 @@ const commandShape: Record<string, { positionals: number; options: string[] }> =
   diagnostics: { positionals: 1, options: [] },
   doctor: { positionals: 1, options: [] },
   repair: { positionals: 1, options: ["locks", "yes"] },
+  upgrade: { positionals: 1, options: ["check", "dry-run"] },
+  eject: { positionals: 1, options: [] },
+  uninstall: { positionals: 1, options: [] },
 };
 
 function required(value: string | undefined, option: string): string {
@@ -113,6 +130,12 @@ async function main(): Promise<void> {
       name: { type: "string" },
       mode: { type: "string" },
       profile: { type: "string" },
+      language: { type: "string" },
+      cache: { type: "string" },
+      codex: { type: "boolean" },
+      environment: { type: "string" },
+      check: { type: "boolean" },
+      "dry-run": { type: "boolean" },
       by: { type: "string" },
       reviewer: { type: "string" },
       verdict: { type: "string" },
@@ -151,7 +174,23 @@ async function main(): Promise<void> {
         name: required(values.name, "--name"),
         mode: ProjectModeSchema.parse(required(values.mode, "--mode").replace("-", "_")),
         profile: ProjectProfileSchema.parse(required(values.profile, "--profile")),
+        language: values.language,
+        adapter: "codex",
+        cache: CacheProviderSchema.parse(values.cache ?? "none"),
       });
+      break;
+    case "adopt":
+      result = await adoptProject(root, {
+        id: required(values.id, "--id"),
+        name: required(values.name, "--name"),
+        profile: ProjectProfileSchema.parse(required(values.profile, "--profile")),
+        language: values.language,
+        adapter: "codex",
+        cache: CacheProviderSchema.parse(values.cache ?? "none"),
+      });
+      break;
+    case "inspect":
+      result = await inspectProject(root, { environment: values.environment });
       break;
     case "status":
       result = await getStatus(root);
@@ -264,6 +303,16 @@ async function main(): Promise<void> {
         locks: values.locks === true,
         confirmedQuiescent: values.yes === true,
       });
+      break;
+    case "upgrade":
+      if (values.check === values["dry-run"]) throw new Error("Use exactly one of --check or --dry-run");
+      result = await planUpgrade(root, values.check ? "check" : "dry-run");
+      break;
+    case "eject":
+      result = await ejectProject(root);
+      break;
+    case "uninstall":
+      result = await uninstallProject(root);
       break;
     default:
       throw new Error(`Unknown command: ${command}`);
