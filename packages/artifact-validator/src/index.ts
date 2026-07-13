@@ -25,6 +25,22 @@ const prohibitedPlaceholders = [
   ["TODO", /^[ \t]*(?:(?:#{1,6}|[-*+]|\d+[.)])(?:[ \t]+\[[ x]\])?[ \t]+)?TODO(?:[ \t]*:[^\r\n]*)?[ \t]*$/im],
   ["To be defined later", /^[ \t]*(?:(?:#{1,6}|[-*+]|\d+[.)])(?:[ \t]+\[[ x]\])?[ \t]+)?to be defined later(?:[ \t]*:[^\r\n]*)?[ \t]*$/im],
 ] as const;
+const reservedEvidenceValues = new Set(["unknown", "none", "n/a", "na", "tbd", "todo"]);
+
+function evidenceValue(line: string, label: string) {
+  const match = new RegExp(`^${label}:\\s*(.+)$`, "i").exec(line);
+  if (!match) return undefined;
+  const value = match[1]!.trim();
+  return value && !reservedEvidenceValues.has(value.toLowerCase()) ? value : undefined;
+}
+
+function isProjectRelativeFile(value: string) {
+  if (value.includes("\\") || value.startsWith("/") || /^[a-z]:/i.test(value)) return false;
+  const segments = value.split("/");
+  return segments.length >= 2
+    && segments.every((segment) => segment !== "." && segment !== ".." && /^[a-z0-9._-]+$/i.test(segment))
+    && /^[a-z0-9_-]+\.[a-z0-9._-]+$/i.test(segments.at(-1)!);
+}
 
 function boundedFrontMatter(text: string): { yaml: string; body: string } | undefined {
   const lines = text.split(/\r?\n/);
@@ -73,12 +89,18 @@ export function validateReviewReadyArtifact(text: string): ArtifactValidation {
     .map((line) => line.trim())
     .filter((line) => line && !/^#{1,6}\s+/.test(line));
   const claimOnly = /^(?:everything|all (?:requirements|tests|checks|security checks)) (?:(?:has|have) )?(?:passed|(?:was|were) successful)[.!]?$/i;
-  const hasCommand = substantive.some((line) => /^command:\s*\S.+/i.test(line));
-  const hasResult = substantive.some((line) => /^(?:exit(?: code)?|passed|failed|result):\s*\S+/i.test(line));
-  const hasBoundReference = substantive.some((line) =>
-    /^(?:receipt|artifact|path):\s*\S+/i.test(line)
-    || /^(?:digest|checksum):\s*sha256:[a-f0-9]{64}$/i.test(line));
-  if (substantive.some((line) => claimOnly.test(line)) && !((hasCommand && hasResult) || hasBoundReference)) {
+  const hasCommand = substantive.some((line) => evidenceValue(line, "command") !== undefined);
+  const hasSuccessfulExit = substantive.some((line) => /^exit code:\s*0$/i.test(line));
+  const hasReceipt = substantive.some((line) =>
+    /^RECEIPT-(?:[A-Z0-9]+-)+[A-Z0-9]+$/i.test(evidenceValue(line, "receipt") ?? ""));
+  const hasProjectFile = substantive.some((line) => {
+    const value = evidenceValue(line, "(?:artifact|path)");
+    return value !== undefined && isProjectRelativeFile(value);
+  });
+  const hasDigest = substantive.some((line) =>
+    /^(?:digest|checksum):\s*sha256:[a-f0-9]{64}$/i.test(line));
+  const hasEvidence = (hasCommand && hasSuccessfulExit) || hasReceipt || hasProjectFile || hasDigest;
+  if (substantive.some((line) => claimOnly.test(line)) && !hasEvidence) {
     findings.push({
       code: "UNSUPPORTED_COMPLETION_CLAIM",
       message: "Completion claims require concrete, reproducible evidence",

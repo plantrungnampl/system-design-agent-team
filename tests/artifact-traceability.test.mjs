@@ -96,6 +96,15 @@ test("rejects unsupported completion claims even with filler but accepts concret
     "Everything passed.\nCommand: npm test",
     "All tests passed.\nExit code: 0",
     "Everything passed.\nArtifact:",
+    "Everything passed.\nReceipt: unknown",
+    "Everything passed.\nArtifact: none",
+    "Everything passed.\nPath: n/a",
+    "Everything passed.\nCommand: run tests\nResult: ok",
+    "Everything passed.\nCommand: unknown\nExit code: 0",
+    "Everything passed.\nPath: ../secret.txt",
+    "Everything passed.\nPath: C:/secret.txt",
+    "Everything passed.\nPath: /etc/secret.txt",
+    "Everything passed.\nPath: summary.md",
   ]) {
     const result = validateReviewReadyArtifact(`---\nstatus: approved\n---\n# Summary\n${claim}`);
     assert.equal(result.valid, false, claim);
@@ -124,6 +133,16 @@ status: approved
 # Review summary
 Everything passed.
 Artifact: requirements/srs.md`), { valid: true, findings: [] });
+
+  assert.deepEqual(validateReviewReadyArtifact(`---
+status: approved
+---
+# Review summary
+Everything passed.
+Checksum: sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef`), {
+    valid: true,
+    findings: [],
+  });
 });
 
 test("reports an approved requirement without a current test", () => {
