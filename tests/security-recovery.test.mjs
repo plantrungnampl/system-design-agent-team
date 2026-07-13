@@ -4,10 +4,12 @@ import { createHash } from "node:crypto";
 import { once } from "node:events";
 import {
   access,
+  chmod,
   mkdir,
   mkdtemp,
   readFile,
   rm,
+  stat,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -141,18 +143,24 @@ test("required CLI safety routes expose real project state", async (t) => {
   assert(stdout.includes("--execution-receipt <id>"));
 });
 
-test("repository inspection is read-only for source and authoritative project evidence", async (t) => {
+test("repository inspection does not write source and uses a read-only POSIX fixture", async (t) => {
   const root = await temporaryDirectory(t, "system-design-team-read-only-inspect-");
   await execFileAsync("git", ["init", "--quiet"], { cwd: root });
-  await writeFile(join(root, "source.txt"), "immutable source\n");
+  const source = join(root, "source.txt");
+  await writeFile(source, "immutable source\n");
   await execFileAsync("git", ["add", "source.txt"], { cwd: root });
-  const before = await readFile(join(root, "source.txt"), "utf8");
+  if (process.platform !== "win32") await chmod(source, 0o444);
+  const before = { content: await readFile(source, "utf8"), stat: await stat(source) };
 
   const first = await inspectProject(root);
   const second = await inspectProject(root);
 
   assert.deepEqual(second, first);
-  assert.equal(await readFile(join(root, "source.txt"), "utf8"), before);
+  const after = { content: await readFile(source, "utf8"), stat: await stat(source) };
+  assert.equal(after.content, before.content);
+  assert.equal(after.stat.mtimeMs, before.stat.mtimeMs);
+  assert.equal(after.stat.size, before.stat.size);
+  if (process.platform !== "win32") assert.equal(after.stat.mode & 0o777, 0o444);
   await assert.rejects(() => access(join(root, ".agent-team")), { code: "ENOENT" });
 });
 

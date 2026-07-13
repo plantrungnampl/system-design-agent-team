@@ -256,6 +256,71 @@ export const PluginStatusListSchema = z.object({
 
 const Sha256DigestSchema = z.string().regex(/^sha256:[a-f0-9]{64}$/);
 
+const ManagedRelativePathSchema = z.string().min(1).refine((path) =>
+  !path.startsWith("/")
+  && !path.includes("\\")
+  && path.split("/").every((segment) => segment !== "" && segment !== "." && segment !== ".."),
+"Managed path must be a contained POSIX-style relative path");
+
+export const LifecycleAuthorizationSchema = z.object({
+  actor: z.object({
+    type: z.enum(["human", "agent", "system"]),
+    identifier: z.string().min(1),
+  }),
+  authorization_source: z.string().min(1),
+});
+
+export const RepositoryInventorySchema = z.object({
+  git: z.object({
+    root: z.string().min(1),
+    dirty: z.boolean(),
+    detached: z.boolean(),
+    branch: z.string().min(1).nullable(),
+    tracked_files: z.number().int().nonnegative(),
+  }),
+  languages: z.array(z.string().min(1)),
+});
+
+export const InstalledFileSchema = z.object({
+  path: ManagedRelativePathSchema,
+  checksum: Sha256DigestSchema,
+  role: z.literal("generated_adapter"),
+});
+
+export const InstallationManifestSchema = z.object({
+  schema_version: z.literal(1),
+  files: z.array(InstalledFileSchema),
+  directories_created: z.array(ManagedRelativePathSchema),
+});
+
+export const InstallationOperationSchema = z.object({
+  schema_version: z.literal(1),
+  action: z.enum(["init", "adopt"]),
+  operation_id: z.string().min(1),
+  authorization: LifecycleAuthorizationSchema,
+  project: ProjectConfigSchema,
+  inventory: RepositoryInventorySchema.optional(),
+});
+
+export const EjectOperationSchema = z.object({
+  schema_version: z.literal(1),
+  action: z.literal("eject"),
+  operation_id: z.string().min(1),
+  authorization: LifecycleAuthorizationSchema,
+  materialized: z.array(ManagedRelativePathSchema),
+});
+
+export const UninstallPlanSchema = z.object({
+  schema_version: z.literal(1),
+  operation_id: z.string().min(1),
+  authorization: LifecycleAuthorizationSchema,
+  status: z.enum(["started", "completed"]),
+  files: z.array(InstalledFileSchema),
+  directories: z.array(ManagedRelativePathSchema),
+  removed: z.array(ManagedRelativePathSchema).default([]),
+  preserved: z.array(ManagedRelativePathSchema).default([".agent-team"]),
+});
+
 export const PermissionProfileSchema = z.enum([
   "read_only_assessment",
   "documentation_write",
@@ -582,6 +647,10 @@ export type ProjectProfile = z.infer<typeof ProjectProfileSchema>;
 export type ProjectConfig = z.infer<typeof ProjectConfigSchema>;
 export type EnvironmentOverlay = z.infer<typeof EnvironmentOverlaySchema>;
 export type CacheProvider = z.infer<typeof CacheProviderSchema>;
+export type LifecycleAuthorization = z.infer<typeof LifecycleAuthorizationSchema>;
+export type RepositoryInventory = z.infer<typeof RepositoryInventorySchema>;
+export type InstallationManifest = z.infer<typeof InstallationManifestSchema>;
+export type UninstallPlan = z.infer<typeof UninstallPlanSchema>;
 export type FrameworkLock = z.infer<typeof FrameworkLockSchema>;
 export type GateId = z.infer<typeof GateIdSchema>;
 export type PhaseStatus = z.infer<typeof PhaseStatusSchema>;

@@ -3,6 +3,7 @@
 import process from "node:process";
 import { parseArgs } from "node:util";
 import {
+  AdapterIdSchema,
   CacheProviderSchema,
   GateIdSchema,
   ProjectModeSchema,
@@ -41,8 +42,8 @@ import {
 const usage = `Usage: system-design-team <command> [options]
 
 Commands:
-  init --id <id> --name <name> --mode <mode> --profile <profile> [--language <language>] [--cache <none|sqlite>] [--codex]
-  adopt --id <id> --name <name> --profile <profile> [--language <language>] [--cache <none|sqlite>] [--codex]
+  init --id <id> --name <name> --mode <mode> --profile <profile> [--language <language>] [--cache <none|sqlite>] [--adapter <codex>]
+  adopt --id <id> --name <name> --profile <profile> --operation-id <id> [--language <language>] [--cache <none|sqlite>] [--adapter <codex>]
   inspect [--environment <name>]
   status
   start <phase> --operation-id <id>
@@ -66,12 +67,12 @@ Commands:
   repair --locks --yes
   upgrade --check
   upgrade --dry-run
-  eject
-  uninstall`;
+  eject --operation-id <id>
+  uninstall --operation-id <id>`;
 
 const commandShape: Record<string, { positionals: number; options: string[] }> = {
-  init: { positionals: 1, options: ["id", "name", "mode", "profile", "language", "cache", "codex"] },
-  adopt: { positionals: 1, options: ["id", "name", "profile", "language", "cache", "codex"] },
+  init: { positionals: 1, options: ["id", "name", "mode", "profile", "language", "cache", "adapter"] },
+  adopt: { positionals: 1, options: ["id", "name", "profile", "language", "cache", "adapter", "operation-id"] },
   inspect: { positionals: 1, options: ["environment"] },
   status: { positionals: 1, options: [] },
   start: { positionals: 2, options: ["operation-id"] },
@@ -94,8 +95,8 @@ const commandShape: Record<string, { positionals: number; options: string[] }> =
   doctor: { positionals: 1, options: [] },
   repair: { positionals: 1, options: ["locks", "yes"] },
   upgrade: { positionals: 1, options: ["check", "dry-run"] },
-  eject: { positionals: 1, options: [] },
-  uninstall: { positionals: 1, options: [] },
+  eject: { positionals: 1, options: ["operation-id"] },
+  uninstall: { positionals: 1, options: ["operation-id"] },
 };
 
 function required(value: string | undefined, option: string): string {
@@ -132,7 +133,7 @@ async function main(): Promise<void> {
       profile: { type: "string" },
       language: { type: "string" },
       cache: { type: "string" },
-      codex: { type: "boolean" },
+      adapter: { type: "string" },
       environment: { type: "string" },
       check: { type: "boolean" },
       "dry-run": { type: "boolean" },
@@ -166,6 +167,10 @@ async function main(): Promise<void> {
 
   const root = process.cwd();
   const receiptId = values["execution-receipt"];
+  const cliAuthorization = {
+    actor: { type: "system" as const, identifier: "system-design-team-cli" },
+    authorizationSource: "cli_invocation",
+  };
   let result: unknown;
   switch (command) {
     case "init":
@@ -175,7 +180,7 @@ async function main(): Promise<void> {
         mode: ProjectModeSchema.parse(required(values.mode, "--mode").replace("-", "_")),
         profile: ProjectProfileSchema.parse(required(values.profile, "--profile")),
         language: values.language,
-        adapter: "codex",
+        adapter: values.adapter ? AdapterIdSchema.parse(values.adapter) : undefined,
         cache: CacheProviderSchema.parse(values.cache ?? "none"),
       });
       break;
@@ -185,9 +190,9 @@ async function main(): Promise<void> {
         name: required(values.name, "--name"),
         profile: ProjectProfileSchema.parse(required(values.profile, "--profile")),
         language: values.language,
-        adapter: "codex",
+        adapter: values.adapter ? AdapterIdSchema.parse(values.adapter) : undefined,
         cache: CacheProviderSchema.parse(values.cache ?? "none"),
-      });
+      }, required(values["operation-id"], "--operation-id"), cliAuthorization);
       break;
     case "inspect":
       result = await inspectProject(root, { environment: values.environment });
@@ -309,10 +314,18 @@ async function main(): Promise<void> {
       result = await planUpgrade(root, values.check ? "check" : "dry-run");
       break;
     case "eject":
-      result = await ejectProject(root);
+      result = await ejectProject(
+        root,
+        required(values["operation-id"], "--operation-id"),
+        cliAuthorization,
+      );
       break;
     case "uninstall":
-      result = await uninstallProject(root);
+      result = await uninstallProject(
+        root,
+        required(values["operation-id"], "--operation-id"),
+        cliAuthorization,
+      );
       break;
     default:
       throw new Error(`Unknown command: ${command}`);

@@ -67,6 +67,10 @@ const adapterWithStatus = (status) => ({
 });
 const pluginAdapter = adapterWithStatus("available");
 const unavailablePluginAdapter = adapterWithStatus("unknown");
+const lifecycleAuthorization = {
+  actor: { type: "human", identifier: "project-owner" },
+  authorizationSource: "test_authorization",
+};
 const startPhase = (root, phase, operationId, adapter = pluginAdapter) =>
   startPhaseWithAdapter(root, phase, operationId, adapter);
 const reviewPhase = (root, phase, reviewer, verdict, operationId, adapter = pluginAdapter) =>
@@ -260,13 +264,74 @@ test("adopt inventories an existing repository without mutating source", async (
     id: "existing-system",
     name: "Existing System",
     profile: "standard",
-  });
+  }, "ADOPT-INVENTORY", lifecycleAuthorization);
 
   assert.equal(adopted.project.project.mode, "existing_system");
   assert.deepEqual(adopted.inventory.languages, ["TypeScript"]);
   assert.equal(adopted.inventory.git.tracked_files, 2);
   assert.equal(await readFile(join(root, "src/application.ts"), "utf8"), before);
   assert.deepEqual(await readYaml(root, ".agent-team/inventory.yaml"), adopted.inventory);
+  const audit = (await readFile(join(root, ".agent-team/audit/events.jsonl"), "utf8"))
+    .trim().split(/\r?\n/).map(JSON.parse);
+  assert(audit.some(({ action, actor, authorization_source }) =>
+    action === "adopt"
+    && actor.identifier === "project-owner"
+    && authorization_source === "test_authorization"));
+});
+
+test("mutating project lifecycle APIs require caller operation ids", async () => {
+  const adoptRoot = await temporaryGitRepository();
+  await assert.rejects(() => adoptProject(adoptRoot, {
+    id: "missing-adopt-operation",
+    name: "Missing Adopt Operation",
+    profile: "standard",
+  }, "", lifecycleAuthorization), /OPERATION_ID_REQUIRED/);
+  await assert.rejects(() => access(join(adoptRoot, ".agent-team")), { code: "ENOENT" });
+
+  const root = await temporaryGitRepository();
+  await initProject(root, {
+    id: "missing-lifecycle-operation",
+    name: "Missing Lifecycle Operation",
+    mode: "greenfield",
+    profile: "standard",
+  });
+  await assert.rejects(() => ejectProject(root, "", lifecycleAuthorization), /OPERATION_ID_REQUIRED/);
+  await assert.rejects(() => uninstallProject(root, "", lifecycleAuthorization), /OPERATION_ID_REQUIRED/);
+});
+
+test("adopt replay is idempotent and binds the operation id to its request", async () => {
+  const root = await temporaryGitRepository();
+  await writeFile(join(root, "source.ts"), "export {};\n");
+  await execFileAsync("git", ["add", "source.ts"], { cwd: root });
+  const options = { id: "adopt-replay", name: "Adopt Replay", profile: "standard" };
+
+  const first = await adoptProject(root, options, "ADOPT-REPLAY", lifecycleAuthorization);
+  assert.deepEqual(await adoptProject(root, options, "ADOPT-REPLAY", lifecycleAuthorization), first);
+  await assert.rejects(
+    () => adoptProject(root, { ...options, name: "Changed Name" }, "ADOPT-REPLAY", lifecycleAuthorization),
+    /OPERATION_ID_CONFLICT/,
+  );
+});
+
+test("adopt bootstrap is one recoverable transaction under fault injection", async () => {
+  const root = await temporaryGitRepository();
+  await writeFile(join(root, "source.ts"), "export {};\n");
+  await execFileAsync("git", ["add", "source.ts"], { cwd: root });
+  const options = { id: "adopt-fault", name: "Adopt Fault", profile: "standard" };
+
+  await assert.rejects(() => adoptProject(
+    root,
+    options,
+    "ADOPT-FAULT",
+    lifecycleAuthorization,
+    { transactionFault: (point) => { if (point === "before_audit_append") throw new Error("adopt fault"); } },
+  ), /adopt fault/);
+  await assert.rejects(() => access(join(root, ".agent-team")), { code: "ENOENT" });
+
+  const adopted = await adoptProject(root, options, "ADOPT-FAULT", lifecycleAuthorization);
+  assert.equal(adopted.project.project.id, "adopt-fault");
+  await access(join(root, ".agent-team/inventory.yaml"));
+  await access(join(root, ".agent-team/installation-manifest.yaml"));
 });
 
 test("inspect reports dirty and detached Git state", async () => {
@@ -291,7 +356,7 @@ test("adopt requires Git and leaves a non-repository untouched", async () => {
     id: "no-git",
     name: "No Git",
     profile: "standard",
-  }), /GIT_REQUIRED/);
+  }, "ADOPT-NO-GIT", lifecycleAuthorization), /GIT_REQUIRED/);
   assert.equal(await readFile(join(root, "source.txt"), "utf8"), "keep\n");
   await assert.rejects(() => access(join(root, ".agent-team")), { code: "ENOENT" });
 });
@@ -326,6 +391,23 @@ test("upgrade check and dry-run preserve overrides and approved content", async 
   await assert.rejects(() => access(join(root, ".agent-team/overrides/upgrade/lead-orchestrator.md")), { code: "ENOENT" });
 });
 
+test("upgrade blocks an authoritative lock workflow mismatch", async () => {
+  const root = await temporaryGitRepository();
+  await initProject(root, {
+    id: "lock-mismatch",
+    name: "Lock Mismatch",
+    mode: "greenfield",
+    profile: "standard",
+  });
+  const lock = await readYaml(root, ".agent-team/framework-lock.yaml");
+  lock.workflow.version = "0.0.0";
+  await ProjectStore.open(root).writeYamlAtomic(".agent-team/framework-lock.yaml", lock);
+
+  const result = await planUpgrade(root, "check");
+  assert.equal(result.status, "blocked");
+  assert(result.conflicts.some(({ path }) => path === ".agent-team/framework-lock.yaml"));
+});
+
 test("eject materializes project-owned overrides and disables upgrades", async () => {
   const root = await temporaryGitRepository();
   await initProject(root, {
@@ -335,7 +417,7 @@ test("eject materializes project-owned overrides and disables upgrades", async (
     profile: "standard",
   });
 
-  const result = await ejectProject(root);
+  const result = await ejectProject(root, "EJECT-1", lifecycleAuthorization);
   const project = await readYaml(root, ".agent-team/project.yaml");
   assert.equal(project.framework.management, "ejected");
   assert.deepEqual(result.materialized, [
@@ -345,6 +427,89 @@ test("eject materializes project-owned overrides and disables upgrades", async (
   assert.equal((await readYaml(root, ".agent-team/overrides/workflow.yaml")).mode, "greenfield");
   assert(Array.isArray(await readYaml(root, ".agent-team/overrides/agents.yaml")));
   assert.equal((await planUpgrade(root, "check")).status, "ejected");
+  assert.deepEqual(await ejectProject(root, "EJECT-1", lifecycleAuthorization), result);
+  await assert.rejects(
+    () => ejectProject(root, "EJECT-1", { ...lifecycleAuthorization, authorizationSource: "changed" }),
+    /OPERATION_ID_CONFLICT/,
+  );
+});
+
+test("ejected agent catalogue is authoritative for start, review, and doctor", async () => {
+  const root = await temporaryGitRepository();
+  await initProject(root, {
+    id: "catalogue-authority",
+    name: "Catalogue Authority",
+    mode: "greenfield",
+    profile: "standard",
+  });
+  await ejectProject(root, "EJECT-CATALOGUE", lifecycleAuthorization);
+  const store = ProjectStore.open(root);
+  const catalogue = await readYaml(root, ".agent-team/overrides/agents.yaml");
+  catalogue.find(({ id }) => id === "lead-orchestrator").required_plugins = [];
+  catalogue.find(({ id }) => id === "documentation-reviewer").required_plugins = [];
+  await store.writeYamlAtomic(".agent-team/overrides/agents.yaml", catalogue);
+
+  await startPhaseWithAdapter(root, "intake", "EJECTED-START", unavailablePluginAdapter);
+  await setArtifactStatus(root, "PROJECT-CHARTER");
+  await validatePhase(root, "intake", "EJECTED-VALIDATE");
+  const reviewed = await reviewPhaseWithAdapter(
+    root, "intake", "documentation-reviewer", "approved", "EJECTED-REVIEW",
+    unavailablePluginAdapter,
+  );
+  assert.equal(reviewed.phases.intake.status, "awaiting_approval");
+
+  await store.writeYamlAtomic(
+    ".agent-team/overrides/agents.yaml",
+    catalogue.filter(({ id }) => id !== "documentation-reviewer"),
+  );
+  const plugins = (await doctor(root)).checks.find(({ name }) => name === "plugins");
+  assert.equal(plugins.ok, false);
+  assert.match(plugins.detail, /documentation-reviewer:AGENT_NOT_CONFIGURED/);
+});
+
+test("init records exact generated ownership and uninstall preserves non-owned paths", async () => {
+  const root = await temporaryGitRepository();
+  await mkdir(join(root, ".codex/agents"), { recursive: true });
+  await writeFile(join(root, ".codex/user.txt"), "user-owned\n");
+  await initProject(root, {
+    id: "manifest-uninstall",
+    name: "Manifest Uninstall",
+    mode: "greenfield",
+    profile: "standard",
+  });
+  const manifest = await readYaml(root, ".agent-team/installation-manifest.yaml");
+  const generated = manifest.files.filter(({ role }) => role === "generated_adapter");
+  assert(generated.every(({ checksum }) => /^sha256:[a-f0-9]{64}$/.test(checksum)));
+  assert(generated.some(({ path }) => path === ".codex/generated/.gitkeep"));
+  assert(!manifest.directories_created.includes(".codex/agents"));
+  const modified = generated.find(({ path }) => path.includes("lead-orchestrator"));
+  await writeFile(join(root, modified.path), "local override\n");
+  await writeFile(join(root, ".codex/agents/user.md"), "user-owned\n");
+
+  const result = await uninstallProject(root, "UNINSTALL-MANIFEST", lifecycleAuthorization);
+  assert(!result.removed.includes(modified.path));
+  assert.equal(await readFile(join(root, modified.path), "utf8"), "local override\n");
+  assert.equal(await readFile(join(root, ".codex/agents/user.md"), "utf8"), "user-owned\n");
+  assert.equal(await readFile(join(root, ".codex/user.txt"), "utf8"), "user-owned\n");
+  await assert.rejects(() => access(join(root, ".codex/generated/.gitkeep")), { code: "ENOENT" });
+  await access(join(root, ".codex/agents"));
+
+  const preservedRoot = await temporaryGitRepository();
+  await mkdir(join(preservedRoot, ".codex/generated"), { recursive: true });
+  await mkdir(join(preservedRoot, ".codex/agents"), { recursive: true });
+  await writeFile(join(preservedRoot, ".codex/generated/.gitkeep"), "");
+  await initProject(preservedRoot, {
+    id: "preexisting-manifest",
+    name: "Preexisting Manifest",
+    mode: "greenfield",
+    profile: "standard",
+  });
+  const preservedManifest = await readYaml(preservedRoot, ".agent-team/installation-manifest.yaml");
+  assert(!preservedManifest.files.some(({ path }) => path === ".codex/generated/.gitkeep"));
+  assert(!preservedManifest.directories_created.includes(".codex/generated"));
+  await uninstallProject(preservedRoot, "UNINSTALL-PREEXISTING", lifecycleAuthorization);
+  await access(join(preservedRoot, ".codex/generated/.gitkeep"));
+  await access(join(preservedRoot, ".codex/generated"));
 });
 
 test("uninstall removes generated adapter files and preserves project memory", async () => {
@@ -359,7 +524,7 @@ test("uninstall removes generated adapter files and preserves project memory", a
   });
   const approvalsBefore = await readFile(join(root, ".agent-team/approvals.yaml"), "utf8");
 
-  const result = await uninstallProject(root);
+  const result = await uninstallProject(root, "UNINSTALL-1", lifecycleAuthorization);
   assert.deepEqual(result.preserved, [".agent-team"]);
   assert.equal(await readFile(join(root, ".codex/keep.txt"), "utf8"), "user-owned\n");
   assert.equal(await readFile(join(root, ".agent-team/approvals.yaml"), "utf8"), approvalsBefore);
@@ -367,7 +532,13 @@ test("uninstall removes generated adapter files and preserves project memory", a
   await assert.rejects(() => access(join(root, ".codex/agents/lead-orchestrator.md")), { code: "ENOENT" });
   const audit = (await readFile(join(root, ".agent-team/audit/events.jsonl"), "utf8"))
     .trim().split(/\r?\n/).map(JSON.parse);
-  assert(audit.some(({ action, result }) => action === "uninstall" && result === "success"));
+  assert(audit.some(({ action, authorization_source, result }) =>
+    action === "uninstall" && authorization_source === "test_authorization" && result === "success"));
+  assert.deepEqual(await uninstallProject(root, "UNINSTALL-1", lifecycleAuthorization), result);
+  await assert.rejects(
+    () => uninstallProject(root, "UNINSTALL-1", { ...lifecycleAuthorization, authorizationSource: "changed" }),
+    /OPERATION_ID_CONFLICT/,
+  );
 });
 
 test("uninstall does not follow a generated-path link outside the project", async (t) => {
@@ -386,10 +557,92 @@ test("uninstall does not follow a generated-path link outside the project", asyn
   await rm(join(root, ".codex/agents"), { recursive: true });
   await symlink(outside, join(root, ".codex/agents"), "junction");
 
-  const result = await uninstallProject(root);
+  const result = await uninstallProject(root, "UNINSTALL-LINK", lifecycleAuthorization);
 
   assert(!result.removed.includes(".codex/agents/lead-orchestrator.md"));
   assert.equal(await readFile(outsideFile, "utf8"), await readFile(generated, "utf8"));
+});
+
+test("uninstall never deletes before its durable plan and started audit", async () => {
+  const root = await temporaryGitRepository();
+  await initProject(root, {
+    id: "uninstall-plan-failure",
+    name: "Uninstall Plan Failure",
+    mode: "greenfield",
+    profile: "standard",
+  });
+  const generated = join(root, ".codex/agents/lead-orchestrator.md");
+  await mkdir(join(root, ".agent-team/uninstall-plan.yaml"));
+
+  await assert.rejects(
+    () => uninstallProject(root, "UNINSTALL-PLAN-FAIL", lifecycleAuthorization),
+  );
+  await access(generated);
+  const audit = (await readFile(join(root, ".agent-team/audit/events.jsonl"), "utf8"))
+    .trim().split(/\r?\n/).map(JSON.parse);
+  assert(!audit.some(({ action }) => action === "uninstall-started"));
+});
+
+test("uninstall does not delete when the started audit append fails", async () => {
+  const root = await temporaryGitRepository();
+  await initProject(root, {
+    id: "uninstall-audit-failure",
+    name: "Uninstall Audit Failure",
+    mode: "greenfield",
+    profile: "standard",
+  });
+  const generated = join(root, ".codex/agents/lead-orchestrator.md");
+
+  await assert.rejects(() => uninstallProject(
+    root,
+    "UNINSTALL-AUDIT-FAIL",
+    lifecycleAuthorization,
+    { transactionFault: (point) => { if (point === "before_audit_append") throw new Error("audit fault"); } },
+  ), /audit fault/);
+  await access(generated);
+  const audit = (await readFile(join(root, ".agent-team/audit/events.jsonl"), "utf8"))
+    .trim().split(/\r?\n/).map(JSON.parse);
+  assert(!audit.some(({ action }) => action === "uninstall-started"));
+
+  const resumed = await uninstallProject(root, "UNINSTALL-AUDIT-FAIL", lifecycleAuthorization);
+  assert(resumed.removed.includes(".codex/agents/lead-orchestrator.md"));
+});
+
+test("uninstall resumes a durably planned operation after a mid-delete failure", async () => {
+  const root = await temporaryGitRepository();
+  await initProject(root, {
+    id: "uninstall-resume",
+    name: "Uninstall Resume",
+    mode: "greenfield",
+    profile: "standard",
+  });
+  const manifest = await readYaml(root, ".agent-team/installation-manifest.yaml");
+  const planned = manifest.files.filter(({ role }) => role === "generated_adapter")
+    .sort((left, right) => left.path.localeCompare(right.path));
+  const first = planned[0];
+  const blocked = planned[1];
+  const blockedPath = join(root, blocked.path);
+  const blockedContent = await readFile(blockedPath, "utf8");
+  await rm(blockedPath);
+  await mkdir(blockedPath);
+
+  await assert.rejects(
+    () => uninstallProject(root, "UNINSTALL-RESUME", lifecycleAuthorization),
+  );
+  await assert.rejects(() => access(join(root, first.path)), { code: "ENOENT" });
+  const started = await readYaml(root, ".agent-team/uninstall-plan.yaml");
+  assert.equal(started.status, "started");
+  const startedAudit = (await readFile(join(root, ".agent-team/audit/events.jsonl"), "utf8"))
+    .trim().split(/\r?\n/).map(JSON.parse);
+  assert(startedAudit.some(({ action }) => action === "uninstall-started"));
+  assert(!startedAudit.some(({ action }) => action === "uninstall"));
+
+  await rm(blockedPath, { recursive: true });
+  await writeFile(blockedPath, blockedContent);
+  const completed = await uninstallProject(root, "UNINSTALL-RESUME", lifecycleAuthorization);
+  assert.equal((await readYaml(root, ".agent-team/uninstall-plan.yaml")).status, "completed");
+  assert(completed.removed.includes(first.path));
+  assert(completed.removed.includes(blocked.path));
 });
 
 test("lifecycle audit records carry authorization and artifact context", async () => {
@@ -1205,6 +1458,9 @@ test("CLI help lists the first-slice commands", async () => {
   }
   assert.match(stdout, /review <phase> --reviewer <id> --verdict <approved\|revision_required> --operation-id <id>/);
   assert.match(stdout, /repair --locks --yes/);
+  assert.match(stdout, /adopt .*--operation-id <id>/);
+  assert.match(stdout, /eject --operation-id <id>/);
+  assert.match(stdout, /uninstall --operation-id <id>/);
 
   const root = await temporaryGitRepository();
   await execFileAsync(process.execPath, [
@@ -1216,7 +1472,7 @@ test("CLI help lists the first-slice commands", async () => {
     "--profile", "standard",
     "--language", "en",
     "--cache", "none",
-    "--codex",
+    "--adapter", "codex",
   ], { cwd: root });
   const status = JSON.parse((await execFileAsync(process.execPath, [bin, "status"], { cwd: root })).stdout);
   assert.equal(status.project.id, "leave-system");
@@ -1281,9 +1537,17 @@ test("CLI help lists the first-slice commands", async () => {
   );
   assert.equal(reviewed.phases.intake.status, "awaiting_approval");
 
-  assert.equal(JSON.parse((await execFileAsync(process.execPath, [bin, "eject"], { cwd: root })).stdout).status, "ejected");
+  assert.equal(JSON.parse((await execFileAsync(
+    process.execPath,
+    [bin, "eject", "--operation-id", "CLI-EJECT"],
+    { cwd: root },
+  )).stdout).status, "ejected");
   assert.deepEqual(
-    JSON.parse((await execFileAsync(process.execPath, [bin, "uninstall"], { cwd: root })).stdout).preserved,
+    JSON.parse((await execFileAsync(
+      process.execPath,
+      [bin, "uninstall", "--operation-id", "CLI-UNINSTALL"],
+      { cwd: root },
+    )).stdout).preserved,
     [".agent-team"],
   );
 
@@ -1296,6 +1560,46 @@ test("CLI help lists the first-slice commands", async () => {
     "--id", "adopted-system",
     "--name", "Adopted System",
     "--profile", "standard",
+    "--operation-id", "CLI-ADOPT",
+    "--adapter", "codex",
   ], { cwd: adoptedRoot })).stdout);
   assert.equal(adopted.project.project.mode, "existing_system");
+
+  const badAdapterRoot = await temporaryGitRepository();
+  await assert.rejects(
+    () => execFileAsync(process.execPath, [
+      bin, "init", "--id", "bad-adapter", "--name", "Bad Adapter",
+      "--mode", "greenfield", "--profile", "standard", "--adapter", "other",
+    ], { cwd: badAdapterRoot }),
+    /Invalid option|Invalid input|codex/,
+  );
+  await assert.rejects(
+    () => execFileAsync(process.execPath, [bin, "eject"], { cwd: root }),
+    /--operation-id is required/,
+  );
+  await assert.rejects(
+    () => execFileAsync(process.execPath, [bin, "uninstall"], { cwd: root }),
+    /--operation-id is required/,
+  );
+  const missingAdoptOperationRoot = await temporaryGitRepository();
+  await assert.rejects(
+    () => execFileAsync(process.execPath, [
+      bin, "adopt", "--id", "missing-operation", "--name", "Missing Operation", "--profile", "standard",
+    ], { cwd: missingAdoptOperationRoot }),
+    /--operation-id is required/,
+  );
+  const removedCodexFlagRoot = await temporaryGitRepository();
+  await assert.rejects(
+    () => execFileAsync(process.execPath, [
+      bin, "init", "--id", "removed-codex", "--name", "Removed Codex",
+      "--mode", "greenfield", "--profile", "standard", "--codex",
+    ], { cwd: removedCodexFlagRoot }),
+    /Unknown option '--codex'/,
+  );
+  const lifecycleAudit = (await readFile(join(root, ".agent-team/audit/events.jsonl"), "utf8"))
+    .trim().split(/\r?\n/).map(JSON.parse);
+  assert(lifecycleAudit.some(({ action, actor, authorization_source }) =>
+    action === "eject"
+    && actor.identifier === "system-design-team-cli"
+    && authorization_source === "cli_invocation"));
 });
