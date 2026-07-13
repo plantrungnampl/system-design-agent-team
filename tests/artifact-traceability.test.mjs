@@ -97,6 +97,11 @@ test("rejects unsupported completion claims even with filler but accepts concret
     "All tests passed.\nExit code: 0",
     "Everything passed.\nArtifact:",
     "Everything passed.\nReceipt: unknown",
+    "Everything passed.\nReceipt: NONE",
+    "Everything passed.\nReceipt: null",
+    "Everything passed.\nReceipt: pending",
+    "Everything passed.\nReceipt: this is evidence",
+    "Everything passed.\nReceipt: receipt-review",
     "Everything passed.\nArtifact: none",
     "Everything passed.\nPath: n/a",
     "Everything passed.\nCommand: run tests\nResult: ok",
@@ -105,6 +110,11 @@ test("rejects unsupported completion claims even with filler but accepts concret
     "Everything passed.\nPath: C:/secret.txt",
     "Everything passed.\nPath: /etc/secret.txt",
     "Everything passed.\nPath: summary.md",
+    "Everything passed.\nPath: C:\\secret.txt",
+    "Everything passed.\nPath: \\\\server\\share\\secret.txt",
+    "Everything passed.\nPath: requirements\\..\\secret.txt",
+    "Everything passed.\nPath: requirements\\.\\srs.md",
+    "Everything passed.\nPath: requirements\\\\srs.md",
   ]) {
     const result = validateReviewReadyArtifact(`---\nstatus: approved\n---\n# Summary\n${claim}`);
     assert.equal(result.valid, false, claim);
@@ -127,12 +137,31 @@ status: approved
 Everything passed.
 Receipt: RECEIPT-REVIEW-123`), { valid: true, findings: [] });
 
+  for (const receipt of [
+    "EXEC-REVIEW-requirements-1",
+    "019c6e27-e55b-73d1-87d8-4e01f1f75043",
+  ]) {
+    assert.deepEqual(validateReviewReadyArtifact(`---
+status: approved
+---
+# Review summary
+Everything passed.
+Receipt: ${receipt}`), { valid: true, findings: [] });
+  }
+
   assert.deepEqual(validateReviewReadyArtifact(`---
 status: approved
 ---
 # Review summary
 Everything passed.
 Artifact: requirements/srs.md`), { valid: true, findings: [] });
+
+  assert.deepEqual(validateReviewReadyArtifact(`---
+status: approved
+---
+# Review summary
+Everything passed.
+Path: requirements\\srs.md`), { valid: true, findings: [] });
 
   assert.deepEqual(validateReviewReadyArtifact(`---
 status: approved

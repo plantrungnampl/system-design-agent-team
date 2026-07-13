@@ -25,7 +25,9 @@ const prohibitedPlaceholders = [
   ["TODO", /^[ \t]*(?:(?:#{1,6}|[-*+]|\d+[.)])(?:[ \t]+\[[ x]\])?[ \t]+)?TODO(?:[ \t]*:[^\r\n]*)?[ \t]*$/im],
   ["To be defined later", /^[ \t]*(?:(?:#{1,6}|[-*+]|\d+[.)])(?:[ \t]+\[[ x]\])?[ \t]+)?to be defined later(?:[ \t]*:[^\r\n]*)?[ \t]*$/im],
 ] as const;
-const reservedEvidenceValues = new Set(["unknown", "none", "n/a", "na", "tbd", "todo"]);
+const reservedEvidenceValues = new Set([
+  "unknown", "none", "null", "n/a", "na", "pending", "tbd", "todo",
+]);
 
 function evidenceValue(line: string, label: string) {
   const match = new RegExp(`^${label}:\\s*(.+)$`, "i").exec(line);
@@ -35,11 +37,21 @@ function evidenceValue(line: string, label: string) {
 }
 
 function isProjectRelativeFile(value: string) {
-  if (value.includes("\\") || value.startsWith("/") || /^[a-z]:/i.test(value)) return false;
-  const segments = value.split("/");
+  if (value.startsWith("/") || /^\\\\/.test(value) || /^[a-z]:[\\/]/i.test(value)) return false;
+  const segments = value.replaceAll("\\", "/").split("/");
   return segments.length >= 2
     && segments.every((segment) => segment !== "." && segment !== ".." && /^[a-z0-9._-]+$/i.test(segment))
     && /^[a-z0-9_-]+\.[a-z0-9._-]+$/i.test(segments.at(-1)!);
+}
+
+function isReceiptIdentifier(value: string) {
+  if (value.length < 8 || /\s/.test(value)) return false;
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value)) {
+    return true;
+  }
+  if (!/^[a-z0-9.]+(?:[-_:][a-z0-9.]+)+$/i.test(value)) return false;
+  const parts = value.split(/[-_:]/);
+  return parts.length >= 3 || /\d/.test(value);
 }
 
 function boundedFrontMatter(text: string): { yaml: string; body: string } | undefined {
@@ -92,7 +104,7 @@ export function validateReviewReadyArtifact(text: string): ArtifactValidation {
   const hasCommand = substantive.some((line) => evidenceValue(line, "command") !== undefined);
   const hasSuccessfulExit = substantive.some((line) => /^exit code:\s*0$/i.test(line));
   const hasReceipt = substantive.some((line) =>
-    /^RECEIPT-(?:[A-Z0-9]+-)+[A-Z0-9]+$/i.test(evidenceValue(line, "receipt") ?? ""));
+    isReceiptIdentifier(evidenceValue(line, "receipt") ?? ""));
   const hasProjectFile = substantive.some((line) => {
     const value = evidenceValue(line, "(?:artifact|path)");
     return value !== undefined && isProjectRelativeFile(value);
