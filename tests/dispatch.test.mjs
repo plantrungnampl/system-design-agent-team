@@ -528,14 +528,15 @@ test("prepareExecution blocks code write without authoritative G6 approval", asy
   }), /G6_APPROVAL_REQUIRED/);
 });
 
-test("prepareExecution blocks production impact without authoritative G8 safety evidence", async () => {
+test("execute blocks production impact without authoritative G8 safety evidence", async () => {
   const adapter = new ManualCodexAdapter(async () => emptyEvidenceContext);
-  await assert.rejects(() => adapter.prepareExecution({
+  const prepared = await adapter.prepareExecution({
     ...dispatch,
     permission_profile: "production_execution",
     command_class: "production_impact",
     execution_evidence: { gate_approvals: [] },
-  }), /G8_APPROVAL_REQUIRED/);
+  });
+  await assert.rejects(() => adapter.execute(prepared), /G8_APPROVAL_REQUIRED/);
 });
 
 test("mutating the public handle cannot bypass adapter-owned digest binding", async () => {
@@ -564,11 +565,11 @@ test("collectResult rejects destructive work downcast to non-destructive", async
   });
   const artifacts = ["BACKUP", "DRY-RUN", "ROLLBACK"].map((id) => ({
     id,
-    path: `${id.toLowerCase()}.md`,
+    path: `release/${id.toLowerCase()}.md`,
     version: 1,
     status: "approved",
-    owner: "developer",
-    reviewer: "reviewer",
+    owner: "devops-lead",
+    reviewer: "operations-reviewer",
     dependencies: [],
     consumers: [],
     required_gate: "G6",
@@ -591,10 +592,10 @@ test("collectResult rejects destructive work downcast to non-destructive", async
         artifact: { id, path, title: id },
       })),
     },
-    reviews: artifacts.map(({ id }) => ({
+    reviews: artifacts.map(({ id, reviewer }) => ({
       id: `REV-${id}`,
       phase: id.toLowerCase(),
-      reviewer: "reviewer",
+      reviewer,
       verdict: "approved",
       artifact_versions: { [id]: 1 },
       timestamp: "2026-07-13T00:00:00Z",
@@ -700,4 +701,76 @@ test("only a result collected by the same adapter can create an execution receip
     () => new ManualCodexAdapter().createExecutionReceipt(result),
     /EXECUTION_RESULT_NOT_COLLECTED/,
   );
+});
+
+test("only the preparing adapter can attest an immutable execution request", async () => {
+  const adapter = new ManualCodexAdapter(async () => emptyEvidenceContext);
+  const prepared = await adapter.prepareExecution({
+    ...dispatch,
+    permission_profile: "production_execution",
+    command_class: "production_impact",
+    execution_evidence: { gate_approvals: [] },
+  });
+
+  const request = adapter.createPreparedExecutionRequest(prepared);
+  assert.equal(request.authorization.execution_id, dispatch.execution_id);
+  assert.equal(request.authorization.dispatch_digest, prepared.digest);
+  assert.throws(
+    () => new ManualCodexAdapter().createPreparedExecutionRequest(prepared),
+    /PREPARED_EXECUTION_INVALID/,
+  );
+});
+
+test("exact G8 request authorization passes execute and a mismatched request fails", async () => {
+  const artifact = {
+    id: "DEPLOYMENT-PLAN", path: "release/deployment-plan.md", type: "document", version: 1,
+    status: "approved", owner: "devops-lead", reviewer: "operations-reviewer",
+    dependencies: [], consumers: [], required_gate: "G8", checksum: `sha256:${"a".repeat(64)}`,
+  };
+  const context = {
+    artifacts: [artifact],
+    reviews: [{
+      id: "REV-DEPLOY", phase: "deployment", reviewer: "operations-reviewer", verdict: "approved",
+      artifact_versions: { "DEPLOYMENT-PLAN": 1 }, timestamp: "2026-07-13T00:00:00Z",
+    }],
+    approvals: [],
+    verified_checksums: { "DEPLOYMENT-PLAN": artifact.checksum },
+    workflow: {
+      id: "release", version: "1.0.0", mode: "greenfield",
+      phases: [{
+        id: "deployment", owner: "devops-lead", reviewer: "operations-reviewer", gate: "G8",
+        depends_on: [], required_plugins: [],
+        artifact: { id: artifact.id, path: artifact.path, title: "Deployment Plan" },
+      }],
+    },
+  };
+  const reference = {
+    artifact_id: artifact.id, version: 1, status: "approved",
+    review_id: "REV-DEPLOY",
+  };
+  const adapter = new ManualCodexAdapter(async () => context);
+  const makeDispatch = (execution_id) => ({
+    ...dispatch,
+    execution_id,
+    permission_profile: "production_execution",
+    command_class: "production_impact",
+    execution_evidence: {
+      gate_approvals: [],
+      backup: reference,
+      rollback: reference,
+    },
+  });
+  const prepared = await adapter.prepareExecution(makeDispatch("EXEC-G8-EXACT"));
+  const request = adapter.createPreparedExecutionRequest(prepared);
+  context.approvals.push({
+    id: "APR-G8-EXEC", gate: "G8", decision: "approved",
+    approved_by: { type: "human", identifier: "owner" },
+    artifact_versions: { "DEPLOYMENT-PLAN": 1 },
+    execution_authorization: request.authorization,
+    timestamp: "2026-07-13T00:00:00Z",
+  });
+  assert.equal((await adapter.execute(prepared)).status, "awaiting_runtime");
+
+  const mismatched = await adapter.prepareExecution(makeDispatch("EXEC-G8-OTHER"));
+  await assert.rejects(() => adapter.execute(mismatched), /G8_APPROVAL_REQUIRED/);
 });

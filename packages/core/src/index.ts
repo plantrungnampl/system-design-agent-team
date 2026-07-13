@@ -297,6 +297,20 @@ export const ExecutionReceiptSchema = z.object({
 
 export const ExecutionReceiptListSchema = z.object({ receipts: z.array(ExecutionReceiptSchema) });
 
+export const PreparedExecutionRequestSchema = z.object({
+  id: z.string().min(1),
+  operation_id: z.string().min(1),
+  adapter_id: z.string().min(1),
+  action: z.string().min(1),
+  scope: AuthorizedPathsSchema,
+  authorization: ExecutionAuthorizationSchema,
+  evidence: ExecutionEvidenceSchema,
+  attestation_digest: Sha256DigestSchema,
+  recorded_at: z.string().datetime(),
+  audit_id: z.string().min(1),
+});
+export const PreparedExecutionRequestListSchema = z.object({ requests: z.array(PreparedExecutionRequestSchema) });
+
 export const PluginInvocationStatusSchema = z.enum(["success", "failure"]);
 
 const PluginInvocationResultFieldsSchema = z.object({
@@ -356,6 +370,10 @@ export const ApprovalRecordSchema = z.object({
   }),
   artifact_versions: z.record(z.string().min(1), z.number().int().positive()),
   execution_authorization: ExecutionAuthorizationSchema.optional(),
+  execution_request_id: z.string().min(1).optional(),
+  execution_request_digest: Sha256DigestSchema.optional(),
+  execution_receipt_id: z.string().min(1).optional(),
+  execution_receipt_digest: Sha256DigestSchema.optional(),
   timestamp: z.string().min(1),
 });
 
@@ -436,6 +454,8 @@ export const ReviewRecordSchema = z.object({
   reviewer: z.string().min(1),
   verdict: ReviewVerdictSchema,
   artifact_versions: z.record(z.string().min(1), z.number().int().positive()),
+  execution_receipt_id: z.string().min(1).optional(),
+  execution_receipt_digest: Sha256DigestSchema.optional(),
   timestamp: z.string().min(1),
 });
 
@@ -468,6 +488,8 @@ export const AuditEventSchema = z.object({
   artifact_versions: z.record(z.string().min(1), z.number().int().positive()),
   execution_receipt_id: z.string().min(1).optional(),
   execution_receipt_digest: Sha256DigestSchema.optional(),
+  execution_request_id: z.string().min(1).optional(),
+  execution_request_digest: Sha256DigestSchema.optional(),
   result: z.enum(["success", "failure"]),
   timestamp: z.string().datetime(),
 }).superRefine((event, context) => {
@@ -529,3 +551,5 @@ export type ExecutionCheckpoint = z.infer<typeof ExecutionCheckpointSchema>;
 export type AgentExecutionResult = z.infer<typeof AgentExecutionResultSchema>;
 export type ExecutionReceipt = z.infer<typeof ExecutionReceiptSchema>;
 export type ExecutionReceiptList = z.infer<typeof ExecutionReceiptListSchema>;
+export type PreparedExecutionRequest = z.infer<typeof PreparedExecutionRequestSchema>;
+export type PreparedExecutionRequestList = z.infer<typeof PreparedExecutionRequestListSchema>;

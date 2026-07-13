@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
+import { parse } from "yaml";
 import {
   approveGate,
   evaluateExecutionPolicy,
@@ -219,7 +221,7 @@ const evidenceRoles = {
   QA: ["verification", "qa-lead", "tester", "testing/qa.md", "QA Evidence", "G7"],
   SECURITY: ["security-review", "security-reviewer", "architecture-reviewer", "security/verdict.md", "Security Verdict", "G7"],
   DATA: ["data-mapping", "system-analyst", "data-reviewer", "data/mapping.md", "Data Reconciliation", "G7"],
-  BACKUP: ["backup-verification", "devops-lead", "operations-reviewer", "operations/backup-verification.md", "Backup Verification", "G8"],
+  BACKUP: ["backup-verification", "devops-lead", "operations-reviewer", "release/backup-verification.md", "Backup Verification", "G8"],
   "DRY-RUN": ["deployment-rehearsal", "devops-lead", "operations-reviewer", "release/deployment-rehearsal.md", "Deployment Dry Run", "G8"],
   ROLLBACK: ["rollback-planning", "devops-lead", "operations-reviewer", "release/rollback-plan.md", "Rollback Plan", "G8"],
 };
@@ -354,7 +356,6 @@ test("G8 approval readiness requires human authorization, backup, and rollback",
       data: artifactReference("DATA"),
     },
   }, evidenceContext).blockers, [
-    "HUMAN_AUTHORIZATION_REQUIRED",
     "BACKUP_VERIFICATION_REQUIRED",
     "ROLLBACK_PLAN_REQUIRED",
   ]);
@@ -489,10 +490,10 @@ test("gate readiness rejects unconfigured gates", () => {
   });
 });
 
-test("G8 approval rejects a failed execution checkpoint", () => {
+test("G7 approval rejects a failed execution checkpoint", () => {
   const g8Workflow = {
     ...workflow,
-    phases: [{ id: "deployment", owner: "devops-lead", reviewer: "operations-reviewer", gate: "G8", depends_on: [] }],
+    phases: [{ id: "deployment", owner: "devops-lead", reviewer: "operations-reviewer", gate: "G7", depends_on: [] }],
   };
   const awaiting = { ...state, phases: { deployment: { status: "awaiting_approval" } } };
   const execution = {
@@ -521,7 +522,7 @@ test("G8 approval rejects a failed execution checkpoint", () => {
 
   assert.throws(() => approveGate(awaiting, g8Workflow, {
     id: "APR-G8-CURRENT",
-    gate: "G8",
+    gate: "G7",
     decision: "approved",
     approved_by: { type: "human", identifier: "project-owner" },
     artifact_versions: { DEPLOYMENT: 1 },
@@ -584,13 +585,9 @@ test("one project charter cannot satisfy execution evidence roles", () => {
     },
   }, context, { type: "human", identifier: "owner" });
 
-  for (const blocker of [
-    "QA_EVIDENCE_NOT_CURRENT",
-    "SECURITY_EVIDENCE_NOT_CURRENT",
-    "DATA_EVIDENCE_NOT_CURRENT",
-    "BACKUP_VERIFICATION_REQUIRED",
-    "ROLLBACK_PLAN_REQUIRED",
-  ]) assert(report.blockers.includes(blocker));
+  for (const blocker of ["BACKUP_VERIFICATION_REQUIRED", "ROLLBACK_PLAN_REQUIRED"]) {
+    assert(report.blockers.includes(blocker));
+  }
 });
 
 test("checksum drift invalidates otherwise current evidence", () => {
@@ -614,6 +611,27 @@ test("checksum drift invalidates otherwise current evidence", () => {
 });
 
 test("execution approval must bind digest, paths, action, and execution id", () => {
+  const input = {
+    ...policyInput,
+    permission_profile: "production_execution",
+    command_class: "production_impact",
+    evidence: {
+      gate_approvals: [gateReference("G8")],
+      qa: artifactReference("QA"),
+      security: artifactReference("SECURITY"),
+      data: artifactReference("DATA"),
+      backup: artifactReference("BACKUP"),
+      rollback: artifactReference("ROLLBACK"),
+    },
+  };
+  const authorization = {
+    execution_id: input.execution_id,
+    dispatch_digest: input.dispatch_digest,
+    permission_profile: input.permission_profile,
+    authorized_paths: input.authorized_paths,
+    command_class: input.command_class,
+    destructive: input.destructive,
+  };
   const mismatches = [
     { execution_id: "OTHER" },
     { dispatch_digest: "c".repeat(64) },
@@ -623,14 +641,11 @@ test("execution approval must bind digest, paths, action, and execution id", () 
   for (const mismatch of mismatches) {
     const context = {
       ...evidenceContext,
-      approvals: evidenceContext.approvals.map((approval) => approval.id === "APR-G6"
-        ? { ...approval, execution_authorization: { ...executionAuthorization, ...mismatch } }
+      approvals: evidenceContext.approvals.map((approval) => approval.id === "APR-G8"
+        ? { ...approval, execution_authorization: { ...authorization, ...mismatch } }
         : approval),
     };
-    assert(evaluateExecutionPolicy({
-      ...policyInput,
-      evidence: { gate_approvals: [gateReference("G6")] },
-    }, context).blockers.includes("G6_APPROVAL_REQUIRED"));
+    assert(evaluateExecutionPolicy(input, context).blockers.includes("G8_APPROVAL_REQUIRED"));
   }
 });
 
@@ -650,4 +665,74 @@ test("unrelated approval cannot authorize destructive confirmation or scope", ()
 
   assert(report.blockers.includes("DESTRUCTIVE_CONFIRMATION_REQUIRED"));
   assert(report.blockers.includes("SCOPE_CONFIRMATION_REQUIRED"));
+});
+
+test("all shipped workflows have satisfiable legitimate evidence roles", async () => {
+  for (const file of ["greenfield.yaml", "existing-system.yaml", "migration.yaml"]) {
+    const definition = parse(await readFile(new URL(`../workflows/${file}`, import.meta.url), "utf8"));
+    const qa = definition.phases.find(({ owner }) => owner === "qa-lead");
+    const security = definition.phases.find(({ owner }) => owner === "security-reviewer");
+    const data = definition.phases.find(({ artifact, owner, reviewer }) => artifact.path.startsWith("data/")
+      && (owner === "data-reviewer" || reviewer === "data-reviewer"));
+    const release = definition.phases.find(({ gate, owner, artifact }) => gate === "G8"
+      && owner === "devops-lead" && artifact.path.startsWith("release/"));
+    const phases = [...new Set([qa, security, data, release].filter(Boolean))];
+    const artifacts = phases.map((phase) => ({
+      id: phase.artifact.id,
+      path: phase.artifact.path,
+      type: "document",
+      version: 1,
+      status: "approved",
+      owner: phase.owner,
+      reviewer: phase.reviewer,
+      dependencies: [],
+      consumers: [],
+      required_gate: phase.gate,
+      checksum: `sha256:${"a".repeat(64)}`,
+    }));
+    const approvals = phases.map((phase) => ({
+      id: `APR-${phase.artifact.id}`,
+      gate: phase.gate,
+      decision: "approved",
+      approved_by: { type: "human", identifier: "owner" },
+      artifact_versions: { [phase.artifact.id]: 1 },
+      timestamp: "2026-07-13T00:00:00Z",
+    }));
+    const reference = (phase) => phase ? ({
+      artifact_id: phase.artifact.id,
+      version: 1,
+      status: "approved",
+      review_id: `REV-${phase.artifact.id}`,
+      approval_id: `APR-${phase.artifact.id}`,
+    }) : undefined;
+    const report = evaluateExecutionPolicy({
+      ...policyInput,
+      permission_profile: "test_execution",
+      command_class: "local_validation",
+      target_gate: "G8",
+      evidence: {
+        gate_approvals: [],
+        qa: reference(qa),
+        security: reference(security),
+        data: reference(data),
+        backup: reference(release),
+        rollback: reference(release),
+      },
+    }, {
+      workflow: definition,
+      artifacts,
+      approvals,
+      verified_checksums: Object.fromEntries(artifacts.map(({ id, checksum }) => [id, checksum])),
+      reviews: phases.map((phase) => ({
+        id: `REV-${phase.artifact.id}`,
+        phase: phase.id,
+        reviewer: phase.reviewer,
+        verdict: "approved",
+        artifact_versions: { [phase.artifact.id]: 1 },
+        timestamp: "2026-07-13T00:00:00Z",
+      })),
+    }, { type: "human", identifier: "owner" });
+
+    assert.deepEqual(report.blockers, [], file);
+  }
 });

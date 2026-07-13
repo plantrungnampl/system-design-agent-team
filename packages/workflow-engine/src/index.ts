@@ -4,6 +4,7 @@ import type {
   ArtifactEvidenceReference,
   ExecutionEvidenceContext,
   ExecutionPolicyInput,
+  PreparedExecutionRequest,
   GateApprovalReference,
   GateId,
   PhaseStatus,
@@ -105,6 +106,7 @@ export function approveGate(
   approval: ApprovalRecord,
   execution?: AgentExecutionResult,
   evidenceContext?: ExecutionEvidenceContext,
+  executionRequest?: PreparedExecutionRequest,
 ): WorkflowState {
   if (state.completed_operations.includes(approval.id)) return state;
 
@@ -124,10 +126,20 @@ export function approveGate(
   if (approval.approved_by.identifier === definition.owner) {
     throw new Error("SELF_APPROVAL_FORBIDDEN");
   }
-  if (approval.gate === "G7" || approval.gate === "G8") {
+  if (approval.gate === "G7") {
     if (!execution) throw new Error("EXECUTION_EVIDENCE_REQUIRED");
     if (!evidenceContext) throw new Error("EXECUTION_EVIDENCE_CONTEXT_REQUIRED");
     const report = evaluateExecutionResult(execution, approval.gate, evidenceContext, approval.approved_by);
+    if (!report.allowed) throw new Error(report.blockers[0]);
+  }
+  if (approval.gate === "G8") {
+    if (!executionRequest) throw new Error("EXECUTION_REQUEST_REQUIRED");
+    if (!evidenceContext) throw new Error("EXECUTION_EVIDENCE_CONTEXT_REQUIRED");
+    const report = evaluateExecutionPolicy({
+      ...executionRequest.authorization,
+      evidence: executionRequest.evidence,
+      target_gate: "G8",
+    }, evidenceContext, approval.approved_by);
     if (!report.allowed) throw new Error(report.blockers[0]);
   }
   if (approval.decision !== "approved" && approval.decision !== "approved_with_conditions") {
@@ -170,19 +182,23 @@ function approvedGate(
   reference: GateApprovalReference | undefined,
   context: ExecutionEvidenceContext,
   policy: ExecutionPolicyInput,
+  expectedGate?: GateId,
 ): boolean {
-  if (!reference) return false;
-  return context.approvals.some((approval) => approval.id === reference.approval_id
-    && approval.gate === reference.gate
+  const gate = reference?.gate ?? expectedGate;
+  if (!gate) return false;
+  const exact = policy.permission_profile === "production_execution"
+    || policy.command_class === "production_impact" || policy.destructive;
+  return context.approvals.some((approval) => (!reference || approval.id === reference.approval_id)
+    && approval.gate === gate
     && (approval.decision === "approved" || approval.decision === "approved_with_conditions")
     && approval.approved_by.type === "human"
-    && approval.execution_authorization?.execution_id === policy.execution_id
-    && approval.execution_authorization.dispatch_digest === policy.dispatch_digest
-    && approval.execution_authorization.permission_profile === policy.permission_profile
-    && approval.execution_authorization.command_class === policy.command_class
-    && approval.execution_authorization.destructive === policy.destructive
-    && JSON.stringify(approval.execution_authorization.authorized_paths)
-      === JSON.stringify(policy.authorized_paths));
+    && (!exact || (approval.execution_authorization?.execution_id === policy.execution_id
+      && approval.execution_authorization.dispatch_digest === policy.dispatch_digest
+      && approval.execution_authorization.permission_profile === policy.permission_profile
+      && approval.execution_authorization.command_class === policy.command_class
+      && approval.execution_authorization.destructive === policy.destructive
+      && JSON.stringify(approval.execution_authorization.authorized_paths)
+        === JSON.stringify(policy.authorized_paths))));
 }
 
 type EvidenceRole = "qa" | "security" | "data" | "backup" | "dry_run" | "rollback";
@@ -199,9 +215,12 @@ function phaseMatchesRole(role: EvidenceRole, phase: WorkflowDefinition["phases"
     case "data": return phase.artifact.path.startsWith("data/")
       && (phase.owner === "data-reviewer" || phase.reviewer === "data-reviewer")
       && /data|reconciliation/.test(purpose);
-    case "backup": return /backup/.test(purpose);
-    case "dry_run": return /dry[- ]?run|rehearsal|parallel-validation|parallel validation/.test(purpose);
-    case "rollback": return /rollback|backout/.test(purpose);
+    case "backup": return phase.owner === "devops-lead" && phase.artifact.path.startsWith("release/")
+      && /release|deployment|cutover|backup/.test(purpose);
+    case "dry_run": return (phase.owner === "qa-lead" || phase.owner === "devops-lead")
+      && /test|validation|dry[- ]?run|rehearsal|parallel/.test(purpose);
+    case "rollback": return phase.owner === "devops-lead" && phase.artifact.path.startsWith("release/")
+      && /release|deployment|cutover|rollback|backout/.test(purpose);
   }
 }
 
@@ -210,11 +229,16 @@ function currentArtifact(
   role: EvidenceRole,
   context: ExecutionEvidenceContext,
 ): boolean {
-  if (!reference?.approval_id) return false;
+  if (!reference) return false;
   const artifact = context.artifacts.find(({ id }) => id === reference.artifact_id);
   const phase = context.workflow.phases.find(({ artifact: configured }) => configured.id === reference.artifact_id);
   const review = context.reviews.find(({ id }) => id === reference.review_id);
-  const approval = context.approvals.find(({ id }) => id === reference.approval_id);
+  const approval = context.approvals.find((candidate) =>
+    (!reference.approval_id || candidate.id === reference.approval_id)
+      && candidate.gate === phase?.gate
+      && candidate.artifact_versions[reference.artifact_id] === reference.version
+      && (candidate.decision === "approved" || candidate.decision === "approved_with_conditions")
+      && candidate.approved_by.type === "human");
   return artifact?.version === reference.version
     && artifact.status === reference.status
     && context.verified_checksums[artifact.id] === artifact.checksum
@@ -247,19 +271,20 @@ export function evaluateExecutionPolicy(
   const production = policy.permission_profile === "production_execution"
     || policy.command_class === "production_impact";
   const gate = (id: GateId) => policy.evidence.gate_approvals.find((reference) => reference.gate === id);
+  const hasRole = (role: EvidenceRole) => context.workflow.phases.some((phase) => phaseMatchesRole(role, phase));
 
   add(policy.permission_profile === "code_write"
     && !approvedGate(gate("G6"), context, policy), "G6_APPROVAL_REQUIRED");
   if (policy.target_gate === "G7" || policy.target_gate === "G8" || production) {
-    add(!currentArtifact(policy.evidence.qa, "qa", context), "QA_EVIDENCE_NOT_CURRENT");
-    add(!currentArtifact(policy.evidence.security, "security", context), "SECURITY_EVIDENCE_NOT_CURRENT");
-    add(!currentArtifact(policy.evidence.data, "data", context), "DATA_EVIDENCE_NOT_CURRENT");
+    add(hasRole("qa") && !currentArtifact(policy.evidence.qa, "qa", context), "QA_EVIDENCE_NOT_CURRENT");
+    add(hasRole("security") && !currentArtifact(policy.evidence.security, "security", context), "SECURITY_EVIDENCE_NOT_CURRENT");
+    add(hasRole("data") && !currentArtifact(policy.evidence.data, "data", context), "DATA_EVIDENCE_NOT_CURRENT");
   }
   if (production) {
-    add(!approvedGate(gate("G8"), context, policy), "G8_APPROVAL_REQUIRED");
+    add(!approvedGate(gate("G8"), context, policy, "G8"), "G8_APPROVAL_REQUIRED");
   }
   if (policy.target_gate === "G8" || production) {
-    add(production ? !approvedGate(gate("G8"), context, policy) : authorizingActor?.type !== "human",
+    add((production || policy.destructive) && !approvedGate(gate("G8"), context, policy, "G8"),
       "HUMAN_AUTHORIZATION_REQUIRED");
     add(!currentArtifact(policy.evidence.backup, "backup", context), "BACKUP_VERIFICATION_REQUIRED");
     add(!currentArtifact(policy.evidence.rollback, "rollback", context), "ROLLBACK_PLAN_REQUIRED");

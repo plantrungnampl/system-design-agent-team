@@ -40,7 +40,7 @@ Commands:
   start <phase> --operation-id <id>
   validate <phase> --operation-id <id>
   review <phase> --reviewer <id> --verdict <approved|revision_required> --operation-id <id> [--execution-receipt <id>]
-  approve <gate> --by <id> --operation-id <id> [--execution-receipt <id>]
+  approve <gate> --by <id> --operation-id <id> [--execution-receipt <id>] [--execution-request <id>]
   reject <gate> --by <id> --operation-id <id>
   handover <phase> --operation-id <id>
   artifact list
@@ -63,7 +63,7 @@ const commandShape: Record<string, { positionals: number; options: string[] }> =
   start: { positionals: 2, options: ["operation-id"] },
   validate: { positionals: 2, options: ["operation-id"] },
   review: { positionals: 2, options: ["reviewer", "verdict", "operation-id", "execution-receipt"] },
-  approve: { positionals: 2, options: ["by", "operation-id", "execution-receipt"] },
+  approve: { positionals: 2, options: ["by", "operation-id", "execution-receipt", "execution-request"] },
   reject: { positionals: 2, options: ["by", "operation-id"] },
   handover: { positionals: 2, options: ["operation-id"] },
   "artifact list": { positionals: 2, options: [] },
@@ -118,6 +118,7 @@ async function main(): Promise<void> {
       verdict: { type: "string" },
       "operation-id": { type: "string" },
       "execution-receipt": { type: "string" },
+      "execution-request": { type: "string" },
       artifacts: { type: "string" },
       reason: { type: "string" },
       impact: { type: "string" },
@@ -169,6 +170,7 @@ async function main(): Promise<void> {
         required(values.by, "--by"),
         required(values["operation-id"], "--operation-id"),
         receiptId,
+        values["execution-request"],
       );
       break;
     case "reject":

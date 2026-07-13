@@ -15,6 +15,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
 import {
+  approve,
   diagnostics,
   doctor,
   gateReadinessReport,
@@ -22,7 +23,9 @@ import {
   invokePlugin,
   issueList,
   loadExecutionReceipt,
+  loadExecutionRequest,
   recordExecutionReceipt,
+  recordExecutionRequest,
   rejectGate,
   repair,
   reviewPhase,
@@ -175,6 +178,48 @@ test("hand-written tracked execution result is not a trusted receipt", async (t)
   await assert.rejects(() => loadExecutionReceipt(root, "g7-execution.yaml"), /EXECUTION_RECEIPT_NOT_FOUND/);
 });
 
+test("prepared execution requests persist with replay, conflict, and audit binding", async (t) => {
+  const root = await temporaryDirectory(t, "system-design-team-execution-request-");
+  await execFileAsync("git", ["init", "--quiet"], { cwd: root });
+  await initProject(root, {
+    id: "leave-system",
+    name: "Leave System",
+    mode: "greenfield",
+    profile: "standard",
+  });
+  const adapter = new ManualCodexAdapter(async () => ({
+    artifacts: [], reviews: [], approvals: [], verified_checksums: {},
+    workflow: {
+      id: "request-test", version: "1.0.0", mode: "greenfield",
+      phases: [{
+        id: "deployment", owner: "devops-lead", reviewer: "operations-reviewer", gate: "G8",
+        depends_on: [], required_plugins: [],
+        artifact: { id: "DEPLOYMENT-PLAN", path: "release/deployment-plan.md", title: "Deployment Plan" },
+      }],
+    },
+  }));
+  const prepared = await adapter.prepareExecution({
+    execution_id: "EXEC-PRODUCTION",
+    operation_id: "DEPLOY-1",
+    objective: "Deploy release",
+    authorized_scope: { read: ["release/**"], write: ["release/**"], execute: ["deploy"] },
+    required_inputs: [],
+    permission_profile: "production_execution",
+    command_class: "production_impact",
+    execution_evidence: { gate_approvals: [] },
+  });
+
+  const first = await recordExecutionRequest(root, adapter, prepared, "REQUEST-1");
+  assert.deepEqual(await recordExecutionRequest(root, adapter, prepared, "REQUEST-1"), first);
+  assert.deepEqual(await loadExecutionRequest(root, first.id), first);
+  await assert.rejects(
+    () => recordExecutionRequest(root, adapter, structuredClone(prepared), "REQUEST-2"),
+    /PREPARED_EXECUTION_INVALID/,
+  );
+  const audit = await readFile(join(root, ".agent-team/audit/events.jsonl"), "utf8");
+  assert(audit.includes(first.attestation_digest));
+});
+
 test("only an adapter-collected result records an audited receipt with safe replay", async (t) => {
   const root = await temporaryDirectory(t, "system-design-team-execution-receipt-");
   await execFileAsync("git", ["init", "--quiet"], { cwd: root });
@@ -202,6 +247,9 @@ test("only an adapter-collected result records an audited receipt with safe repl
   assert.deepEqual(await loadExecutionReceipt(root, first.id), first);
   const audit = await readFile(join(root, ".agent-team/audit/events.jsonl"), "utf8");
   assert.equal(audit.split(/\r?\n/).filter((line) => line.includes(first.id)).length, 1);
+  const receiptAudit = audit.split(/\r?\n/).filter(Boolean).map(JSON.parse)
+    .find(({ action }) => action === "execution-receipt");
+  assert.equal(receiptAudit.permission_profile, "read_only_assessment");
 
   const other = await collectedReviewerResult(adapter, { execution_id: "EXEC-OTHER" });
   await assert.rejects(
@@ -330,7 +378,136 @@ test("G7 review binds its receipt to reviewer identity, phase, and verdict", asy
   ), /QA_EVIDENCE_NOT_CURRENT/);
 });
 
-test("G8 review evaluates G8 authorization instead of G7", async (t) => {
+test("G8 approval persists an exact prepared request authorization and rejects replay drift", async (t) => {
+  const root = await temporaryDirectory(t, "system-design-team-g8-approval-request-");
+  await execFileAsync("git", ["init", "--quiet"], { cwd: root });
+  await initProject(root, {
+    id: "leave-system",
+    name: "Leave System",
+    mode: "greenfield",
+    profile: "standard",
+  });
+  const store = ProjectStore.open(root);
+  const state = await store.readWorkflowState();
+  state.phases.deployment = {
+    status: "awaiting_approval",
+    review_id: "REV-DEPLOYMENT",
+  };
+  state.current_phase = "deployment";
+  await store.writeYamlAtomic(".agent-team/workflow-state.yaml", state);
+
+  const registry = parse(await readFile(join(root, ".agent-team/artifact-registry.yaml"), "utf8"));
+  const evidence = [
+    ["TEST-SUMMARY", "verification", "qa-lead", "tester", "approved"],
+    ["RELEASE-READINESS", "release-readiness", "security-reviewer", "architecture-reviewer", "approved"],
+    ["DEPLOYMENT-PLAN", "deployment", "devops-lead", "operations-reviewer", "in_review"],
+  ];
+  const reviews = [];
+  for (const [artifactId, phase, owner, reviewer, status] of evidence) {
+    const artifact = registry.artifacts.find(({ id }) => id === artifactId);
+    artifact.status = status;
+    const content = [
+      "---",
+      `artifact_id: ${artifactId}`,
+      "version: 1",
+      `status: ${status}`,
+      `owner: ${owner}`,
+      `reviewer: ${reviewer}`,
+      "---",
+      `# ${artifactId}`,
+      "Current evidence.",
+    ].join("\n");
+    artifact.checksum = `sha256:${createHash("sha256").update(content).digest("hex")}`;
+    await store.writeTextAtomic(`.agent-team/${artifact.path}`, content);
+    reviews.push({
+      id: `REV-${artifactId === "DEPLOYMENT-PLAN" ? "DEPLOYMENT" : artifactId}`,
+      phase,
+      reviewer,
+      verdict: "approved",
+      artifact_versions: { [artifactId]: 1 },
+      timestamp: "2026-07-13T00:00:00.000Z",
+    });
+  }
+  await store.writeYamlAtomic(".agent-team/artifact-registry.yaml", registry);
+  await store.writeYamlAtomic(".agent-team/reviews.yaml", { reviews });
+  await store.writeYamlAtomic(".agent-team/approvals.yaml", { approvals: [{
+    id: "APR-G7-EVIDENCE",
+    gate: "G7",
+    decision: "approved",
+    approved_by: { type: "human", identifier: "project-owner" },
+    artifact_versions: { "TEST-SUMMARY": 1, "RELEASE-READINESS": 1 },
+    timestamp: "2026-07-13T00:00:00.000Z",
+  }] });
+
+  const workflow = parse(await readFile(join(import.meta.dirname, "../workflows/greenfield.yaml"), "utf8"));
+  const artifacts = registry.artifacts.filter(({ id }) => evidence.some(([artifactId]) => artifactId === id));
+  const context = {
+    workflow,
+    artifacts,
+    reviews,
+    approvals: parse(await readFile(join(root, ".agent-team/approvals.yaml"), "utf8")).approvals,
+    verified_checksums: Object.fromEntries(artifacts.map(({ id, checksum }) => [id, checksum])),
+  };
+  const qa = {
+    artifact_id: "TEST-SUMMARY", version: 1, status: "approved",
+    review_id: "REV-TEST-SUMMARY", approval_id: "APR-G7-EVIDENCE",
+  };
+  const security = {
+    artifact_id: "RELEASE-READINESS", version: 1, status: "approved",
+    review_id: "REV-RELEASE-READINESS", approval_id: "APR-G7-EVIDENCE",
+  };
+  const deployment = {
+    artifact_id: "DEPLOYMENT-PLAN", version: 1, status: "in_review",
+    review_id: "REV-DEPLOYMENT",
+  };
+  const adapter = new ManualCodexAdapter(async () => context);
+  const prepare = (executionId) => adapter.prepareExecution({
+    execution_id: executionId,
+    operation_id: `DEPLOY-${executionId}`,
+    objective: "Deploy the approved release",
+    authorized_scope: { read: ["release/**"], write: ["release/**"], execute: ["deploy"] },
+    required_inputs: [],
+    permission_profile: "production_execution",
+    command_class: "production_impact",
+    execution_evidence: { gate_approvals: [], qa, security, backup: deployment, rollback: deployment },
+  });
+  const prepared = await prepare("EXEC-G8-APPROVAL");
+  const request = await recordExecutionRequest(root, adapter, prepared, "REQUEST-G8-APPROVAL");
+  const approvalResult = await collectedReviewerResult(adapter, {
+    execution_id: "EXEC-G8-APPROVAL-REVIEW",
+    agent_id: "operations-reviewer",
+    phase: "deployment",
+  });
+  const receipt = await recordExecutionReceipt(root, adapter, approvalResult, "RECEIPT-G8-APPROVAL");
+  const approved = await approve(root, "G8", "project-owner", "APPROVE-G8", receipt.id, request.id);
+  assert.equal(approved.phases.deployment.status, "approved");
+
+  const persisted = parse(await readFile(join(root, ".agent-team/approvals.yaml"), "utf8"))
+    .approvals.find(({ gate }) => gate === "G8");
+  assert.equal(persisted.execution_request_id, request.id);
+  assert.equal(persisted.execution_request_digest, request.attestation_digest);
+  assert.equal(persisted.execution_receipt_id, receipt.id);
+  assert.equal(persisted.execution_receipt_digest, receipt.attestation_digest);
+  assert.deepEqual(persisted.execution_authorization, request.authorization);
+  const audit = (await readFile(join(root, ".agent-team/audit/events.jsonl"), "utf8"))
+    .trim().split(/\r?\n/).map(JSON.parse)
+    .find(({ action, target }) => action === "approve" && target === "G8");
+  assert.equal(audit.execution_request_id, request.id);
+  assert.equal(audit.execution_request_digest, request.attestation_digest);
+  assert.equal(audit.execution_receipt_id, receipt.id);
+  assert.equal(audit.execution_receipt_digest, receipt.attestation_digest);
+  assert.deepEqual(await approve(root, "G8", "project-owner", "APPROVE-G8", receipt.id, request.id), approved);
+
+  const conflicting = await recordExecutionRequest(
+    root, adapter, await prepare("EXEC-G8-CONFLICT"), "REQUEST-G8-CONFLICT",
+  );
+  await assert.rejects(
+    () => approve(root, "G8", "project-owner", "APPROVE-G8", receipt.id, conflicting.id),
+    /OPERATION_ID_CONFLICT/,
+  );
+});
+
+test("G8 reviewer receipt does not require production pre-authorization", async (t) => {
   const root = await temporaryDirectory(t, "system-design-team-g8-review-");
   await execFileAsync("git", ["init", "--quiet"], { cwd: root });
   await initProject(root, {
@@ -377,7 +554,52 @@ test("G8 review evaluates G8 authorization instead of G7", async (t) => {
     "G8-REVIEW",
     pluginAdapter,
     receipt.id,
-  ), /HUMAN_AUTHORIZATION_REQUIRED/);
+  ), /QA_EVIDENCE_NOT_CURRENT/);
+
+  const revisionResult = await collectedReviewerResult(adapter, {
+    execution_id: "EXEC-G8-REVISION",
+    agent_id: "operations-reviewer",
+    phase: "deployment",
+    review_verdict: "revision_required",
+  });
+  const revisionReceipt = await recordExecutionReceipt(
+    root, adapter, revisionResult, "RECEIPT-G8-REVISION",
+  );
+  const revised = await reviewPhase(
+    root,
+    "deployment",
+    "operations-reviewer",
+    "revision_required",
+    "G8-REVISION",
+    pluginAdapter,
+    revisionReceipt.id,
+  );
+  assert.equal(revised.phases.deployment.status, "revision_required");
+  const reviews = parse(await readFile(join(root, ".agent-team/reviews.yaml"), "utf8"));
+  assert.equal(reviews.reviews.at(-1).execution_receipt_id, revisionReceipt.id);
+  const audit = (await readFile(join(root, ".agent-team/audit/events.jsonl"), "utf8"))
+    .trim().split(/\r?\n/).map(JSON.parse);
+  const reviewAudit = audit.find(({ action, target }) => action === "review" && target === "deployment");
+  assert.equal(reviewAudit.execution_receipt_id, revisionReceipt.id);
+
+  const conflictingResult = await collectedReviewerResult(adapter, {
+    execution_id: "EXEC-G8-REVISION-CONFLICT",
+    agent_id: "operations-reviewer",
+    phase: "deployment",
+    review_verdict: "revision_required",
+  });
+  const conflictingReceipt = await recordExecutionReceipt(
+    root, adapter, conflictingResult, "RECEIPT-G8-REVISION-CONFLICT",
+  );
+  await assert.rejects(() => reviewPhase(
+    root,
+    "deployment",
+    "operations-reviewer",
+    "revision_required",
+    "G8-REVISION",
+    pluginAdapter,
+    conflictingReceipt.id,
+  ), /OPERATION_ID_CONFLICT/);
 });
 
 test("reject records a human decision and append-only audit event", async (t) => {

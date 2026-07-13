@@ -69,6 +69,15 @@ export interface AttestedExecutionReceipt {
   attestation_digest: `sha256:${string}`;
 }
 
+export interface AttestedPreparedExecutionRequest {
+  adapter_id: "manual-codex-adapter";
+  action: string;
+  scope: CapabilityRequirements["authorized_paths"];
+  authorization: Omit<ExecutionPolicyInput, "target_gate" | "evidence">;
+  evidence: ExecutionPolicyInput["evidence"];
+  attestation_digest: `sha256:${string}`;
+}
+
 export type ExecutionContextResolver = (dispatch: AgentDispatch) => Promise<ExecutionEvidenceContext>;
 
 function freezeRecursively<T>(value: T): T {
@@ -254,7 +263,11 @@ export class ManualCodexAdapter implements PluginAdapter, AgentExecutionAdapter 
           : {}),
       };
       const policyReport = evaluateExecutionPolicy(policy, await this.contextResolver(ownedDispatch));
-      if (!policyReport.allowed) {
+      if (!policyReport.allowed && !(
+        requirements.permission_profile === "production_execution"
+        || requirements.command_class === "production_impact"
+        || destructive
+      )) {
         throw new Error(policyReport.blockers.find((blocker) => /G[68]_APPROVAL_REQUIRED/.test(blocker))
           ?? policyReport.blockers[0]);
       }
@@ -279,6 +292,29 @@ export class ManualCodexAdapter implements PluginAdapter, AgentExecutionAdapter 
     const handle: ExecutionHandle = Object.freeze({ status: "awaiting_runtime", digest: state.digest });
     this.#executions.set(handle, { digest: state.digest, dispatch: state.dispatch });
     return handle;
+  }
+
+  createPreparedExecutionRequest(prepared: PreparedExecution): AttestedPreparedExecutionRequest {
+    const state = this.#authorized.get(prepared);
+    if (!state?.policy) throw new Error("PREPARED_EXECUTION_INVALID");
+    const binding = {
+      adapter_id: "manual-codex-adapter" as const,
+      action: String(state.dispatch.objective ?? state.policy.command_class),
+      scope: state.policy.authorized_paths,
+      authorization: {
+        execution_id: state.policy.execution_id,
+        dispatch_digest: state.policy.dispatch_digest,
+        permission_profile: state.policy.permission_profile,
+        authorized_paths: state.policy.authorized_paths,
+        command_class: state.policy.command_class,
+        destructive: state.policy.destructive,
+      },
+      evidence: state.policy.evidence,
+    };
+    return freezeRecursively({
+      ...binding,
+      attestation_digest: `sha256:${createHash("sha256").update(JSON.stringify(binding)).digest("hex")}` as const,
+    });
   }
 
   async collectResult(handle: ExecutionHandle, runtimeResult?: unknown): Promise<AgentExecutionResult> {
