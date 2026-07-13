@@ -2166,9 +2166,12 @@ export async function secretsScan(root: string) {
   const findings: { path: string; line: number; code: string }[] = [];
   const projectRoot = await realpath(root);
   const generatedOrDependency = /(?:^|\/)(?:node_modules|dist|build|coverage)(?:\/|$)|^\.agent-team\/cache(?:\/|$)/;
-  const paths = [...new Set(`${tracked}${untracked}`.split("\0").filter(Boolean))]
-    .filter((path) => path !== ".git" && !path.startsWith(".git/") && !generatedOrDependency.test(path))
-    .sort();
+  const trackedPaths = tracked.split("\0").filter(Boolean);
+  const untrackedPaths = untracked.split("\0").filter((path) => path
+    && path !== ".git"
+    && !path.startsWith(".git/")
+    && !generatedOrDependency.test(path));
+  const paths = [...new Set([...trackedPaths, ...untrackedPaths])].sort();
   for (const path of paths) {
     let content: Buffer;
     try {

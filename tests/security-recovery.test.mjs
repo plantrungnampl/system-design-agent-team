@@ -241,6 +241,8 @@ test("secrets scan reports tracked and untracked credentials but excludes ignore
     await mkdir(join(root, directory), { recursive: true });
     await writeFile(join(root, directory, "ignored.txt"), "api_key = 'ignored-not-real-secret'\n");
   }
+  await writeFile(join(root, "dist/tracked-release.txt"), "api_key = 'tracked-release-not-real-secret'\n");
+  await execFileAsync("git", ["add", "-f", "binary.dat", "dist/tracked-release.txt"], { cwd: root });
 
   const result = await secretsScan(root);
 
@@ -249,6 +251,7 @@ test("secrets scan reports tracked and untracked credentials but excludes ignore
     "config.txt",
     "cookie.txt",
     "database.txt",
+    "dist/tracked-release.txt",
     "private.pem",
     "provider.txt",
     "untracked.txt",

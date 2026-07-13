@@ -73,7 +73,12 @@ export function validateReviewReadyArtifact(text: string): ArtifactValidation {
     .map((line) => line.trim())
     .filter((line) => line && !/^#{1,6}\s+/.test(line));
   const claimOnly = /^(?:everything|all (?:requirements|tests|checks|security checks)) (?:(?:has|have) )?(?:passed|(?:was|were) successful)[.!]?$/i;
-  if (substantive.length === 1 && claimOnly.test(substantive[0]!)) {
+  const hasCommand = substantive.some((line) => /^command:\s*\S.+/i.test(line));
+  const hasResult = substantive.some((line) => /^(?:exit(?: code)?|passed|failed|result):\s*\S+/i.test(line));
+  const hasBoundReference = substantive.some((line) =>
+    /^(?:receipt|artifact|path):\s*\S+/i.test(line)
+    || /^(?:digest|checksum):\s*sha256:[a-f0-9]{64}$/i.test(line));
+  if (substantive.some((line) => claimOnly.test(line)) && !((hasCommand && hasResult) || hasBoundReference)) {
     findings.push({
       code: "UNSUPPORTED_COMPLETION_CLAIM",
       message: "Completion claims require concrete, reproducible evidence",
