@@ -1,48 +1,57 @@
 # Getting started
 
-This repository is the first V1 vertical slice: greenfield initialization and the approval-gated intake-to-requirements-to-product path.
+V1 is a local Codex-first workflow and dispatch framework. Run it in the Git repository that will own `.agent-team/` project memory.
 
-## Prerequisites
+## Install and verify
 
-- Node.js 20 or newer
-- Git
-- A repository checkout of this project
-
-Install, build, and inspect the implemented commands:
+Node.js 20 or newer and Git are required. For framework development:
 
 ```bash
 npm ci
-npm run build
+npm run check
 node packages/cli/dist/bin.js --help
 ```
 
-Run the CLI from the project repository you want to manage, using the absolute path to this checkout's built `bin.js`:
+The package smoke test packs every internal workspace, installs the tarballs into a clean temporary package, and runs the installed CLI. A consumer may use the `system-design-team` executable after those packages are published or supplied as tarballs.
+
+## Choose a project mode
+
+Greenfield starts from a new business problem:
 
 ```bash
-node /path/to/system-design-agent-team/packages/cli/dist/bin.js init \
-  --id leave-system --name "Leave System" --mode greenfield --profile standard
-node /path/to/system-design-agent-team/packages/cli/dist/bin.js status
-node /path/to/system-design-agent-team/packages/cli/dist/bin.js doctor
+system-design-team init --id leave-system --name "Leave System" --mode greenfield --profile standard --operation-id INIT-GREENFIELD-001
 ```
 
-The lifecycle commands are:
+Existing-system adoption inventories tracked source and documentation without changing application source:
 
-```text
-start <phase> --operation-id <id>
-validate <phase> --operation-id <id>
-review <phase> --reviewer <id> --verdict <approved|revision_required> --operation-id <id>
-approve <gate> --by <human-id> --operation-id <id>
-handover <phase> --operation-id <id>
+```bash
+system-design-team adopt --id order-system --name "Order System" --profile standard --operation-id ADOPT-001
 ```
 
-Lock files are never reclaimed automatically. If `doctor` reports an abandoned same-host lock, stop every framework process for the project, then explicitly confirm that quiescent state:
+Migration starts with legacy assessment and continues through separately approved cutover, reconciliation, and decommission phases:
 
-```text
-repair --locks --yes
+```bash
+system-design-team init --id order-migration --name "Order Migration" --mode migration --profile enterprise --operation-id INIT-MIGRATION-001
 ```
 
-The repair command only removes generated lock files with valid metadata whose same-host owner PID is dead. Live, foreign-host, invalid, and unconfirmed repairs remain blocked.
+Use `small`, `standard`, `enterprise`, or `regulated` profiles. Generated project artifacts are English. Inspect the effective installation and current state:
 
-`start` blocks until the host records the owner's required plugin skills through the exported `setPluginStatus` library API. There is no plugin-status CLI command in this slice.
+```bash
+system-design-team inspect
+system-design-team status
+system-design-team doctor
+```
 
-Packed CLI assets still require a repository checkout: workflows, the agent catalogue, and templates are not yet included in the npm package. Run `npm run check` for the complete build and test gate.
+## Work through a phase
+
+Every mutation needs a caller-supplied operation ID. A typical phase follows start, artifact work, validation, independent review, human approval where required, then handover:
+
+```bash
+system-design-team start intake --operation-id INTAKE-START-001
+system-design-team validate intake --operation-id INTAKE-VALIDATE-001
+system-design-team review intake --reviewer documentation-reviewer --verdict approved --operation-id INTAKE-REVIEW-001
+system-design-team approve G0 --by project-owner --operation-id INTAKE-APPROVE-001
+system-design-team handover intake --operation-id INTAKE-HANDOVER-001
+```
+
+Required-plugin phases need a host-provided execution adapter. The standalone CLI checks persisted status and evidence but does not invoke third-party capabilities by itself. See [Security](security.md) for the plugin contract and [Operations](operations.md) for gate and recovery procedures.

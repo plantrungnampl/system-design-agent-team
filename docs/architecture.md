@@ -1,23 +1,28 @@
 # Architecture and sources of truth
 
-This is the first V1 vertical slice, not the complete framework. The CLI coordinates small ESM TypeScript workspace packages:
+V1 separates durable domain state from runtime adapters:
 
-- `core` owns shared Zod contracts.
-- `project-store` owns contained, atomic filesystem writes, locks, and audit redaction.
-- `workflow-engine` owns allowed phase and gate transitions.
-- `artifact-validator` checks review-ready Markdown artifacts.
-- `plugin-registry` checks required plugin capabilities.
-- `codex-adapter` prepares bounded dispatches without fabricating runtime evidence.
-- `cli` composes those public APIs for initialization and lifecycle operations.
+- `core` owns shared Zod contracts and stable identifiers.
+- `project-store` owns contained atomic writes, locks, recovery, and redacted audit events.
+- `workflow-engine` owns phase transitions and G0-G9 gate policy.
+- `artifact-validator` and `traceability` validate artifacts, links, freshness, and coverage.
+- `plugin-registry` verifies trusted plugin identity, skills, and digest-only invocation records.
+- `codex-adapter` prepares scoped requests and validates execution receipts.
+- `sqlite-cache` builds a disposable real SQLite index from authoritative files.
+- `cli` composes the public operations and bundles workflows, agent definitions, and templates.
 
 ## Authority boundaries
 
-Git-backed YAML under `.agent-team/` is authoritative. `workflow-state.yaml` records lifecycle state, scoped operation IDs, and handover evidence digests; `artifact-registry.yaml`, `reviews.yaml`, `approvals.yaml`, and `handovers/*.yaml` bind evidence to exact artifact versions. Use the CLI or exported library functions for lifecycle changes instead of editing workflow state directly.
+Git-backed YAML and Markdown under `.agent-team/` are authoritative. `workflow-state.yaml`, `artifact-registry.yaml`, `traceability.yaml`, `reviews.yaml`, `approvals.yaml`, execution records, and handovers bind decisions to exact versions and evidence. `.agent-team/audit/events.jsonl` is an append-only operational summary, not approval or plugin proof.
 
-Generated lock files contain synced owner metadata and are fail-closed: an existing lock always blocks normal work. `doctor` identifies valid same-host locks whose owner PID is dead. `repair --locks --yes` removes only those locks after the operator confirms all framework processes are quiescent; repair is an administrative precondition, not a concurrency guarantee.
+The optional `.agent-team/cache/index.db` is derived data. Its schema and source commit are checked; corruption or staleness disables cache-backed diagnostics without blocking core file-backed workflow operations. Rebuilding it never changes authoritative project content.
 
-Repository assets under `workflows/`, `agents/`, and `templates/` define bootstrap inputs. Shared Zod schemas validate persisted domain data at read/write boundaries. `.agent-team/audit/events.jsonl` is a redacted operational log, not approval evidence.
+Bootstrap assets under `workflows/`, `agents/`, and `templates/` are copied into the packed CLI. Initialization creates `.codex/agents/` instructions without overwriting application source, an existing root `AGENTS.md`, or unrelated `.codex` files.
 
-Application source, an existing root `AGENTS.md`, and unrelated `.codex` content remain outside framework ownership. Initialization creates framework state without replacing them.
+## Execution boundary
 
-The packed CLI currently contains compiled CLI files and metadata only. Bootstrap assets still require the repository checkout; standalone installation is deferred beyond this slice.
+The adapter distinguishes prepared requests, runtime receipts, plugin availability, and completed invocation evidence. Availability does not prove a plugin invocation. The framework stores only identity, status, timestamps, references, and digests—not private reasoning or plugin internals.
+
+Production-impacting work requires exact authorization and current gate evidence. V1 prepares and verifies those contracts; it does not deploy to production and has no automatic cloud, GitHub, CI, or production connector.
+
+See [Operations](operations.md) for lifecycle behavior and [Security](security.md) for trust boundaries.

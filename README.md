@@ -1,19 +1,25 @@
 # System Design Agent Team
 
-Codex-first, approval-gated, END2END multi-agent framework for greenfield, existing-system, and migration projects.
+System Design Agent Team is a local, Codex-first workflow and dispatch framework for greenfield, existing-system, and migration projects. It stores reviewable project knowledge in Git, enforces G0-G9 approval gates, validates traceability and execution evidence, and prepares bounded agent work. V1 does not deploy to production or provide a hosted multi-agent runtime.
 
-Current status: the foundation packages and first V1 approval-gated vertical slice are implemented.
+## Start here
 
-Requires Node.js 20 or newer and Git. From this repository checkout:
+Requires Node.js 20 or newer and Git.
 
 ```bash
-npm install
-npm run build
+npm ci
+npm run check
 node packages/cli/dist/bin.js --help
 ```
 
-The first slice exposes `init`, `status`, `start`, `validate`, `review`, `approve`, `handover`, `doctor`, and explicit lock `repair` for the intake-to-requirements-to-product workflow. Project state is stored under `.agent-team/`; application source and an existing root `AGENTS.md` are left untouched.
+After installing the packed or published workspace packages, the executable is `system-design-team`. Initialize a project from its repository root:
 
-Packed CLI assets still require this repository checkout; workflows, the agent catalogue, and templates are not yet bundled for standalone installation.
+```bash
+system-design-team init --id leave-system --name "Leave System" --mode greenfield --profile standard --operation-id INIT-001
+system-design-team status
+system-design-team doctor
+```
 
-See [Getting started](docs/getting-started.md), [Architecture and sources of truth](docs/architecture.md), and the [design specification](docs/superpowers/specs/2026-07-11-system-design-agent-team-design.md).
+Git-backed Markdown and YAML under `.agent-team/` remain authoritative. The optional SQLite index is disposable and rebuildable. Plugin availability and skill contracts are checked, but availability does not prove a plugin invocation; only adapter-issued invocation evidence can do that.
+
+Read [Getting started](docs/getting-started.md), [Architecture](docs/architecture.md), [Operations](docs/operations.md), [Security](docs/security.md), [Upgrade](docs/upgrade.md), and [Troubleshooting](docs/troubleshooting.md). The full intended product shape is recorded in the [design specification](docs/superpowers/specs/2026-07-11-system-design-agent-team-design.md).

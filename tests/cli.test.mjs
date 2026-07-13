@@ -1571,7 +1571,7 @@ test("cache rebuild integrates with diagnostics without blocking core workflow",
   assert.equal((await getStatus(root)).project.id, "leave-system");
 });
 
-test("CLI help lists the first-slice commands", async () => {
+test("CLI help lists the implemented commands", async () => {
   const bin = join(repository, "packages/cli/dist/bin.js");
   const { stdout } = await execFileAsync(
     process.execPath,
