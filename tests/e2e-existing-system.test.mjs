@@ -29,6 +29,8 @@ import {
 } from "./fixtures/e2e-harness.mjs";
 
 const execFileAsync = promisify(execFile);
+const childEnvironment = { ...process.env };
+delete childEnvironment.NODE_TEST_CONTEXT;
 const mode = "existing_system";
 const fixture = join(import.meta.dirname, "fixtures/existing-system");
 
@@ -52,7 +54,7 @@ test("existing-system performs scoped discovery, modifies existing authorization
     "not_started");
 
   let phase = await reviewReadyPhase(root, mode, "repository-discovery",
-    "Scoped files: src/AdminPage.aspx.cs and tests/AdminPageAuthorizationTests.cs. Current flow calls DeleteOrder without a server-side role check.");
+    "Scoped files: src/AdminPage.aspx.cs and tests/verify-admin-authorization.mjs. Current flow calls DeleteOrder without a server-side role check.");
   await approveAndHandover(root, mode, "repository-discovery", { receipt: phase.receipt });
   assert.equal((await ProjectStore.open(root).readWorkflowState()).phases["current-system-analysis"].status, "ready");
 
@@ -69,27 +71,37 @@ test("existing-system performs scoped discovery, modifies existing authorization
   }
 
   const sourcePath = join(root, "src/AdminPage.aspx.cs");
-  const testPath = join(root, "tests/AdminPageAuthorizationTests.cs");
+  const testPath = join(root, "tests/verify-admin-authorization.mjs");
+  const verificationCommand = "node --test tests/verify-admin-authorization.mjs";
+  await assert.rejects(
+    () => execFileAsync(process.execPath, ["--test", "tests/verify-admin-authorization.mjs"], {
+      cwd: root,
+      env: childEnvironment,
+    }),
+    ({ stdout, stderr }) => /server-side administrator guard is missing/.test(`${stdout}\n${stderr}`),
+  );
   const source = await readFile(sourcePath, "utf8");
-  const regression = await readFile(testPath, "utf8");
   await writeFile(sourcePath, source.replace(
     "    {\n        OrderService.Delete(orderId);",
     "    {\n        Authorization.RequireRole(\"Administrator\");\n        OrderService.Delete(orderId);",
   ));
-  await writeFile(testPath, regression.replace(
-    "    // Existing regression suite; the END2END scenario extends this file.",
-    "    public void NonAdministratorIsRejected() => Assert.Throws<UnauthorizedAccessException>(() => page.DeleteOrder(42));",
-  ));
+  const { stdout: verificationOutput } = await execFileAsync(
+    process.execPath,
+    ["--test", "tests/verify-admin-authorization.mjs"],
+    { cwd: root, env: childEnvironment },
+  );
+  assert.match(verificationOutput, /pass 3/);
+  assert.match(verificationOutput, /fail 0/);
   const codeReceipt = await recordCodeExecution(root, mode, "implementation", [
-    "src/AdminPage.aspx.cs", "tests/AdminPageAuthorizationTests.cs",
-  ]);
+    "src/AdminPage.aspx.cs",
+  ], { command: verificationCommand, stdout: verificationOutput });
   assert.match(await readFile(sourcePath, "utf8"), /RequireRole\("Administrator"\)/);
-  assert.match(await readFile(testPath, "utf8"), /NonAdministratorIsRejected/);
+  assert.match(await readFile(testPath, "utf8"), /hiding the delete button is not server-side authorization/);
   const allFiles = (await Promise.all([readdir(join(root, "src")), readdir(join(root, "tests"))])).flat();
   assert.equal(allFiles.some((name) => /(?:Fixed|V2)/i.test(name)), false);
 
   phase = await reviewReadyPhase(root, mode, "implementation",
-    `Existing files changed under approved G6 scope. Runtime receipt: ${codeReceipt.id}.`);
+    `Existing source changed under approved G6 scope. Command: ${verificationCommand}. Exit: 0. Tests: 3 passed, 0 failed. Runtime receipt: ${codeReceipt.id}.`);
   await approveAndHandover(root, mode, "implementation", { receipt: phase.receipt });
   phase = await reviewReadyPhase(root, mode, "regression-security-testing",
     "Regression covers authorized and unauthorized deletion; no frontend-only authorization is accepted.");
@@ -102,7 +114,6 @@ test("existing-system performs scoped discovery, modifies existing authorization
   assert.equal((await validatePhase(root, "security-review", "VALIDATE-security-review-1")).valid, true);
   const secretPath = join(root, "tracked-secret.txt");
   await writeFile(secretPath, "api_key = 'not-a-real-secret-value'\n");
-  await execFileAsync("git", ["add", "tracked-secret.txt"], { cwd: root });
   assert.equal((await secretsScan(root)).valid, false);
   const securityPending = await artifactReference(root, mode, "SECURITY-VERDICT", false);
   const securityEvidence = { gate_approvals: [], qa, security: securityPending };
@@ -112,21 +123,35 @@ test("existing-system performs scoped discovery, modifies existing authorization
       "REVIEW-security-with-secret", pluginAdapter, blockedReceipt.id),
     /SECRET_SCAN_FAILED/,
   );
-  await execFileAsync("git", ["rm", "--quiet", "--cached", "tracked-secret.txt"], { cwd: root });
   await rm(secretPath);
   const securityReceipt = await reviewerReceipt(root, mode, "security-review", securityEvidence, "clean");
-  await reviewPhase(root, "security-review", "architecture-reviewer", "approved",
+  const reviewed = await reviewPhase(root, "security-review", "architecture-reviewer", "approved",
     "REVIEW-security-clean", pluginAdapter, securityReceipt.id);
   const lateSecretPath = join(root, "late-secret.txt");
   await writeFile(lateSecretPath, "api_key = 'another-not-real-secret-value'\n");
-  await execFileAsync("git", ["add", "late-secret.txt"], { cwd: root });
+  assert.deepEqual(await reviewPhase(root, "security-review", "architecture-reviewer", "approved",
+    "REVIEW-security-clean", pluginAdapter, securityReceipt.id), reviewed);
+  await assert.rejects(
+    () => reviewPhase(root, "security-review", "architecture-reviewer", "approved",
+      "REVIEW-security-new", pluginAdapter, securityReceipt.id),
+    /SECRET_SCAN_FAILED/,
+  );
   await assert.rejects(
     () => approve(root, "G7", "project-owner", "APPROVE-security-late-secret", securityReceipt.id),
     /SECRET_SCAN_FAILED/,
   );
-  await execFileAsync("git", ["rm", "--quiet", "--cached", "late-secret.txt"], { cwd: root });
   await rm(lateSecretPath);
   await approveAndHandover(root, mode, "security-review", { receipt: securityReceipt });
+  const approved = await ProjectStore.open(root).readWorkflowState();
+  const replaySecretPath = join(root, "replay-secret.txt");
+  await writeFile(replaySecretPath, "api_key = 'replay-not-real-secret-value'\n");
+  assert.deepEqual(await approve(root, "G7", "project-owner",
+    "APPROVE-security-review-1", securityReceipt.id), approved);
+  await assert.rejects(
+    () => approve(root, "G7", "project-owner", "APPROVE-security-new", securityReceipt.id),
+    /SECRET_SCAN_FAILED/,
+  );
+  await rm(replaySecretPath);
   const security = await artifactReference(root, mode, "SECURITY-VERDICT");
 
   await startPhase(root, "release", "START-release-1", pluginAdapter);

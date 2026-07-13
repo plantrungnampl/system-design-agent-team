@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { cp, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -22,6 +22,8 @@ import { ProjectStore } from "@system-design-team/project-store";
 import { parse } from "yaml";
 
 const execFileAsync = promisify(execFile);
+const childEnvironment = { ...process.env };
+delete childEnvironment.NODE_TEST_CONTEXT;
 const pluginUri = "plugin://superpowers@openai-curated-remote";
 const operationKey = (action, target, raw) => JSON.stringify([action, target, raw]);
 const adapterWithStatus = (status) => ({
@@ -140,6 +142,9 @@ async function artifactReference(root, artifactId, includeApproval = true) {
 async function reviewerReceipt(root, phase, evidence = { gate_approvals: [] }) {
   const workflow = await workflowFixture();
   const definition = workflow.phases.find(({ id }) => id === phase);
+  const registry = await readYaml(root, ".agent-team/artifact-registry.yaml");
+  const artifact = registry.artifacts.find(({ id }) => id === definition.artifact.id);
+  const artifactContent = await readFile(join(root, ".agent-team", artifact.path), "utf8");
   const adapter = new ManualCodexAdapter(() => executionContext(root));
   const dispatch = {
     execution_id: `EXEC-REVIEW-${phase}`,
@@ -164,7 +169,7 @@ async function reviewerReceipt(root, phase, evidence = { gate_approvals: [] }) {
       id: `review-${phase}`,
       status: "completed",
       timestamp: "2026-07-13T00:00:00.000Z",
-      evidence: [`sha256:${"a".repeat(64)}`],
+      evidence: [`sha256:${createHash("sha256").update(artifactContent).digest("hex")}`],
     }],
     evidence,
   });
@@ -257,12 +262,27 @@ test("greenfield reaches G9 with revision, attested implementation, release, and
   );
   await approveAndHandover(root, "implementation-planning", planning.receipt);
   const g6 = (await ProjectStore.open(root).readWorkflowState()).phases["implementation-planning"].approval_id;
+  const greenfieldFixture = join(import.meta.dirname, "fixtures/greenfield");
+  await cp(join(greenfieldFixture, "src"), join(root, "src"), { recursive: true });
+  await cp(join(greenfieldFixture, "tests"), join(root, "tests"), { recursive: true });
+  const implementationCommand = "node --test tests/leave-request.test.mjs";
+  const { stdout: implementationOutput } = await execFileAsync(
+    process.execPath,
+    ["--test", "tests/leave-request.test.mjs"],
+    { cwd: root, env: childEnvironment },
+  );
+  assert.match(implementationOutput, /pass 2/);
+  assert.match(implementationOutput, /fail 0/);
   const codeAdapter = new ManualCodexAdapter(() => executionContext(root));
   const codeDispatch = {
     execution_id: "EXEC-IMPLEMENT-LEAVE-SLICE",
     agent_id: "developer",
     phase: "implementation",
-    authorized_scope: { read: ["src/**"], write: ["src/**"], execute: ["npm test"] },
+    authorized_scope: {
+      read: ["src/**", "tests/**"],
+      write: ["src/**", "tests/**"],
+      execute: [implementationCommand],
+    },
     required_inputs: [],
     permission_profile: "code_write",
     command_class: "mutating_local",
@@ -281,17 +301,21 @@ test("greenfield reaches G9 with revision, attested implementation, release, and
       id: "tests-pass",
       status: "completed",
       timestamp: "2026-07-13T00:00:00.000Z",
-      evidence: [`sha256:${"b".repeat(64)}`],
+      evidence: [`sha256:${createHash("sha256").update(implementationOutput).digest("hex")}`],
     }],
     evidence: codeDispatch.execution_evidence,
-    output: { changed_files: ["src/leave-request.ts", "tests/leave-request.test.ts"] },
+    output: {
+      changed_files: ["src/leave-request.mjs", "tests/leave-request.test.mjs"],
+      verification: { command: implementationCommand, stdout: implementationOutput },
+    },
   });
   const implementationReceipt = await recordExecutionReceipt(
     root, codeAdapter, codeResult, "RECEIPT-IMPLEMENT-LEAVE-SLICE",
   );
 
   await startPhase(root, "implementation", "START-implementation-1");
-  await writePhaseArtifact(root, "implementation", `Vertical slice implemented. Receipt: ${implementationReceipt.id}.`);
+  await writePhaseArtifact(root, "implementation",
+    `Vertical slice implemented. Command: ${implementationCommand}. Exit: 0. Tests: 2 passed, 0 failed. Receipt: ${implementationReceipt.id}.`);
   assert.equal((await validatePhase(root, "implementation", "VALIDATE-implementation-1")).valid, true);
   await assert.rejects(
     () => reviewPhase(root, "implementation", "code-reviewer", "approved", "REVIEW-implementation-missing", pluginAdapter),

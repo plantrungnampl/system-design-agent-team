@@ -5,3 +5,6 @@ mappings:
   - source: CUSTOMER_ID
     target: orders.customer_id
     transform: trim
+  - source: TOTAL_CENTS
+    target: orders.total_cents
+    transform: integer

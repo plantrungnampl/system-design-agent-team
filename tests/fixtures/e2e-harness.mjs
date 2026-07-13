@@ -114,9 +114,13 @@ export async function artifactReference(root, mode, artifactId, includeApproval 
   };
 }
 
-export async function reviewerReceipt(root, mode, phase, evidence, suffix = "1") {
+export async function reviewerReceipt(root, mode, phase, evidence, suffix = "1", verification) {
   const workflow = await loadWorkflow(mode);
   const definition = workflow.phases.find(({ id }) => id === phase);
+  const registry = await readYaml(root, ".agent-team/artifact-registry.yaml");
+  const artifact = registry.artifacts.find(({ id }) => id === definition.artifact.id);
+  const artifactContent = await readFile(join(root, ".agent-team", artifact.path), "utf8");
+  const reviewedEvidence = `${artifactContent}\n${verification?.stdout ?? ""}`;
   const adapter = new ManualCodexAdapter(() => executionContext(root, mode));
   const dispatch = {
     execution_id: `EXEC-REVIEW-${phase}-${suffix}`,
@@ -141,9 +145,10 @@ export async function reviewerReceipt(root, mode, phase, evidence, suffix = "1")
       id: `review-${phase}`,
       status: "completed",
       timestamp: "2026-07-13T00:00:00.000Z",
-      evidence: [`sha256:${"c".repeat(64)}`],
+      evidence: [`sha256:${createHash("sha256").update(reviewedEvidence).digest("hex")}`],
     }],
     evidence: evidence ?? { gate_approvals: [] },
+    ...(verification ? { output: { verification } } : {}),
   });
   return recordExecutionReceipt(root, adapter, result, `RECEIPT-REVIEW-${phase}-${suffix}`);
 }
@@ -175,7 +180,7 @@ export async function approveAndHandover(root, mode, phase, options = {}) {
   }
 }
 
-export async function recordCodeExecution(root, mode, phase, changedFiles) {
+export async function recordCodeExecution(root, mode, phase, changedFiles, verification) {
   const state = await ProjectStore.open(root).readWorkflowState();
   const workflow = await loadWorkflow(mode);
   const dependency = workflow.phases.find(({ id }) => id === phase).depends_on[0];
@@ -185,7 +190,11 @@ export async function recordCodeExecution(root, mode, phase, changedFiles) {
     execution_id: `EXEC-CODE-${phase}`,
     agent_id: "developer",
     phase,
-    authorized_scope: { read: ["src/**", "tests/**"], write: ["src/**", "tests/**"], execute: ["dotnet test"] },
+    authorized_scope: {
+      read: ["src/**", "tests/**"],
+      write: ["src/**", "tests/**"],
+      execute: [verification.command],
+    },
     required_inputs: [],
     permission_profile: "code_write",
     command_class: "mutating_local",
@@ -204,10 +213,10 @@ export async function recordCodeExecution(root, mode, phase, changedFiles) {
       id: "implementation-and-tests",
       status: "completed",
       timestamp: "2026-07-13T00:00:00.000Z",
-      evidence: [`sha256:${"d".repeat(64)}`],
+      evidence: [`sha256:${createHash("sha256").update(verification.stdout).digest("hex")}`],
     }],
     evidence: dispatch.execution_evidence,
-    output: { changed_files: changedFiles },
+    output: { changed_files: changedFiles, verification },
   });
   return recordExecutionReceipt(root, adapter, result, `RECEIPT-CODE-${phase}`);
 }

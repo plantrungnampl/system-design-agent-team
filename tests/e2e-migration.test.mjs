@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { access, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import test from "node:test";
+import { promisify } from "node:util";
 import {
   approve,
   handover,
@@ -26,6 +28,7 @@ import {
 
 const mode = "migration";
 const fixture = join(import.meta.dirname, "fixtures/migration");
+const execFileAsync = promisify(execFile);
 
 test("migration blocks unsafe cutover, validates data, and separately approves decommission", async (t) => {
   const root = await temporaryRepository(t, "system-design-team-migration-e2e-", fixture);
@@ -56,9 +59,34 @@ test("migration blocks unsafe cutover, validates data, and separately approves d
     await approveAndHandover(root, mode, id, { receipt: phase.receipt });
   }
 
-  phase = await reviewReadyPhase(root, mode, "parallel-validation",
-    "Dry run loaded 2 of 2 rows. Source and target totals reconcile; negative transformation cases are retained.");
-  await approveAndHandover(root, mode, "parallel-validation", { receipt: phase.receipt });
+  const migrationCommand = "node run-migration.mjs";
+  const { stdout: migrationOutput } = await execFileAsync(process.execPath, ["run-migration.mjs"], { cwd: root });
+  assert.deepEqual(JSON.parse(migrationOutput), {
+    status: "reconciled",
+    source_rows: 2,
+    target_rows: 2,
+    source_total_cents: 17300,
+    target_total_cents: 17300,
+  });
+  await assert.rejects(
+    () => execFileAsync(process.execPath, ["run-migration.mjs", "--mismatch"], { cwd: root }),
+    ({ stderr }) => /RECONCILIATION_MISMATCH/.test(stderr),
+  );
+  await startPhase(root, "parallel-validation", "START-parallel-validation-1", pluginAdapter);
+  await writePhaseArtifact(root, mode, "parallel-validation",
+    `Command: ${migrationCommand}. Exit: 0. Dry run loaded 2 of 2 rows; source and target totals both equal 17300 cents.`);
+  assert.equal((await validatePhase(root, "parallel-validation", "VALIDATE-parallel-validation-1")).valid, true);
+  const validationReceipt = await reviewerReceipt(
+    root,
+    mode,
+    "parallel-validation",
+    undefined,
+    "1",
+    { command: migrationCommand, stdout: migrationOutput },
+  );
+  await reviewPhase(root, "parallel-validation", "tester", "approved",
+    "REVIEW-parallel-validation-1", pluginAdapter, validationReceipt.id);
+  await approveAndHandover(root, mode, "parallel-validation", { receipt: validationReceipt });
   const qa = await artifactReference(root, mode, "PARALLEL-VALIDATION");
   const data = await artifactReference(root, mode, "DATA-MAPPING");
   const dataLoss = await artifactReference(root, mode, "BUSINESS-CONTINUITY");

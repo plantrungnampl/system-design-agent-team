@@ -225,15 +225,22 @@ test("adopt inventory preserves non-framework repository contents and Git index"
   assert.deepEqual(await repositorySnapshot(root, [".agent-team", ".codex"]), before);
 });
 
-test("secrets scan reports tracked credential material", async (t) => {
+test("secrets scan reports tracked and untracked credentials but excludes ignored and binary files", async (t) => {
   const root = await temporaryDirectory(t, "system-design-team-secret-scan-");
   await execFileAsync("git", ["init", "--quiet"], { cwd: root });
+  await writeFile(join(root, ".gitignore"), "node_modules/\ndist/\nbuild/\ncoverage/\n.agent-team/cache/\n");
   await writeFile(join(root, "config.txt"), "api_key = 'not-a-real-secret-value'\n");
   await writeFile(join(root, "cookie.txt"), "session_token=abcdefghijklmnopqrstuvwxyz\n");
   await writeFile(join(root, "database.txt"), "postgresql://admin:password@prod.example/app\n");
   await writeFile(join(root, "private.pem"), "-----BEGIN PRIVATE KEY-----\nnot-real\n-----END PRIVATE KEY-----\n");
   await writeFile(join(root, "provider.txt"), "AWS_SECRET_ACCESS_KEY=abcdefghijklmnopqrstuvwxyz123456\n");
   await execFileAsync("git", ["add", "."], { cwd: root });
+  await writeFile(join(root, "untracked.txt"), "api_key = 'untracked-not-real-secret'\n");
+  await writeFile(join(root, "binary.dat"), Buffer.from("\0api_key = 'binary-not-real-secret'"));
+  for (const directory of ["node_modules", "dist", "build", "coverage", ".agent-team/cache"]) {
+    await mkdir(join(root, directory), { recursive: true });
+    await writeFile(join(root, directory, "ignored.txt"), "api_key = 'ignored-not-real-secret'\n");
+  }
 
   const result = await secretsScan(root);
 
@@ -244,6 +251,7 @@ test("secrets scan reports tracked credential material", async (t) => {
     "database.txt",
     "private.pem",
     "provider.txt",
+    "untracked.txt",
   ]);
   assert(!JSON.stringify(result).includes("not-a-real-secret-value"));
 });

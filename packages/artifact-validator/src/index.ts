@@ -69,7 +69,11 @@ export function validateReviewReadyArtifact(text: string): ArtifactValidation {
       code: "PROHIBITED_PLACEHOLDER",
       message: `Prohibited placeholder: ${name}`,
     }));
-  if (/^\s*(?:everything|all (?:requirements|tests|checks)) (?:has |have )?passed[.!]?\s*$/im.test(artifact.body)) {
+  const substantive = artifact.body.split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line && !/^#{1,6}\s+/.test(line));
+  const claimOnly = /^(?:everything|all (?:requirements|tests|checks|security checks)) (?:(?:has|have) )?(?:passed|(?:was|were) successful)[.!]?$/i;
+  if (substantive.length === 1 && claimOnly.test(substantive[0]!)) {
     findings.push({
       code: "UNSUPPORTED_COMPLETION_CLAIM",
       message: "Completion claims require concrete, reproducible evidence",

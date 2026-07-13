@@ -87,6 +87,23 @@ test("allows explicit placeholders in drafts and returns stable parse diagnostic
   });
 });
 
+test("rejects claim-only completion variants but accepts concrete evidence", () => {
+  for (const claim of ["Everything passed.", "All security checks were successful."]) {
+    const result = validateReviewReadyArtifact(`---\nstatus: approved\n---\n# Summary\n${claim}`);
+    assert.equal(result.valid, false, claim);
+    assert.equal(result.findings[0].code, "UNSUPPORTED_COMPLETION_CLAIM");
+  }
+
+  assert.deepEqual(validateReviewReadyArtifact(`---
+status: approved
+---
+# Test summary
+All tests passed.
+Command: node --test tests/leave-request.test.mjs
+Exit code: 0
+Passed: 2, Failed: 0`), { valid: true, findings: [] });
+});
+
 test("reports an approved requirement without a current test", () => {
   const findings = validateTraceability(
     [{ id: "FR-AUTH-001", kind: "requirement", status: "approved" }],

@@ -1284,9 +1284,6 @@ export async function reviewPhase(
   ]);
   const definition = workflow.phases.find((candidate) => candidate.id === phase);
   if (!definition) throw new Error("PHASE_NOT_CONFIGURED");
-  if ((definition.gate === "G7" || definition.gate === "G8") && !(await secretsScan(root)).valid) {
-    throw new Error("SECRET_SCAN_FAILED");
-  }
   let reviewReceipt: ExecutionReceipt | undefined;
   if (definition.gate === "G7" || definition.gate === "G8") {
     if (!receiptId) throw new Error("REVIEW_EXECUTION_RECEIPT_REQUIRED");
@@ -1329,6 +1326,9 @@ export async function reviewPhase(
       executionReceiptDigest: reviewReceipt?.attestation_digest,
     });
     return state;
+  }
+  if ((definition.gate === "G7" || definition.gate === "G8") && !(await secretsScan(root)).valid) {
+    throw new Error("SECRET_SCAN_FAILED");
   }
   if (!reviewerId || reviewerId !== definition.reviewer || reviewerId === definition.owner) {
     throw new Error("REVIEWER_NOT_CONFIGURED");
@@ -1429,9 +1429,6 @@ export async function approve(
   const existing = approvals.approvals.find((approval) => approval.id === scopedOperation);
   const receipt = receiptId ? await loadExecutionReceipt(root, receiptId) : undefined;
   const request = requestId ? await loadExecutionRequest(root, requestId) : undefined;
-  if ((gate === "G7" || gate === "G8") && !(await secretsScan(root)).valid) {
-    throw new Error("SECRET_SCAN_FAILED");
-  }
   if (state.completed_operations.includes(scopedOperation)) {
     if (!existing) throw new Error("APPROVAL_EVIDENCE_MISSING");
     if (existing.gate !== gate
@@ -1454,6 +1451,9 @@ export async function approve(
       executionRequestDigest: request?.attestation_digest,
     });
     return state;
+  }
+  if ((gate === "G7" || gate === "G8") && !(await secretsScan(root)).valid) {
+    throw new Error("SECRET_SCAN_FAILED");
   }
 
   const definition = workflow.phases.find(
@@ -2145,9 +2145,13 @@ export async function loadExecutionReceipt(root: string, reference: string): Pro
 }
 
 export async function secretsScan(root: string) {
-  let stdout = "";
+  let tracked = "";
+  let untracked = "";
   try {
-    ({ stdout } = await runGit(root, ["ls-files", "-z"]));
+    [{ stdout: tracked }, { stdout: untracked }] = await Promise.all([
+      runGit(root, ["ls-files", "-z", "--cached"]),
+      runGit(root, ["ls-files", "-z", "--others", "--exclude-standard"]),
+    ]);
   } catch {
     throw new Error("GIT_REQUIRED");
   }
@@ -2160,14 +2164,24 @@ export async function secretsScan(root: string) {
     /\b(?:AKIA|ASIA)[A-Z0-9]{16}\b|\bgh[pousr]_[A-Za-z0-9_]{20,}\b|\bAIza[A-Za-z0-9_-]{30,}\b/,
   ];
   const findings: { path: string; line: number; code: string }[] = [];
-  for (const path of stdout.split("\0").filter(Boolean).sort()) {
-    let content: string;
+  const projectRoot = await realpath(root);
+  const generatedOrDependency = /(?:^|\/)(?:node_modules|dist|build|coverage)(?:\/|$)|^\.agent-team\/cache(?:\/|$)/;
+  const paths = [...new Set(`${tracked}${untracked}`.split("\0").filter(Boolean))]
+    .filter((path) => path !== ".git" && !path.startsWith(".git/") && !generatedOrDependency.test(path))
+    .sort();
+  for (const path of paths) {
+    let content: Buffer;
     try {
-      content = await readFile(join(root, path), "utf8");
+      const target = resolve(projectRoot, path);
+      const entry = await lstat(target);
+      if (!inside(projectRoot, target) || entry.isSymbolicLink() || !entry.isFile()) continue;
+      if (!inside(projectRoot, await realpath(target))) continue;
+      content = await readFile(target);
     } catch {
       continue;
     }
-    const lines = content.split(/\r?\n/);
+    if (content.subarray(0, 8192).includes(0)) continue;
+    const lines = content.toString("utf8").split(/\r?\n/);
     const index = lines.findIndex((line) => secrets.some((secret) => secret.test(line)));
     if (index >= 0) findings.push({ path, line: index + 1, code: "POSSIBLE_SECRET" });
   }
