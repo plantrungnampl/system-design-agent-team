@@ -16,12 +16,15 @@ import {
   artifactList,
   artifactValidate,
   approve,
+  cacheRebuild,
   createChange,
   diagnostics,
   doctor,
   ejectProject,
+  evidenceVerify,
   gateReadinessReport,
   getStatus,
+  glossaryValidate,
   handover,
   initProject,
   inspectProject,
@@ -62,6 +65,9 @@ Commands:
   gate readiness <gate> [--execution-receipt <id>]
   issue list
   secrets scan
+  cache rebuild
+  glossary validate
+  evidence verify
   diagnostics
   doctor
   repair --locks --yes
@@ -91,6 +97,9 @@ const commandShape: Record<string, { positionals: number; options: string[] }> =
   "gate readiness": { positionals: 3, options: ["execution-receipt"] },
   "issue list": { positionals: 2, options: [] },
   "secrets scan": { positionals: 2, options: [] },
+  "cache rebuild": { positionals: 2, options: [] },
+  "glossary validate": { positionals: 2, options: [] },
+  "evidence verify": { positionals: 2, options: [] },
   diagnostics: { positionals: 1, options: [] },
   doctor: { positionals: 1, options: [] },
   repair: { positionals: 1, options: ["locks", "yes"] },
@@ -156,7 +165,7 @@ async function main(): Promise<void> {
     console.log(usage);
     return;
   }
-  const command = ["artifact", "trace", "stale", "change", "gate", "issue", "secrets"].includes(rootCommand)
+  const command = ["artifact", "trace", "stale", "change", "gate", "issue", "secrets", "cache", "glossary", "evidence"].includes(rootCommand)
     ? `${rootCommand} ${positionals[1] ?? ""}`
     : rootCommand;
   validateInvocation(command, positionals, values);
@@ -290,6 +299,15 @@ async function main(): Promise<void> {
     case "secrets scan":
       result = await secretsScan(root);
       break;
+    case "cache rebuild":
+      result = await cacheRebuild(root);
+      break;
+    case "glossary validate":
+      result = await glossaryValidate(root);
+      break;
+    case "evidence verify":
+      result = await evidenceVerify(root);
+      break;
     case "diagnostics":
       result = await diagnostics(root);
       break;
@@ -333,7 +351,8 @@ async function main(): Promise<void> {
   console.log(JSON.stringify(result, null, 2));
   const outcome = result as { ok?: boolean; valid?: boolean };
   if ((command === "doctor" && outcome.ok === false)
-    || ((command === "validate" || command === "artifact validate" || command === "trace check")
+    || ((command === "validate" || command === "artifact validate" || command === "trace check"
+      || command === "glossary validate" || command === "evidence verify")
       && outcome.valid === false)) {
     process.exitCode = 1;
   }

@@ -28,6 +28,22 @@ export const PluginEnforcementSchema = z.enum(["strict"]);
 export const CacheProviderSchema = z.enum(["none", "sqlite"]);
 export const SecurityClassificationSchema = z.enum(["public", "internal", "confidential", "restricted"]);
 
+export const GlossarySchema = z.object({
+  entries: z.array(z.object({
+    term: z.string().min(1),
+    definition: z.string().min(1),
+  })),
+}).superRefine((glossary, context) => {
+  const terms = new Set<string>();
+  glossary.entries.forEach(({ term }, index) => {
+    const normalized = term.trim().toLocaleLowerCase("en");
+    if (terms.has(normalized)) {
+      context.addIssue({ code: "custom", message: "Glossary terms must be unique", path: ["entries", index, "term"] });
+    }
+    terms.add(normalized);
+  });
+});
+
 export const ProjectApprovalPolicySchema = z.object({
   business_scope: ApprovalPolicySchema.default("human_required"),
   requirements: ApprovalPolicySchema.default("human_required"),
@@ -643,6 +659,7 @@ export const ExecutionEvidenceContextSchema = z.object({
 });
 
 export type ProjectMode = z.infer<typeof ProjectModeSchema>;
+export type Glossary = z.infer<typeof GlossarySchema>;
 export type ProjectProfile = z.infer<typeof ProjectProfileSchema>;
 export type ProjectConfig = z.infer<typeof ProjectConfigSchema>;
 export type EnvironmentOverlay = z.infer<typeof EnvironmentOverlaySchema>;

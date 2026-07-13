@@ -4,6 +4,7 @@
     { "path": "packages/core" },
     { "path": "packages/workflow-engine" },
     { "path": "packages/project-store" },
+    { "path": "packages/sqlite-cache" },
     { "path": "packages/artifact-validator" },
     { "path": "packages/traceability" },
     { "path": "packages/plugin-registry" },

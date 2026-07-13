@@ -23,10 +23,13 @@ import {
   artifactValidate,
   approve,
   adoptProject,
+  cacheRebuild,
   createChange,
   doctor,
   ejectProject,
+  evidenceVerify,
   getStatus,
+  glossaryValidate,
   handover,
   initProject,
   inspectProject,
@@ -1477,6 +1480,7 @@ test("status and doctor return structured project diagnostics", async () => {
     "node",
     "state_schema",
     "workflow",
+    "cache",
     "plugins",
     "locks",
   ]);
@@ -1489,6 +1493,84 @@ test("status and doctor return structured project diagnostics", async () => {
   assert.equal((await doctor(root)).ok, true);
 });
 
+test("glossary and evidence validation use authoritative project files", async () => {
+  const root = await temporaryGitRepository();
+  await initProject(root, {
+    id: "leave-system",
+    name: "Leave System",
+    mode: "greenfield",
+    profile: "standard",
+  }, "INIT-CLI-VALIDATION");
+  const store = ProjectStore.open(root);
+  await store.writeYamlAtomic(".agent-team/glossary.yaml", {
+    entries: [{ term: "Queue", definition: "Work awaiting processing." }],
+  });
+
+  assert.deepEqual(await glossaryValidate(root), { valid: true, entry_count: 1, findings: [] });
+  assert.deepEqual(await evidenceVerify(root), {
+    valid: true,
+    verified: { execution_receipts: 0, execution_requests: 0, plugin_invocations: 0 },
+    findings: [],
+  });
+
+  await writeFile(join(root, ".agent-team/glossary.yaml"), "entries:\n  - term: Queue\n");
+  assert.equal((await glossaryValidate(root)).valid, false);
+  await writeFile(join(root, ".agent-team/execution-receipts.yaml"), "receipts: invalid\n");
+  assert.equal((await evidenceVerify(root)).valid, false);
+});
+
+test("evidence verification rejects schema-valid plugin claims without audit evidence", async () => {
+  const root = await temporaryGitRepository();
+  await initProject(root, {
+    id: "leave-system",
+    name: "Leave System",
+    mode: "greenfield",
+    profile: "standard",
+  }, "INIT-CLI-EVIDENCE");
+  await ProjectStore.open(root).writeYamlAtomic(".agent-team/plugin-invocations.yaml", {
+    invocations: [{
+      plugin_uri: pluginUri,
+      publisher_identity: "openai-curated-remote",
+      status: "success",
+      execution_reference: "fabricated",
+      started_at: "2026-07-13T00:00:00.000Z",
+      completed_at: "2026-07-13T00:00:01.000Z",
+      operation_id: "FABRICATED",
+      skill: "brainstorming",
+      input_digest: `sha256:${"0".repeat(64)}`,
+      output_digest: `sha256:${"1".repeat(64)}`,
+    }],
+  });
+
+  const report = await evidenceVerify(root);
+
+  assert.equal(report.valid, false);
+  assert.equal(report.findings[0].code, "PLUGIN_INVOCATION_AUDIT_MISSING");
+});
+
+test("cache rebuild integrates with diagnostics without blocking core workflow", async () => {
+  const root = await temporaryGitRepository();
+  await execFileAsync("git", ["config", "user.email", "cli@example.com"], { cwd: root });
+  await execFileAsync("git", ["config", "user.name", "CLI Test"], { cwd: root });
+  await initProject(root, {
+    id: "leave-system",
+    name: "Leave System",
+    mode: "greenfield",
+    profile: "standard",
+    cache: "sqlite",
+  }, "INIT-CLI-CACHE");
+  await execFileAsync("git", ["add", "."], { cwd: root });
+  await execFileAsync("git", ["commit", "-m", "initialize project"], { cwd: root });
+
+  const rebuilt = await cacheRebuild(root);
+  assert.equal(rebuilt.available, true);
+  assert.equal((await doctor(root)).checks.find(({ name }) => name === "cache").ok, true);
+
+  await writeFile(join(root, ".agent-team/cache/index.db"), "broken");
+  assert.equal((await doctor(root)).checks.find(({ name }) => name === "cache").ok, false);
+  assert.equal((await getStatus(root)).project.id, "leave-system");
+});
+
 test("CLI help lists the first-slice commands", async () => {
   const bin = join(repository, "packages/cli/dist/bin.js");
   const { stdout } = await execFileAsync(
@@ -1497,7 +1579,7 @@ test("CLI help lists the first-slice commands", async () => {
   );
   for (const command of [
     "init", "adopt", "inspect", "status", "start", "review", "approve", "handover",
-    "validate", "doctor", "repair", "upgrade", "eject", "uninstall",
+    "validate", "doctor", "repair", "upgrade", "eject", "uninstall", "cache", "glossary", "evidence",
   ]) {
     assert.match(stdout, new RegExp(`\\b${command}\\b`));
   }
@@ -1507,6 +1589,9 @@ test("CLI help lists the first-slice commands", async () => {
   assert.match(stdout, /adopt .*--operation-id <id>/);
   assert.match(stdout, /eject --operation-id <id>/);
   assert.match(stdout, /uninstall --operation-id <id>/);
+  assert.match(stdout, /cache rebuild/);
+  assert.match(stdout, /glossary validate/);
+  assert.match(stdout, /evidence verify/);
 
   const root = await temporaryGitRepository();
   await execFileAsync(process.execPath, [
@@ -1657,4 +1742,46 @@ test("CLI help lists the first-slice commands", async () => {
     action === "eject"
     && actor.identifier === "system-design-team-cli"
     && authorization_source === "cli_invocation"));
+});
+
+test("CLI runs cache and validation commands and rejects extra arguments", async () => {
+  const bin = join(repository, "packages/cli/dist/bin.js");
+  const root = await temporaryGitRepository();
+  await execFileAsync("git", ["config", "user.email", "cli@example.com"], { cwd: root });
+  await execFileAsync("git", ["config", "user.name", "CLI Test"], { cwd: root });
+  await execFileAsync(process.execPath, [
+    bin,
+    "init",
+    "--id", "leave-system",
+    "--name", "Leave System",
+    "--mode", "greenfield",
+    "--profile", "standard",
+    "--operation-id", "CLI-CACHE-INIT",
+    "--cache", "sqlite",
+  ], { cwd: root });
+  await ProjectStore.open(root).writeYamlAtomic(".agent-team/glossary.yaml", {
+    entries: [{ term: "Queue", definition: "Work awaiting processing." }],
+  });
+  await execFileAsync("git", ["add", "."], { cwd: root });
+  await execFileAsync("git", ["commit", "-m", "initialize project"], { cwd: root });
+
+  assert.equal(JSON.parse((await execFileAsync(
+    process.execPath,
+    [bin, "cache", "rebuild"],
+    { cwd: root },
+  )).stdout).available, true);
+  assert.equal(JSON.parse((await execFileAsync(
+    process.execPath,
+    [bin, "glossary", "validate"],
+    { cwd: root },
+  )).stdout).valid, true);
+  assert.equal(JSON.parse((await execFileAsync(
+    process.execPath,
+    [bin, "evidence", "verify"],
+    { cwd: root },
+  )).stdout).valid, true);
+  await assert.rejects(
+    () => execFileAsync(process.execPath, [bin, "cache", "rebuild", "extra"], { cwd: root }),
+    /Unexpected positional arguments/,
+  );
 });

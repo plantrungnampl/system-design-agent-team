@@ -14,6 +14,7 @@ import {
   ChangeRequestSchema,
   FRAMEWORK_VERSION,
   FrameworkLockSchema,
+  GlossarySchema,
   ExecutionReceiptListSchema,
   ExecutionReceiptSchema,
   EjectOperationSchema,
@@ -69,6 +70,7 @@ import {
   ProjectStore,
   type TransactionFaultPoint,
 } from "@system-design-team/project-store";
+import { inspectCache, rebuildCache } from "@system-design-team/sqlite-cache";
 import { propagateStaleness, traceCoverage, validateTraceability } from "@system-design-team/traceability";
 import {
   approveGate,
@@ -999,6 +1001,104 @@ export async function traceCheck(root: string) {
 export async function traceCoverageReport(root: string) {
   const document = await traceabilityDocument(ProjectStore.open(root));
   return traceCoverage(document.nodes, document.links);
+}
+
+export async function glossaryValidate(root: string) {
+  try {
+    const glossary = await ProjectStore.open(root).readYaml(".agent-team/glossary.yaml", GlossarySchema);
+    return { valid: true, entry_count: glossary.entries.length, findings: [] };
+  } catch (error) {
+    return {
+      valid: false,
+      entry_count: 0,
+      findings: [{
+        code: "GLOSSARY_INVALID",
+        message: error instanceof Error ? error.message : String(error),
+      }],
+    };
+  }
+}
+
+export async function evidenceVerify(root: string) {
+  try {
+    const store = ProjectStore.open(root);
+    const [receipts, requests, invocations] = await Promise.all([
+      executionReceipts(store),
+      executionRequests(store),
+      pluginInvocations(store),
+    ]);
+    const findings: { code: string; reference: string; message: string }[] = [];
+    const audits = new Map<string, AuditEvent>();
+    if (invocations.invocations.length > 0) {
+      const auditPath = join(resolve(root), ".agent-team/audit/events.jsonl");
+      const projectRoot = await realpath(root);
+      if (!inside(projectRoot, await realpath(auditPath))) throw new Error("PATH_OUTSIDE_PROJECT");
+      for (const line of (await readFile(auditPath, "utf8")).split(/\r?\n/).filter(Boolean)) {
+        const audit = AuditEventSchema.parse(JSON.parse(line));
+        audits.set(audit.id, audit);
+      }
+    }
+    for (const receipt of receipts.receipts) {
+      try {
+        await loadExecutionReceipt(root, receipt.id);
+      } catch (error) {
+        findings.push({
+          code: "EXECUTION_RECEIPT_INVALID",
+          reference: receipt.id,
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+    for (const request of requests.requests) {
+      try {
+        await loadExecutionRequest(root, request.id);
+      } catch (error) {
+        findings.push({
+          code: "EXECUTION_REQUEST_INVALID",
+          reference: request.id,
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+    for (const invocation of invocations.invocations) {
+      const audit = audits.get(operationKey("plugin-invocation", invocation.plugin_uri, invocation.operation_id));
+      if (!audit) {
+        findings.push({
+          code: "PLUGIN_INVOCATION_AUDIT_MISSING",
+          reference: invocation.operation_id,
+          message: `No audit event attests ${invocation.plugin_uri}`,
+        });
+      } else if (audit.action !== "plugin-invocation"
+        || audit.target !== invocation.plugin_uri
+        || audit.adapter_id !== invocation.plugin_uri
+        || audit.result !== "success") {
+        findings.push({
+          code: "PLUGIN_INVOCATION_AUDIT_MISMATCH",
+          reference: invocation.operation_id,
+          message: `Audit event does not attest ${invocation.plugin_uri}`,
+        });
+      }
+    }
+    return {
+      valid: findings.length === 0,
+      verified: {
+        execution_receipts: receipts.receipts.length,
+        execution_requests: requests.requests.length,
+        plugin_invocations: invocations.invocations.length,
+      },
+      findings,
+    };
+  } catch (error) {
+    return {
+      valid: false,
+      verified: { execution_receipts: 0, execution_requests: 0, plugin_invocations: 0 },
+      findings: [{
+        code: "EVIDENCE_INVALID",
+        reference: ".agent-team",
+        message: error instanceof Error ? error.message : String(error),
+      }],
+    };
+  }
 }
 
 export async function staleList(root: string): Promise<ArtifactRecord[]> {
@@ -2072,6 +2172,12 @@ export async function diagnostics(root: string) {
   return doctor(root);
 }
 
+export async function cacheRebuild(root: string) {
+  const cache = (await projectConfig(ProjectStore.open(root))).cache;
+  if (cache.provider !== "sqlite") throw new Error("CACHE_DISABLED");
+  return rebuildCache(root, cache.path);
+}
+
 export async function issueList(root: string) {
   const report = await doctor(root);
   return {
@@ -2141,6 +2247,23 @@ export async function doctor(root: string) {
     checks.push({ name: "workflow", ok: true, detail: `${workflow.id}@${workflow.version}` });
   } catch (error) {
     checks.push({ name: "workflow", ok: false, detail: error instanceof Error ? error.message : String(error) });
+  }
+  try {
+    const cache = (await projectConfig(store)).cache;
+    if (cache.provider === "none") {
+      checks.push({ name: "cache", ok: true, detail: "disabled" });
+    } else {
+      const status = await inspectCache(root, cache.path);
+      checks.push({
+        name: "cache",
+        ok: status.available,
+        detail: status.available
+          ? `${status.document_count} documents at ${status.source_commit}`
+          : status.reason,
+      });
+    }
+  } catch (error) {
+    checks.push({ name: "cache", ok: false, detail: error instanceof Error ? error.message : String(error) });
   }
   try {
     const [plugins, workflow, catalogue] = await Promise.all([
