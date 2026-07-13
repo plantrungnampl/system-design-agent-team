@@ -3,10 +3,13 @@ import {
   AgentExecutionResultSchema,
   AgentManifestSchema,
   CapabilityRequirementsSchema,
+  ExecutionEvidenceSchema,
+  GateIdSchema,
   type AgentExecutionResult,
   type AgentManifest,
   type CapabilityReport,
   type CapabilityRequirements,
+  type ExecutionEvidenceContext,
   type PluginInvocationResult,
 } from "@system-design-team/core";
 import type {
@@ -15,6 +18,7 @@ import type {
   PluginResolution,
   PluginRegistry,
 } from "@system-design-team/plugin-registry";
+import { evaluateExecutionPolicy } from "@system-design-team/workflow-engine";
 
 export interface ContextArtifact {
   id: string;
@@ -54,6 +58,8 @@ export interface AgentExecutionAdapter {
   collectResult(handle: ExecutionHandle, runtimeResult?: unknown): Promise<AgentExecutionResult>;
   cancel(handle: ExecutionHandle): Promise<void>;
 }
+
+export type ExecutionContextResolver = (dispatch: AgentDispatch) => Promise<ExecutionEvidenceContext>;
 
 function freezeRecursively<T>(value: T): T {
   if (value && typeof value === "object" && !Object.isFrozen(value)) {
@@ -180,7 +186,10 @@ export function prepareDispatch(
 
 export class ManualCodexAdapter implements PluginAdapter, AgentExecutionAdapter {
   readonly #cancelled = new WeakSet<ExecutionHandle>();
-  readonly #prepared = new WeakMap<ExecutionHandle, PreparedExecution>();
+  readonly #authorized = new WeakMap<PreparedExecution, { digest: string; dispatch: AgentDispatch }>();
+  readonly #executions = new WeakMap<ExecutionHandle, { digest: string; dispatch: AgentDispatch }>();
+
+  constructor(readonly contextResolver?: ExecutionContextResolver) {}
 
   async resolve(_uri: string): Promise<PluginResolution> {
     throw new Error("PLUGIN_RUNTIME_REQUIRED");
@@ -208,16 +217,42 @@ export class ManualCodexAdapter implements PluginAdapter, AgentExecutionAdapter 
     });
     const report = capabilityReport(requirements);
     if (!report.allowed) throw new Error(report.blockers[0]);
+    const destructive = ownedDispatch.destructive === true;
+    const sensitive = requirements.permission_profile === "code_write"
+      || requirements.permission_profile === "production_execution"
+      || requirements.command_class === "production_impact"
+      || destructive;
+    if (sensitive) {
+      if (!this.contextResolver) throw new Error("EXECUTION_POLICY_CONTEXT_REQUIRED");
+      const evidence = ExecutionEvidenceSchema.safeParse(ownedDispatch.execution_evidence);
+      if (!evidence.success) throw new Error("EXECUTION_EVIDENCE_REQUIRED");
+      const policy = evaluateExecutionPolicy({
+        ...requirements,
+        destructive,
+        evidence: evidence.data,
+        ...(typeof ownedDispatch.target_gate === "string"
+          ? { target_gate: GateIdSchema.parse(ownedDispatch.target_gate) }
+          : {}),
+      }, await this.contextResolver(ownedDispatch));
+      if (!policy.allowed) {
+        throw new Error(policy.blockers.find((blocker) => /G[68]_APPROVAL_REQUIRED/.test(blocker))
+          ?? policy.blockers[0]);
+      }
+    }
     freezeRecursively(ownedDispatch);
-    return freezeRecursively({
+    const prepared = freezeRecursively({
       dispatch: ownedDispatch,
       digest: createHash("sha256").update(JSON.stringify(ownedDispatch)).digest("hex"),
     });
+    this.#authorized.set(prepared, { digest: prepared.digest, dispatch: structuredClone(ownedDispatch) });
+    return prepared;
   }
 
   async execute(prepared: PreparedExecution): Promise<ExecutionHandle> {
-    const handle: ExecutionHandle = { status: "awaiting_runtime", digest: prepared.digest };
-    this.#prepared.set(handle, prepared);
+    const state = this.#authorized.get(prepared);
+    if (!state) throw new Error("PREPARED_EXECUTION_INVALID");
+    const handle: ExecutionHandle = Object.freeze({ status: "awaiting_runtime", digest: state.digest });
+    this.#executions.set(handle, state);
     return handle;
   }
 
@@ -226,10 +261,13 @@ export class ManualCodexAdapter implements PluginAdapter, AgentExecutionAdapter 
     if (runtimeResult === undefined) throw new Error("RUNTIME_RESULT_REQUIRED");
     const parsed = AgentExecutionResultSchema.safeParse(runtimeResult);
     if (!parsed.success) throw new Error("EXECUTION_RESULT_INVALID");
-    if (parsed.data.dispatch_digest !== handle.digest) throw new Error("EXECUTION_DIGEST_MISMATCH");
-    const prepared = this.#prepared.get(handle);
-    if (!prepared) throw new Error("EXECUTION_HANDLE_INVALID");
-    const expected = prepared.dispatch;
+    if (parsed.data.checkpoints.some(({ status }) => status !== "completed")) {
+      throw new Error("CHECKPOINT_NOT_COMPLETED");
+    }
+    const state = this.#executions.get(handle);
+    if (!state) throw new Error("EXECUTION_HANDLE_INVALID");
+    if (parsed.data.dispatch_digest !== state.digest) throw new Error("EXECUTION_DIGEST_MISMATCH");
+    const expected = state.dispatch;
     if ((typeof expected.execution_id === "string" && parsed.data.execution_id !== expected.execution_id)
       || (typeof expected.permission_profile === "string"
         && parsed.data.permission_profile !== expected.permission_profile)
@@ -237,7 +275,10 @@ export class ManualCodexAdapter implements PluginAdapter, AgentExecutionAdapter 
       || JSON.stringify(parsed.data.authorized_paths) !== JSON.stringify(expected.authorized_scope)) {
       throw new Error("PERMISSION_PROFILE_ESCALATION");
     }
-    return runtimeResult as AgentExecutionResult;
+    if (parsed.data.destructive !== (expected.destructive === true)) {
+      throw new Error("DESTRUCTIVE_SCOPE_MISMATCH");
+    }
+    return parsed.data;
   }
 
   async cancel(handle: ExecutionHandle): Promise<void> {

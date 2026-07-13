@@ -1,13 +1,20 @@
 import type {
   AgentExecutionResult,
   ApprovalRecord,
+  ArtifactEvidenceReference,
+  ExecutionEvidenceContext,
   ExecutionPolicyInput,
+  GateApprovalReference,
   GateId,
   PhaseStatus,
   WorkflowDefinition,
   WorkflowState,
 } from "@system-design-team/core";
-import { AgentExecutionResultSchema, ExecutionPolicyInputSchema } from "@system-design-team/core";
+import {
+  AgentExecutionResultSchema,
+  ExecutionEvidenceContextSchema,
+  ExecutionPolicyInputSchema,
+} from "@system-design-team/core";
 
 export interface TransitionRequest {
   phase: string;
@@ -25,6 +32,8 @@ export interface ExecutionPolicyReport {
   allowed: boolean;
   blockers: string[];
 }
+
+type AuthorizationActor = ApprovalRecord["approved_by"];
 
 const transitions: Record<PhaseStatus, readonly PhaseStatus[]> = {
   not_started: ["ready"],
@@ -95,6 +104,7 @@ export function approveGate(
   workflow: WorkflowDefinition,
   approval: ApprovalRecord,
   execution?: AgentExecutionResult,
+  evidenceContext?: ExecutionEvidenceContext,
 ): WorkflowState {
   if (state.completed_operations.includes(approval.id)) return state;
 
@@ -116,17 +126,8 @@ export function approveGate(
   }
   if (approval.gate === "G7" || approval.gate === "G8") {
     if (!execution) throw new Error("EXECUTION_EVIDENCE_REQUIRED");
-    const parsed = AgentExecutionResultSchema.safeParse(execution);
-    if (!parsed.success) throw new Error("EXECUTION_RESULT_INVALID");
-    if (parsed.data.status !== "completed") throw new Error("EXECUTION_NOT_COMPLETED");
-    const report = evaluateExecutionPolicy({
-      permission_profile: parsed.data.permission_profile,
-      authorized_paths: parsed.data.authorized_paths,
-      command_class: parsed.data.command_class,
-      destructive: parsed.data.destructive ?? false,
-      evidence: parsed.data.evidence,
-      target_gate: approval.gate,
-    });
+    if (!evidenceContext) throw new Error("EXECUTION_EVIDENCE_CONTEXT_REQUIRED");
+    const report = evaluateExecutionResult(execution, approval.gate, evidenceContext, approval.approved_by);
     if (!report.allowed) throw new Error(report.blockers[0]);
   }
   if (approval.decision !== "approved" && approval.decision !== "approved_with_conditions") {
@@ -165,51 +166,112 @@ export function rejectGate(
   });
 }
 
-export function evaluateExecutionPolicy(input: ExecutionPolicyInput): ExecutionPolicyReport {
+function approvedGate(reference: GateApprovalReference | undefined, context: ExecutionEvidenceContext): boolean {
+  if (!reference) return false;
+  return context.approvals.some((approval) => approval.id === reference.approval_id
+    && approval.gate === reference.gate
+    && (approval.decision === "approved" || approval.decision === "approved_with_conditions")
+    && approval.approved_by.type === "human");
+}
+
+function currentArtifact(
+  reference: ArtifactEvidenceReference | undefined,
+  context: ExecutionEvidenceContext,
+): boolean {
+  if (!reference?.approval_id) return false;
+  const artifact = context.artifacts.find(({ id }) => id === reference.artifact_id);
+  const review = context.reviews.find(({ id }) => id === reference.review_id);
+  const approval = context.approvals.find(({ id }) => id === reference.approval_id);
+  return artifact?.version === reference.version
+    && artifact.status === reference.status
+    && review?.verdict === "approved"
+    && review.artifact_versions[reference.artifact_id] === reference.version
+    && (approval?.decision === "approved" || approval?.decision === "approved_with_conditions")
+    && approval.approved_by.type === "human"
+    && approval.gate === artifact.required_gate
+    && approval.artifact_versions[reference.artifact_id] === reference.version;
+}
+
+export function evaluateExecutionPolicy(
+  input: ExecutionPolicyInput,
+  contextInput: ExecutionEvidenceContext,
+  authorizingActor?: AuthorizationActor,
+): ExecutionPolicyReport {
   const policy = ExecutionPolicyInputSchema.parse(input);
+  const context = ExecutionEvidenceContextSchema.parse(contextInput);
   const blockers: string[] = [];
   const add = (condition: boolean, blocker: string) => {
     if (condition && !blockers.includes(blocker)) blockers.push(blocker);
   };
   const production = policy.permission_profile === "production_execution"
     || policy.command_class === "production_impact";
+  const gate = (id: GateId) => policy.evidence.gate_approvals.find((reference) => reference.gate === id);
 
   add(policy.permission_profile === "code_write"
-    && !policy.evidence.gate_approvals.includes("G6"), "G6_APPROVAL_REQUIRED");
+    && !approvedGate(gate("G6"), context), "G6_APPROVAL_REQUIRED");
   if (policy.target_gate === "G7" || policy.target_gate === "G8" || production) {
-    add(policy.evidence.qa !== "current", "QA_EVIDENCE_NOT_CURRENT");
-    add(policy.evidence.security !== "current", "SECURITY_EVIDENCE_NOT_CURRENT");
-    add(policy.evidence.data !== "current", "DATA_EVIDENCE_NOT_CURRENT");
+    add(!currentArtifact(policy.evidence.qa, context), "QA_EVIDENCE_NOT_CURRENT");
+    add(!currentArtifact(policy.evidence.security, context), "SECURITY_EVIDENCE_NOT_CURRENT");
+    add(!currentArtifact(policy.evidence.data, context), "DATA_EVIDENCE_NOT_CURRENT");
   }
   if (production) {
-    add(!policy.evidence.gate_approvals.includes("G8"), "G8_APPROVAL_REQUIRED");
+    add(!approvedGate(gate("G8"), context), "G8_APPROVAL_REQUIRED");
   }
   if (policy.target_gate === "G8" || production) {
-    add(!policy.evidence.human_authorization, "HUMAN_AUTHORIZATION_REQUIRED");
-    add(policy.evidence.backup !== "passed", "BACKUP_VERIFICATION_REQUIRED");
-    add(policy.evidence.rollback !== "current", "ROLLBACK_PLAN_REQUIRED");
+    add(production ? !approvedGate(gate("G8"), context) : authorizingActor?.type !== "human",
+      "HUMAN_AUTHORIZATION_REQUIRED");
+    add(!currentArtifact(policy.evidence.backup, context), "BACKUP_VERIFICATION_REQUIRED");
+    add(!currentArtifact(policy.evidence.rollback, context), "ROLLBACK_PLAN_REQUIRED");
   }
   if (policy.destructive) {
-    add(!policy.evidence.human_authorization, "HUMAN_AUTHORIZATION_REQUIRED");
-    add(!policy.evidence.destructive_confirmation, "DESTRUCTIVE_CONFIRMATION_REQUIRED");
-    add(!policy.evidence.scope_confirmation, "SCOPE_CONFIRMATION_REQUIRED");
-    add(policy.evidence.backup !== "passed", "BACKUP_VERIFICATION_REQUIRED");
-    add(policy.evidence.dry_run !== "passed", "DRY_RUN_REQUIRED");
-    add(policy.evidence.rollback !== "current", "ROLLBACK_PLAN_REQUIRED");
+    add(!approvedGate(policy.evidence.destructive_confirmation, context), "DESTRUCTIVE_CONFIRMATION_REQUIRED");
+    add(!approvedGate(policy.evidence.scope_confirmation, context), "SCOPE_CONFIRMATION_REQUIRED");
+    add(!currentArtifact(policy.evidence.backup, context), "BACKUP_VERIFICATION_REQUIRED");
+    add(!currentArtifact(policy.evidence.dry_run, context), "DRY_RUN_REQUIRED");
+    add(!currentArtifact(policy.evidence.rollback, context), "ROLLBACK_PLAN_REQUIRED");
   }
   return { allowed: blockers.length === 0, blockers };
+}
+
+export function evaluateExecutionResult(
+  execution: AgentExecutionResult,
+  targetGate: GateId | undefined,
+  context: ExecutionEvidenceContext,
+  actor?: AuthorizationActor,
+): ExecutionPolicyReport {
+  const parsed = AgentExecutionResultSchema.safeParse(execution);
+  if (!parsed.success) return { allowed: false, blockers: ["EXECUTION_RESULT_INVALID"] };
+  if (parsed.data.status !== "completed") return { allowed: false, blockers: ["EXECUTION_NOT_COMPLETED"] };
+  if (parsed.data.checkpoints.some(({ status }) => status !== "completed")) {
+    return { allowed: false, blockers: ["CHECKPOINT_NOT_COMPLETED"] };
+  }
+  return evaluateExecutionPolicy({
+    permission_profile: parsed.data.permission_profile,
+    authorized_paths: parsed.data.authorized_paths,
+    command_class: parsed.data.command_class,
+    destructive: parsed.data.destructive,
+    evidence: parsed.data.evidence,
+    target_gate: targetGate,
+  }, context, actor);
 }
 
 export function gateReadiness(
   state: WorkflowState,
   workflow: WorkflowDefinition,
   gate: GateId,
+  execution?: AgentExecutionResult,
+  evidenceContext?: ExecutionEvidenceContext,
 ): GateReadiness {
-  const blockers = workflow.phases
-    .filter((phase) => phase.gate === gate)
+  const configured = workflow.phases.filter((phase) => phase.gate === gate);
+  if (configured.length === 0) return { gate, ready: false, blockers: ["GATE_NOT_CONFIGURED"] };
+  const blockers = configured
     .filter((phase) => !approvedStatuses.includes(state.phases[phase.id]?.status ?? "not_started"))
     .map((phase) => `PHASE_NOT_APPROVED:${phase.id}`)
     .sort();
+  if (gate === "G7" || gate === "G8") {
+    if (!execution || !evidenceContext) blockers.push("EXECUTION_EVIDENCE_REQUIRED");
+    else blockers.push(...evaluateExecutionResult(execution, gate, evidenceContext).blockers);
+  }
 
   return { gate, ready: blockers.length === 0, blockers };
 }

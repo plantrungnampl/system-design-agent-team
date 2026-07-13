@@ -223,22 +223,34 @@ export const CapabilityReportSchema = z.object({
   blockers: z.array(z.string().min(1)),
 });
 
+export const GateApprovalReferenceSchema = z.object({
+  gate: GateIdSchema,
+  approval_id: z.string().min(1),
+});
+
+export const ArtifactEvidenceReferenceSchema = z.object({
+  artifact_id: z.string().min(1),
+  version: z.number().int().positive(),
+  status: z.enum(["in_review", "approved", "approved_with_conditions"]),
+  review_id: z.string().min(1),
+  approval_id: z.string().min(1).optional(),
+});
+
 export const ExecutionEvidenceSchema = z.object({
-  gate_approvals: z.array(GateIdSchema).default([]),
-  qa: z.enum(["current", "stale", "missing"]),
-  security: z.enum(["current", "stale", "missing"]),
-  data: z.enum(["current", "stale", "missing"]),
-  human_authorization: z.boolean(),
-  destructive_confirmation: z.boolean(),
-  scope_confirmation: z.boolean(),
-  backup: z.enum(["passed", "failed", "missing"]),
-  dry_run: z.enum(["passed", "failed", "missing"]),
-  rollback: z.enum(["current", "stale", "missing"]),
+  gate_approvals: z.array(GateApprovalReferenceSchema).default([]),
+  qa: ArtifactEvidenceReferenceSchema.optional(),
+  security: ArtifactEvidenceReferenceSchema.optional(),
+  data: ArtifactEvidenceReferenceSchema.optional(),
+  destructive_confirmation: GateApprovalReferenceSchema.optional(),
+  scope_confirmation: GateApprovalReferenceSchema.optional(),
+  backup: ArtifactEvidenceReferenceSchema.optional(),
+  dry_run: ArtifactEvidenceReferenceSchema.optional(),
+  rollback: ArtifactEvidenceReferenceSchema.optional(),
 });
 
 export const ExecutionPolicyInputSchema = CapabilityRequirementsSchema.extend({
   target_gate: GateIdSchema.optional(),
-  destructive: z.boolean().optional(),
+  destructive: z.boolean(),
   evidence: ExecutionEvidenceSchema,
 });
 
@@ -442,6 +454,12 @@ export const AuditEventSchema = z.object({
   }
 });
 
+export const ExecutionEvidenceContextSchema = z.object({
+  artifacts: z.array(ArtifactRecordSchema),
+  reviews: z.array(ReviewRecordSchema),
+  approvals: z.array(ApprovalRecordSchema),
+});
+
 export type ProjectMode = z.infer<typeof ProjectModeSchema>;
 export type ProjectProfile = z.infer<typeof ProjectProfileSchema>;
 export type ProjectConfig = z.infer<typeof ProjectConfigSchema>;
@@ -474,6 +492,9 @@ export type AuthorizedPaths = z.infer<typeof AuthorizedPathsSchema>;
 export type CapabilityRequirements = z.infer<typeof CapabilityRequirementsSchema>;
 export type CapabilityReport = z.infer<typeof CapabilityReportSchema>;
 export type ExecutionEvidence = z.infer<typeof ExecutionEvidenceSchema>;
+export type GateApprovalReference = z.infer<typeof GateApprovalReferenceSchema>;
+export type ArtifactEvidenceReference = z.infer<typeof ArtifactEvidenceReferenceSchema>;
+export type ExecutionEvidenceContext = z.infer<typeof ExecutionEvidenceContextSchema>;
 export type ExecutionPolicyInput = z.infer<typeof ExecutionPolicyInputSchema>;
 export type ExecutionCheckpoint = z.infer<typeof ExecutionCheckpointSchema>;
 export type AgentExecutionResult = z.infer<typeof AgentExecutionResultSchema>;

@@ -21,6 +21,7 @@ import {
   initProject,
   invokePlugin,
   issueList,
+  loadExecutionResult,
   rejectGate,
   repair,
   reviewPhase,
@@ -37,7 +38,7 @@ const pluginUri = "plugin://superpowers@openai-curated-remote";
 
 class FakePluginAdapter {
   async resolve(uri) {
-    return { uri, publisher_identity: "openai-curated-remote", status: "available" };
+    return { uri, publisher_identity: uri.split("@").at(-1), status: "available" };
   }
 
   async verifySkill() {
@@ -66,6 +67,26 @@ async function temporaryDirectory(t, prefix) {
   return root;
 }
 
+function reviewerResult(overrides = {}) {
+  return {
+    execution_id: "EXEC-REVIEW",
+    dispatch_digest: "a".repeat(64),
+    status: "completed",
+    permission_profile: "read_only_assessment",
+    authorized_paths: { read: [".agent-team/**"], write: [], execute: [] },
+    command_class: "safe_read",
+    destructive: false,
+    checkpoints: [{
+      id: "review-complete",
+      status: "completed",
+      timestamp: "2026-07-13T00:00:00.000Z",
+      evidence: [`sha256:${"a".repeat(64)}`],
+    }],
+    evidence: { gate_approvals: [] },
+    ...overrides,
+  };
+}
+
 test("required CLI safety routes expose real project state", async (t) => {
   const root = await temporaryDirectory(t, "system-design-team-safety-routes-");
   await execFileAsync("git", ["init", "--quiet"], { cwd: root });
@@ -90,19 +111,128 @@ test("required CLI safety routes expose real project state", async (t) => {
   for (const command of ["reject <gate>", "gate readiness <gate>", "secrets scan", "diagnostics", "issue list"]) {
     assert(stdout.includes(command));
   }
+  assert(stdout.includes("--execution-evidence <path>"));
 });
 
 test("secrets scan reports tracked credential material", async (t) => {
   const root = await temporaryDirectory(t, "system-design-team-secret-scan-");
   await execFileAsync("git", ["init", "--quiet"], { cwd: root });
   await writeFile(join(root, "config.txt"), "api_key = 'not-a-real-secret-value'\n");
-  await execFileAsync("git", ["add", "config.txt"], { cwd: root });
+  await writeFile(join(root, "cookie.txt"), "session_token=abcdefghijklmnopqrstuvwxyz\n");
+  await writeFile(join(root, "database.txt"), "postgresql://admin:password@prod.example/app\n");
+  await writeFile(join(root, "private.pem"), "-----BEGIN PRIVATE KEY-----\nnot-real\n-----END PRIVATE KEY-----\n");
+  await writeFile(join(root, "provider.txt"), "AWS_SECRET_ACCESS_KEY=abcdefghijklmnopqrstuvwxyz123456\n");
+  await execFileAsync("git", ["add", "."], { cwd: root });
 
   const result = await secretsScan(root);
 
   assert.equal(result.valid, false);
-  assert.deepEqual(result.findings.map(({ path }) => path), ["config.txt"]);
+  assert.deepEqual(result.findings.map(({ path }) => path), [
+    "config.txt",
+    "cookie.txt",
+    "database.txt",
+    "private.pem",
+    "provider.txt",
+  ]);
   assert(!JSON.stringify(result).includes("not-a-real-secret-value"));
+});
+
+test("CLI loads only contained Git-tracked structured execution evidence", async (t) => {
+  const root = await temporaryDirectory(t, "system-design-team-execution-file-");
+  await execFileAsync("git", ["init", "--quiet"], { cwd: root });
+  await writeFile(join(root, "g7-execution.yaml"), JSON.stringify(reviewerResult()));
+  await writeFile(join(root, "invalid-execution.yaml"), "status: completed\n");
+  await execFileAsync("git", ["add", "."], { cwd: root });
+
+  assert.deepEqual(await loadExecutionResult(root, "g7-execution.yaml"), reviewerResult());
+  await assert.rejects(
+    () => loadExecutionResult(root, "invalid-execution.yaml"),
+    /EXECUTION_RESULT_INVALID/,
+  );
+  await assert.rejects(() => loadExecutionResult(root, "../outside.yaml"), /PATH_OUTSIDE_PROJECT/);
+});
+
+test("gate readiness CLI accepts an execution evidence reference for G7 and G8", async (t) => {
+  const root = await temporaryDirectory(t, "system-design-team-gate-evidence-");
+  await execFileAsync("git", ["init", "--quiet"], { cwd: root });
+  await initProject(root, {
+    id: "leave-system",
+    name: "Leave System",
+    mode: "greenfield",
+    profile: "standard",
+  });
+  await writeFile(join(root, "gates.yaml"), JSON.stringify(reviewerResult()));
+  await execFileAsync("git", ["add", "gates.yaml"], { cwd: root });
+  const bin = join(import.meta.dirname, "../packages/cli/dist/bin.js");
+
+  for (const gate of ["G7", "G8"]) {
+    const { stdout } = await execFileAsync(process.execPath, [
+      bin,
+      "gate",
+      "readiness",
+      gate,
+      "--execution-evidence",
+      "gates.yaml",
+    ], { cwd: root });
+    const result = JSON.parse(stdout);
+    assert.equal(result.gate, gate);
+    assert.equal(result.ready, false);
+    assert(result.blockers.some((blocker) => blocker.includes("EVIDENCE")));
+  }
+});
+
+test("G7 review requires a completed verified reviewer execution result", async (t) => {
+  const root = await temporaryDirectory(t, "system-design-team-review-execution-");
+  await execFileAsync("git", ["init", "--quiet"], { cwd: root });
+  await initProject(root, {
+    id: "leave-system",
+    name: "Leave System",
+    mode: "greenfield",
+    profile: "standard",
+  });
+  const store = ProjectStore.open(root);
+  const state = await store.readWorkflowState();
+  state.phases.implementation.status = "artifact_validation";
+  state.current_phase = "implementation";
+  await store.writeYamlAtomic(".agent-team/workflow-state.yaml", state);
+  const registry = parse(await readFile(join(root, ".agent-team/artifact-registry.yaml"), "utf8"));
+  const artifact = registry.artifacts.find(({ id }) => id === "IMPLEMENTATION-EVIDENCE");
+  artifact.status = "in_review";
+  const content = [
+    "---",
+    "artifact_id: IMPLEMENTATION-EVIDENCE",
+    "version: 1",
+    "status: in_review",
+    "owner: developer",
+    "reviewer: code-reviewer",
+    "---",
+    "# Implementation Evidence",
+    "Current evidence.",
+  ].join("\n");
+  artifact.checksum = `sha256:${createHash("sha256").update(content).digest("hex")}`;
+  await store.writeYamlAtomic(".agent-team/artifact-registry.yaml", registry);
+  await store.writeTextAtomic(`.agent-team/${artifact.path}`, content);
+
+  await assert.rejects(() => reviewPhase(
+    root,
+    "implementation",
+    "code-reviewer",
+    "approved",
+    "G7-REVIEW",
+    pluginAdapter,
+  ), /REVIEW_EXECUTION_REQUIRED/);
+  await assert.rejects(() => reviewPhase(
+    root,
+    "implementation",
+    "code-reviewer",
+    "approved",
+    "G7-REVIEW",
+    pluginAdapter,
+    reviewerResult({ checkpoints: [{
+      ...reviewerResult().checkpoints[0],
+      status: "failed",
+    }] }),
+  ), /CHECKPOINT_NOT_COMPLETED/);
 });
 
 test("reject records a human decision and append-only audit event", async (t) => {

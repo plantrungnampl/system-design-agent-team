@@ -7,6 +7,7 @@ import { promisify } from "node:util";
 import { parseArtifact, validateReviewReadyArtifact } from "@system-design-team/artifact-validator";
 import {
   AgentManifestSchema,
+  AgentExecutionResultSchema,
   AuditEventSchema,
   ApprovalListSchema,
   ApprovalRecordSchema,
@@ -51,6 +52,7 @@ import { GENERATED_LOCK_PATHS, ProjectStore } from "@system-design-team/project-
 import { propagateStaleness, traceCoverage, validateTraceability } from "@system-design-team/traceability";
 import {
   approveGate,
+  evaluateExecutionResult,
   gateReadiness,
   rejectGate as rejectWorkflowGate,
   transitionPhase,
@@ -357,6 +359,15 @@ async function pluginInvocations(store: ProjectStore): Promise<PluginInvocationL
 
 async function artifactRegistry(store: ProjectStore) {
   return store.readYaml(".agent-team/artifact-registry.yaml", ArtifactRegistrySchema);
+}
+
+async function executionEvidenceContext(store: ProjectStore) {
+  const [registry, reviews, approvals] = await Promise.all([
+    artifactRegistry(store),
+    store.readYaml(".agent-team/reviews.yaml", ReviewListSchema),
+    store.readYaml(".agent-team/approvals.yaml", ApprovalListSchema),
+  ]);
+  return { artifacts: registry.artifacts, reviews: reviews.reviews, approvals: approvals.approvals };
 }
 
 function requireOperationId(operationId: string): void {
@@ -824,6 +835,7 @@ export async function reviewPhase(
   verdictInput: ReviewVerdict,
   operationId: string,
   adapter?: PluginAdapter,
+  execution?: AgentExecutionResult,
 ): Promise<WorkflowState> {
   requireOperationId(operationId);
   const reviewerId = reviewer.trim();
@@ -841,6 +853,15 @@ export async function reviewPhase(
   ]);
   const definition = workflow.phases.find((candidate) => candidate.id === phase);
   if (!definition) throw new Error("PHASE_NOT_CONFIGURED");
+  if (definition.gate === "G7" || definition.gate === "G8") {
+    if (!execution) throw new Error("REVIEW_EXECUTION_REQUIRED");
+    const report = evaluateExecutionResult(execution, "G7", {
+      artifacts: registry.artifacts,
+      reviews: reviews.reviews,
+      approvals: (await store.readYaml(".agent-team/approvals.yaml", ApprovalListSchema)).approvals,
+    });
+    if (!report.allowed) throw new Error(report.blockers[0]);
+  }
   const existing = reviews.reviews.find((review) => review.id === evidenceId);
   if (state.completed_operations.includes(verdictId)) {
     if (!existing) throw new Error("REVIEW_EVIDENCE_MISSING");
@@ -1001,7 +1022,11 @@ export async function approve(
   const nextApprovals = ApprovalListSchema.parse({
     approvals: existing ? approvals.approvals : [...approvals.approvals, approval],
   });
-  const nextState = approveGate(state, workflow, approval, execution);
+  const nextState = approveGate(state, workflow, approval, execution, {
+    artifacts: registry.artifacts,
+    reviews: reviews.reviews,
+    approvals: approvals.approvals,
+  });
   const { project } = await projectConfig(store);
   await store.transaction(scopedOperation, [
     { path: ".agent-team/approvals.yaml", content: stringify(nextApprovals) },
@@ -1224,13 +1249,37 @@ export async function getStatus(root: string) {
   };
 }
 
-export async function gateReadinessReport(root: string, gate: GateId) {
+export async function gateReadinessReport(root: string, gate: GateId, execution?: AgentExecutionResult) {
   const store = ProjectStore.open(root);
-  const [state, workflow] = await Promise.all([
+  const [state, workflow, context] = await Promise.all([
     store.readWorkflowState(),
     configuredWorkflow(store),
+    executionEvidenceContext(store),
   ]);
-  return gateReadiness(state, workflow, gate);
+  return gateReadiness(state, workflow, gate, execution, context);
+}
+
+export async function loadExecutionResult(root: string, reference: string): Promise<AgentExecutionResult> {
+  if (!reference || isAbsolute(reference) || reference.includes("\\")
+    || reference.split("/").some((segment) => segment === "" || segment === "." || segment === "..")) {
+    throw new Error("PATH_OUTSIDE_PROJECT");
+  }
+  const projectRoot = await realpath(root);
+  const target = resolve(projectRoot, reference);
+  if (!inside(projectRoot, target)) throw new Error("PATH_OUTSIDE_PROJECT");
+  await execFileAsync("git", ["ls-files", "--error-unmatch", "--", reference], { cwd: projectRoot })
+    .catch(() => { throw new Error("EXECUTION_EVIDENCE_NOT_TRACKED"); });
+  const actual = await realpath(target);
+  if (!inside(projectRoot, actual)) throw new Error("PATH_OUTSIDE_PROJECT");
+  let value: unknown;
+  try {
+    value = parse(await readFile(actual, "utf8"));
+  } catch {
+    throw new Error("EXECUTION_RESULT_INVALID");
+  }
+  const result = AgentExecutionResultSchema.safeParse(value);
+  if (!result.success) throw new Error("EXECUTION_RESULT_INVALID");
+  return result.data;
 }
 
 export async function secretsScan(root: string) {
@@ -1240,8 +1289,14 @@ export async function secretsScan(root: string) {
   } catch {
     throw new Error("GIT_REQUIRED");
   }
-  // ponytail: common credential assignments only; use a dedicated scanner when one is adopted.
-  const secret = /\b(?:api[_-]?key|secret|token|password)\b\s*[:=]\s*["']?[^\s"']{8,}/i;
+  // ponytail: deterministic signatures only; use a dedicated scanner when one is adopted.
+  const secrets = [
+    /\b(?:api[_-]?key|secret|token|password|cookie|session[_-]?(?:id|token))\b\s*[:=]\s*["']?[^\s"']{8,}/i,
+    /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/,
+    /\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|sqlserver):\/\/[^\s:@]+:[^\s@]+@/i,
+    /\b(?:AWS_SECRET_ACCESS_KEY|AZURE_CLIENT_SECRET|GOOGLE_API_KEY)\s*=/,
+    /\b(?:AKIA|ASIA)[A-Z0-9]{16}\b|\bgh[pousr]_[A-Za-z0-9_]{20,}\b|\bAIza[A-Za-z0-9_-]{30,}\b/,
+  ];
   const findings: { path: string; line: number; code: string }[] = [];
   for (const path of stdout.split("\0").filter(Boolean).sort()) {
     let content: string;
@@ -1250,9 +1305,9 @@ export async function secretsScan(root: string) {
     } catch {
       continue;
     }
-    content.split(/\r?\n/).forEach((line, index) => {
-      if (secret.test(line)) findings.push({ path, line: index + 1, code: "POSSIBLE_SECRET" });
-    });
+    const lines = content.split(/\r?\n/);
+    const index = lines.findIndex((line) => secrets.some((secret) => secret.test(line)));
+    if (index >= 0) findings.push({ path, line: index + 1, code: "POSSIBLE_SECRET" });
   }
   return { valid: findings.length === 0, findings };
 }

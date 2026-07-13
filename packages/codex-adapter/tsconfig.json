@@ -7,7 +7,8 @@
   },
   "references": [
     { "path": "../core" },
-    { "path": "../plugin-registry" }
+    { "path": "../plugin-registry" },
+    { "path": "../workflow-engine" }
   ],
   "include": ["src/**/*.ts"]
 }

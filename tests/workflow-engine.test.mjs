@@ -215,27 +215,56 @@ test("reports gate blockers in deterministic phase order", () => {
   });
 });
 
+const evidenceArtifacts = ["QA", "SECURITY", "DATA", "BACKUP", "DRY-RUN", "ROLLBACK"].map((id) => ({
+  id,
+  path: `${id.toLowerCase()}.md`,
+  type: "document",
+  version: 1,
+  status: "approved",
+  owner: "qa-lead",
+  reviewer: "tester",
+  dependencies: [],
+  consumers: [],
+  required_gate: "G7",
+  checksum: `sha256:${"a".repeat(64)}`,
+}));
+const evidenceContext = {
+  artifacts: evidenceArtifacts,
+  reviews: evidenceArtifacts.map(({ id }) => ({
+    id: `REV-${id}`,
+    phase: "release-readiness",
+    reviewer: "tester",
+    verdict: "approved",
+    artifact_versions: { [id]: 1 },
+    timestamp: "2026-07-13T00:00:00Z",
+  })),
+  approvals: ["G6", "G7", "G8"].map((gate) => ({
+    id: `APR-${gate}`,
+    gate,
+    decision: "approved",
+    approved_by: { type: "human", identifier: "project-owner" },
+    artifact_versions: Object.fromEntries(evidenceArtifacts.map(({ id }) => [id, 1])),
+    timestamp: "2026-07-13T00:00:00Z",
+  })),
+};
+const artifactReference = (id) => ({
+  artifact_id: id,
+  version: 1,
+  status: "approved",
+  review_id: `REV-${id}`,
+  approval_id: "APR-G7",
+});
+const gateReference = (gate) => ({ gate, approval_id: `APR-${gate}` });
 const policyInput = {
   permission_profile: "code_write",
   authorized_paths: { read: ["src/**"], write: ["src/**"], execute: ["npm test"] },
   command_class: "mutating_local",
   destructive: false,
-  evidence: {
-    gate_approvals: [],
-    qa: "missing",
-    security: "missing",
-    data: "missing",
-    human_authorization: false,
-    destructive_confirmation: false,
-    scope_confirmation: false,
-    backup: "missing",
-    dry_run: "missing",
-    rollback: "missing",
-  },
+  evidence: { gate_approvals: [] },
 };
 
-test("G6 blocks code-write execution until approved", () => {
-  assert.deepEqual(evaluateExecutionPolicy(policyInput).blockers, ["G6_APPROVAL_REQUIRED"]);
+test("G6 blocks code-write execution until authoritatively approved", () => {
+  assert.deepEqual(evaluateExecutionPolicy(policyInput, evidenceContext).blockers, ["G6_APPROVAL_REQUIRED"]);
 });
 
 test("G7 requires current QA, security, and data evidence", () => {
@@ -244,7 +273,7 @@ test("G7 requires current QA, security, and data evidence", () => {
     permission_profile: "test_execution",
     command_class: "local_validation",
     target_gate: "G7",
-  }).blockers, [
+  }, evidenceContext).blockers, [
     "QA_EVIDENCE_NOT_CURRENT",
     "SECURITY_EVIDENCE_NOT_CURRENT",
     "DATA_EVIDENCE_NOT_CURRENT",
@@ -256,15 +285,8 @@ test("G8 production execution requires explicit human authorization", () => {
     ...policyInput,
     permission_profile: "production_execution",
     command_class: "production_impact",
-    evidence: {
-      ...policyInput.evidence,
-      qa: "current",
-      security: "current",
-      data: "current",
-      backup: "passed",
-      rollback: "current",
-    },
-  });
+    evidence: { gate_approvals: [] },
+  }, evidenceContext);
 
   assert(report.blockers.includes("G8_APPROVAL_REQUIRED"));
   assert(report.blockers.includes("HUMAN_AUTHORIZATION_REQUIRED"));
@@ -277,12 +299,12 @@ test("G8 approval readiness requires human authorization, backup, and rollback",
     command_class: "local_validation",
     target_gate: "G8",
     evidence: {
-      ...policyInput.evidence,
-      qa: "current",
-      security: "current",
-      data: "current",
+      gate_approvals: [],
+      qa: artifactReference("QA"),
+      security: artifactReference("SECURITY"),
+      data: artifactReference("DATA"),
     },
-  }).blockers, [
+  }, evidenceContext).blockers, [
     "HUMAN_AUTHORIZATION_REQUIRED",
     "BACKUP_VERIFICATION_REQUIRED",
     "ROLLBACK_PLAN_REQUIRED",
@@ -294,15 +316,13 @@ test("destructive execution requires explicit confirmation", () => {
     ...policyInput,
     destructive: true,
     evidence: {
-      ...policyInput.evidence,
-      gate_approvals: ["G6"],
-      human_authorization: true,
-      scope_confirmation: true,
-      backup: "passed",
-      dry_run: "passed",
-      rollback: "current",
+      gate_approvals: [gateReference("G6")],
+      scope_confirmation: gateReference("G6"),
+      backup: artifactReference("BACKUP"),
+      dry_run: artifactReference("DRY-RUN"),
+      rollback: artifactReference("ROLLBACK"),
     },
-  });
+  }, evidenceContext);
 
   assert.deepEqual(report.blockers, ["DESTRUCTIVE_CONFIRMATION_REQUIRED"]);
 });
@@ -312,15 +332,13 @@ test("destructive execution requires verified backup", () => {
     ...policyInput,
     destructive: true,
     evidence: {
-      ...policyInput.evidence,
-      gate_approvals: ["G6"],
-      human_authorization: true,
-      destructive_confirmation: true,
-      scope_confirmation: true,
-      dry_run: "passed",
-      rollback: "current",
+      gate_approvals: [gateReference("G6")],
+      destructive_confirmation: gateReference("G6"),
+      scope_confirmation: gateReference("G6"),
+      dry_run: artifactReference("DRY-RUN"),
+      rollback: artifactReference("ROLLBACK"),
     },
-  });
+  }, evidenceContext);
 
   assert.deepEqual(report.blockers, ["BACKUP_VERIFICATION_REQUIRED"]);
 });
@@ -331,15 +349,13 @@ test("production execution requires a current rollback plan", () => {
     permission_profile: "production_execution",
     command_class: "production_impact",
     evidence: {
-      ...policyInput.evidence,
-      gate_approvals: ["G8"],
-      qa: "current",
-      security: "current",
-      data: "current",
-      human_authorization: true,
-      backup: "passed",
+      gate_approvals: [gateReference("G8")],
+      qa: artifactReference("QA"),
+      security: artifactReference("SECURITY"),
+      data: artifactReference("DATA"),
+      backup: artifactReference("BACKUP"),
     },
-  });
+  }, evidenceContext);
 
   assert.deepEqual(report.blockers, ["ROLLBACK_PLAN_REQUIRED"]);
 });
@@ -365,11 +381,98 @@ test("G7 approval rejects policy claims without a structured execution result", 
     ...policyInput,
     permission_profile: "test_execution",
     command_class: "local_validation",
+    evidence: { gate_approvals: [] },
+  }, evidenceContext), /EXECUTION_RESULT_INVALID/);
+});
+
+test("self-asserted evidence is rejected when its artifact version is not current", () => {
+  const stale = { ...artifactReference("QA"), version: 2 };
+  const report = evaluateExecutionPolicy({
+    ...policyInput,
+    permission_profile: "test_execution",
+    command_class: "local_validation",
+    target_gate: "G7",
+    evidence: { gate_approvals: [], qa: stale, security: stale, data: stale },
+  }, evidenceContext);
+
+  assert.deepEqual(report.blockers, [
+    "QA_EVIDENCE_NOT_CURRENT",
+    "SECURITY_EVIDENCE_NOT_CURRENT",
+    "DATA_EVIDENCE_NOT_CURRENT",
+  ]);
+});
+
+test("artifact evidence requires a human approval at the artifact gate", () => {
+  const context = {
+    ...evidenceContext,
+    approvals: evidenceContext.approvals.map((approval) => approval.id === "APR-G7"
+      ? { ...approval, gate: "G6", approved_by: { type: "agent", identifier: "reviewer" } }
+      : approval),
+  };
+  const report = evaluateExecutionPolicy({
+    ...policyInput,
+    permission_profile: "test_execution",
+    command_class: "local_validation",
+    target_gate: "G7",
     evidence: {
-      ...policyInput.evidence,
-      qa: "current",
-      security: "current",
-      data: "current",
+      gate_approvals: [],
+      qa: artifactReference("QA"),
+      security: artifactReference("SECURITY"),
+      data: artifactReference("DATA"),
     },
-  }), /EXECUTION_RESULT_INVALID/);
+  }, context);
+
+  assert.deepEqual(report.blockers, [
+    "QA_EVIDENCE_NOT_CURRENT",
+    "SECURITY_EVIDENCE_NOT_CURRENT",
+    "DATA_EVIDENCE_NOT_CURRENT",
+  ]);
+});
+
+test("gate readiness rejects unconfigured gates", () => {
+  assert.deepEqual(gateReadiness(state, workflow, "G8"), {
+    gate: "G8",
+    ready: false,
+    blockers: ["GATE_NOT_CONFIGURED"],
+  });
+});
+
+test("G8 approval rejects a failed execution checkpoint", () => {
+  const g8Workflow = {
+    ...workflow,
+    phases: [{ id: "deployment", owner: "devops-lead", reviewer: "operations-reviewer", gate: "G8", depends_on: [] }],
+  };
+  const awaiting = { ...state, phases: { deployment: { status: "awaiting_approval" } } };
+  const execution = {
+    execution_id: "EXEC-G8",
+    dispatch_digest: "a".repeat(64),
+    status: "completed",
+    permission_profile: "test_execution",
+    authorized_paths: { read: [".agent-team/**"], write: [], execute: [] },
+    command_class: "local_validation",
+    destructive: false,
+    checkpoints: [{
+      id: "release-check",
+      status: "failed",
+      timestamp: "2026-07-13T00:00:00.000Z",
+      evidence: [`sha256:${"a".repeat(64)}`],
+    }],
+    evidence: {
+      gate_approvals: [],
+      qa: artifactReference("QA"),
+      security: artifactReference("SECURITY"),
+      data: artifactReference("DATA"),
+      backup: artifactReference("BACKUP"),
+      rollback: artifactReference("ROLLBACK"),
+    },
+  };
+
+  assert.throws(() => approveGate(awaiting, g8Workflow, {
+    id: "APR-G8-CURRENT",
+    gate: "G8",
+    decision: "approved",
+    approved_by: { type: "human", identifier: "project-owner" },
+    artifact_versions: { DEPLOYMENT: 1 },
+    timestamp: "2026-07-13T00:00:00Z",
+  }, execution, evidenceContext), /CHECKPOINT_NOT_COMPLETED/);
 });

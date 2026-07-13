@@ -42,24 +42,14 @@ function executionResult(prepared, overrides = {}) {
     permission_profile: "documentation_write",
     authorized_paths: prepared.dispatch.authorized_scope,
     command_class: "mutating_local",
+    destructive: false,
     checkpoints: [{
       id: "artifact-written",
       status: "completed",
       timestamp: "2026-07-13T00:00:00.000Z",
       evidence: ["sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
     }],
-    evidence: {
-      gate_approvals: [],
-      qa: "missing",
-      security: "missing",
-      data: "missing",
-      human_authorization: false,
-      destructive_confirmation: false,
-      scope_confirmation: false,
-      backup: "missing",
-      dry_run: "missing",
-      rollback: "missing",
-    },
+    evidence: { gate_approvals: [] },
     output: "requirements",
     ...overrides,
   };
@@ -410,11 +400,12 @@ test("dispatch stops at plugin blockers", () => {
 });
 
 test("manual adapter waits for a supplied runtime result without fabricating evidence", async () => {
-  const prepared = prepareDispatch(dispatch, businessAnalystManifest, [
-    { id: "PROJECT-CHARTER", version: 1, status: "approved", content: "charter" },
-    { id: "STAKEHOLDER-MAP", version: 1, status: "approved", content: "stakeholders" },
-  ], availableRegistry);
   const adapter = new ManualCodexAdapter();
+  const prepared = await adapter.prepareExecution({
+    ...dispatch,
+    permission_profile: "documentation_write",
+    command_class: "mutating_local",
+  });
 
   const handle = await adapter.execute(prepared);
 
@@ -423,7 +414,7 @@ test("manual adapter waits for a supplied runtime result without fabricating evi
   await assert.rejects(() => adapter.collectResult(handle), /RUNTIME_RESULT_REQUIRED/);
 
   const runtimeResult = executionResult(prepared);
-  assert.equal(await adapter.collectResult(handle, runtimeResult), runtimeResult);
+  assert.deepEqual(await adapter.collectResult(handle, runtimeResult), runtimeResult);
 });
 
 test("capability check rejects permission escalation", async () => {
@@ -492,4 +483,147 @@ test("collectResult rejects runtime permission escalation", async () => {
     permission_profile: "production_execution",
     command_class: "production_impact",
   })), /PERMISSION_PROFILE_ESCALATION/);
+});
+
+test("execute rejects a caller-forged prepared execution", async () => {
+  const adapter = new ManualCodexAdapter();
+  await assert.rejects(() => adapter.execute({
+    digest: "a".repeat(64),
+    dispatch: {
+      ...dispatch,
+      permission_profile: "documentation_write",
+      command_class: "mutating_local",
+    },
+  }), /PREPARED_EXECUTION_INVALID/);
+});
+
+test("prepareExecution blocks code write without authoritative G6 approval", async () => {
+  const adapter = new ManualCodexAdapter(async () => ({ artifacts: [], reviews: [], approvals: [] }));
+  await assert.rejects(() => adapter.prepareExecution({
+    ...dispatch,
+    permission_profile: "code_write",
+    command_class: "mutating_local",
+    execution_evidence: { gate_approvals: [] },
+  }), /G6_APPROVAL_REQUIRED/);
+});
+
+test("prepareExecution blocks production impact without authoritative G8 safety evidence", async () => {
+  const adapter = new ManualCodexAdapter(async () => ({ artifacts: [], reviews: [], approvals: [] }));
+  await assert.rejects(() => adapter.prepareExecution({
+    ...dispatch,
+    permission_profile: "production_execution",
+    command_class: "production_impact",
+    execution_evidence: { gate_approvals: [] },
+  }), /G8_APPROVAL_REQUIRED/);
+});
+
+test("mutating the public handle cannot bypass adapter-owned digest binding", async () => {
+  const adapter = new ManualCodexAdapter();
+  const prepared = await adapter.prepareExecution({
+    ...dispatch,
+    permission_profile: "documentation_write",
+    command_class: "mutating_local",
+  });
+  const handle = await adapter.execute(prepared);
+
+  assert.throws(() => { handle.digest = "b".repeat(64); }, TypeError);
+  await assert.rejects(() => adapter.collectResult(handle, executionResult(prepared, {
+    dispatch_digest: "b".repeat(64),
+  })), /EXECUTION_DIGEST_MISMATCH/);
+});
+
+test("collectResult rejects destructive work downcast to non-destructive", async () => {
+  const gate = { gate: "G6", approval_id: "APR-G6" };
+  const reference = (id) => ({
+    artifact_id: id,
+    version: 1,
+    status: "approved",
+    review_id: `REV-${id}`,
+    approval_id: "APR-G6",
+  });
+  const artifacts = ["BACKUP", "DRY-RUN", "ROLLBACK"].map((id) => ({
+    id,
+    path: `${id.toLowerCase()}.md`,
+    version: 1,
+    status: "approved",
+    owner: "developer",
+    reviewer: "reviewer",
+    dependencies: [],
+    consumers: [],
+    required_gate: "G6",
+    checksum: `sha256:${"a".repeat(64)}`,
+  }));
+  const context = {
+    artifacts,
+    reviews: artifacts.map(({ id }) => ({
+      id: `REV-${id}`,
+      phase: "implementation-planning",
+      reviewer: "reviewer",
+      verdict: "approved",
+      artifact_versions: { [id]: 1 },
+      timestamp: "2026-07-13T00:00:00Z",
+    })),
+    approvals: [{
+      id: "APR-G6",
+      gate: "G6",
+      decision: "approved",
+      approved_by: { type: "human", identifier: "project-owner" },
+      artifact_versions: Object.fromEntries(artifacts.map(({ id }) => [id, 1])),
+      timestamp: "2026-07-13T00:00:00Z",
+    }],
+  };
+  const evidence = {
+    gate_approvals: [gate],
+    destructive_confirmation: gate,
+    scope_confirmation: gate,
+    backup: reference("BACKUP"),
+    dry_run: reference("DRY-RUN"),
+    rollback: reference("ROLLBACK"),
+  };
+  const adapter = new ManualCodexAdapter(async () => context);
+  const prepared = await adapter.prepareExecution({
+    ...dispatch,
+    permission_profile: "code_write",
+    command_class: "mutating_local",
+    destructive: true,
+    execution_evidence: evidence,
+  });
+  const handle = await adapter.execute(prepared);
+
+  await assert.rejects(() => adapter.collectResult(handle, executionResult(prepared, {
+    permission_profile: "code_write",
+    destructive: false,
+    evidence,
+  })), /DESTRUCTIVE_SCOPE_MISMATCH/);
+});
+
+test("collectResult rejects a failed checkpoint on a completed result", async () => {
+  const adapter = new ManualCodexAdapter();
+  const prepared = await adapter.prepareExecution({
+    ...dispatch,
+    permission_profile: "documentation_write",
+    command_class: "mutating_local",
+  });
+  const handle = await adapter.execute(prepared);
+  const result = executionResult(prepared);
+  result.checkpoints[0].status = "failed";
+
+  await assert.rejects(() => adapter.collectResult(handle, result), /CHECKPOINT_NOT_COMPLETED/);
+});
+
+test("collectResult returns the parsed normalized result", async () => {
+  const adapter = new ManualCodexAdapter();
+  const prepared = await adapter.prepareExecution({
+    ...dispatch,
+    permission_profile: "documentation_write",
+    command_class: "mutating_local",
+  });
+  const handle = await adapter.execute(prepared);
+
+  const result = await adapter.collectResult(handle, {
+    ...executionResult(prepared),
+    private_reasoning: "discard me",
+  });
+
+  assert.equal("private_reasoning" in result, false);
 });
