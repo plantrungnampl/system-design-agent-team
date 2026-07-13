@@ -181,7 +181,7 @@ test("init creates a valid project without overwriting source", async () => {
     name: "Leave System",
     mode: "greenfield",
     profile: "standard",
-  });
+  }, "INIT-CLI-1");
 
   const project = parse(await readFile(join(root, ".agent-team/project.yaml"), "utf8"));
   const state = parse(await readFile(join(root, ".agent-team/workflow-state.yaml"), "utf8"));
@@ -205,7 +205,7 @@ test("fresh initialization persists complete profile-derived configuration", asy
     environments: {
       production: { security: { classification: "confidential" } },
     },
-  });
+  }, "INIT-CLI-2");
 
   const project = await readYaml(root, ".agent-team/project.yaml");
   assert.equal(project.project.language, "en");
@@ -239,7 +239,7 @@ test("explicit configuration overrides environment and clears superseded cache s
     environments: {
       production: { security: { classification: "confidential" } },
     },
-  });
+  }, "INIT-CLI-3");
   const project = await readYaml(root, ".agent-team/project.yaml");
 
   const effective = resolveProjectConfig(project, "production", {
@@ -280,6 +280,15 @@ test("adopt inventories an existing repository without mutating source", async (
 });
 
 test("mutating project lifecycle APIs require caller operation ids", async () => {
+  const initRoot = await temporaryGitRepository();
+  await assert.rejects(() => initProject(initRoot, {
+    id: "missing-init-operation",
+    name: "Missing Init Operation",
+    mode: "greenfield",
+    profile: "standard",
+  }, "", lifecycleAuthorization), /OPERATION_ID_REQUIRED/);
+  await assert.rejects(() => access(join(initRoot, ".agent-team")), { code: "ENOENT" });
+
   const adoptRoot = await temporaryGitRepository();
   await assert.rejects(() => adoptProject(adoptRoot, {
     id: "missing-adopt-operation",
@@ -294,9 +303,26 @@ test("mutating project lifecycle APIs require caller operation ids", async () =>
     name: "Missing Lifecycle Operation",
     mode: "greenfield",
     profile: "standard",
-  });
+  }, "INIT-LIFECYCLE", lifecycleAuthorization);
   await assert.rejects(() => ejectProject(root, "", lifecycleAuthorization), /OPERATION_ID_REQUIRED/);
   await assert.rejects(() => uninstallProject(root, "", lifecycleAuthorization), /OPERATION_ID_REQUIRED/);
+});
+
+test("init replay is idempotent and binds the operation id to its request", async () => {
+  const root = await temporaryGitRepository();
+  const options = {
+    id: "init-replay",
+    name: "Init Replay",
+    mode: "greenfield",
+    profile: "standard",
+  };
+
+  const first = await initProject(root, options, "INIT-REPLAY", lifecycleAuthorization);
+  assert.deepEqual(await initProject(root, options, "INIT-REPLAY", lifecycleAuthorization), first);
+  await assert.rejects(
+    () => initProject(root, { ...options, name: "Changed Name" }, "INIT-REPLAY", lifecycleAuthorization),
+    /OPERATION_ID_CONFLICT/,
+  );
 });
 
 test("adopt replay is idempotent and binds the operation id to its request", async () => {
@@ -368,7 +394,7 @@ test("upgrade check and dry-run preserve overrides and approved content", async 
     name: "Upgrade System",
     mode: "greenfield",
     profile: "standard",
-  });
+  }, "INIT-CLI-4");
   const agentPath = join(root, ".codex/agents/lead-orchestrator.md");
   const overriddenAgent = `${await readFile(agentPath, "utf8")}\nLocal override.\n`;
   await writeFile(agentPath, overriddenAgent);
@@ -398,14 +424,21 @@ test("upgrade blocks an authoritative lock workflow mismatch", async () => {
     name: "Lock Mismatch",
     mode: "greenfield",
     profile: "standard",
-  });
+  }, "INIT-LOCK-MISMATCH", lifecycleAuthorization);
   const lock = await readYaml(root, ".agent-team/framework-lock.yaml");
   lock.workflow.version = "0.0.0";
   await ProjectStore.open(root).writeYamlAtomic(".agent-team/framework-lock.yaml", lock);
 
   const result = await planUpgrade(root, "check");
   assert.equal(result.status, "blocked");
-  assert(result.conflicts.some(({ path }) => path === ".agent-team/framework-lock.yaml"));
+  const conflict = result.conflicts.find(({ path }) => path === ".agent-team/framework-lock.yaml");
+  assert.equal(conflict.proposal_path, ".agent-team/overrides/upgrade/framework-lock.yaml");
+  const proposal = result.proposals.find(({ path }) => path === conflict.proposal_path);
+  assert.deepEqual(parse(proposal.content), {
+    framework: { version: "0.1.0" },
+    workflow: { id: "greenfield-standard", version: "1.0.0" },
+  });
+  await assert.rejects(() => access(join(root, conflict.proposal_path)), { code: "ENOENT" });
 });
 
 test("eject materializes project-owned overrides and disables upgrades", async () => {
@@ -415,7 +448,7 @@ test("eject materializes project-owned overrides and disables upgrades", async (
     name: "Ejected System",
     mode: "greenfield",
     profile: "standard",
-  });
+  }, "INIT-EJECTED", lifecycleAuthorization);
 
   const result = await ejectProject(root, "EJECT-1", lifecycleAuthorization);
   const project = await readYaml(root, ".agent-team/project.yaml");
@@ -427,6 +460,17 @@ test("eject materializes project-owned overrides and disables upgrades", async (
   assert.equal((await readYaml(root, ".agent-team/overrides/workflow.yaml")).mode, "greenfield");
   assert(Array.isArray(await readYaml(root, ".agent-team/overrides/agents.yaml")));
   assert.equal((await planUpgrade(root, "check")).status, "ejected");
+  const lock = await readYaml(root, ".agent-team/framework-lock.yaml");
+  lock.workflow.version = "0.0.0";
+  await ProjectStore.open(root).writeYamlAtomic(".agent-team/framework-lock.yaml", lock);
+  const blocked = await planUpgrade(root, "dry-run");
+  const lockConflict = blocked.conflicts.find(({ path }) => path === ".agent-team/framework-lock.yaml");
+  const lockProposal = blocked.proposals.find(({ path }) => path === lockConflict.proposal_path);
+  assert.deepEqual(parse(lockProposal.content), {
+    framework: { version: "0.1.0" },
+    workflow: { id: "greenfield-standard", version: "1.0.0" },
+  });
+  await assert.rejects(() => access(join(root, lockConflict.proposal_path)), { code: "ENOENT" });
   assert.deepEqual(await ejectProject(root, "EJECT-1", lifecycleAuthorization), result);
   await assert.rejects(
     () => ejectProject(root, "EJECT-1", { ...lifecycleAuthorization, authorizationSource: "changed" }),
@@ -441,7 +485,7 @@ test("ejected agent catalogue is authoritative for start, review, and doctor", a
     name: "Catalogue Authority",
     mode: "greenfield",
     profile: "standard",
-  });
+  }, "INIT-CLI-5");
   await ejectProject(root, "EJECT-CATALOGUE", lifecycleAuthorization);
   const store = ProjectStore.open(root);
   const catalogue = await readYaml(root, ".agent-team/overrides/agents.yaml");
@@ -476,7 +520,7 @@ test("init records exact generated ownership and uninstall preserves non-owned p
     name: "Manifest Uninstall",
     mode: "greenfield",
     profile: "standard",
-  });
+  }, "INIT-CLI-6");
   const manifest = await readYaml(root, ".agent-team/installation-manifest.yaml");
   const generated = manifest.files.filter(({ role }) => role === "generated_adapter");
   assert(generated.every(({ checksum }) => /^sha256:[a-f0-9]{64}$/.test(checksum)));
@@ -503,7 +547,7 @@ test("init records exact generated ownership and uninstall preserves non-owned p
     name: "Preexisting Manifest",
     mode: "greenfield",
     profile: "standard",
-  });
+  }, "INIT-CLI-7");
   const preservedManifest = await readYaml(preservedRoot, ".agent-team/installation-manifest.yaml");
   assert(!preservedManifest.files.some(({ path }) => path === ".codex/generated/.gitkeep"));
   assert(!preservedManifest.directories_created.includes(".codex/generated"));
@@ -521,7 +565,7 @@ test("uninstall removes generated adapter files and preserves project memory", a
     name: "Uninstalled System",
     mode: "greenfield",
     profile: "standard",
-  });
+  }, "INIT-CLI-8");
   const approvalsBefore = await readFile(join(root, ".agent-team/approvals.yaml"), "utf8");
 
   const result = await uninstallProject(root, "UNINSTALL-1", lifecycleAuthorization);
@@ -548,7 +592,7 @@ test("uninstall does not follow a generated-path link outside the project", asyn
     name: "Linked Uninstall",
     mode: "greenfield",
     profile: "standard",
-  });
+  }, "INIT-CLI-9");
   const generated = join(root, ".codex/agents/lead-orchestrator.md");
   const outside = await mkdtemp(join(tmpdir(), "system-design-team-outside-agent-"));
   t.after(() => rm(outside, { recursive: true, force: true }));
@@ -570,7 +614,7 @@ test("uninstall never deletes before its durable plan and started audit", async 
     name: "Uninstall Plan Failure",
     mode: "greenfield",
     profile: "standard",
-  });
+  }, "INIT-CLI-10");
   const generated = join(root, ".codex/agents/lead-orchestrator.md");
   await mkdir(join(root, ".agent-team/uninstall-plan.yaml"));
 
@@ -590,7 +634,7 @@ test("uninstall does not delete when the started audit append fails", async () =
     name: "Uninstall Audit Failure",
     mode: "greenfield",
     profile: "standard",
-  });
+  }, "INIT-CLI-11");
   const generated = join(root, ".codex/agents/lead-orchestrator.md");
 
   await assert.rejects(() => uninstallProject(
@@ -615,7 +659,7 @@ test("uninstall resumes a durably planned operation after a mid-delete failure",
     name: "Uninstall Resume",
     mode: "greenfield",
     profile: "standard",
-  });
+  }, "INIT-CLI-12");
   const manifest = await readYaml(root, ".agent-team/installation-manifest.yaml");
   const planned = manifest.files.filter(({ role }) => role === "generated_adapter")
     .sort((left, right) => left.path.localeCompare(right.path));
@@ -652,13 +696,14 @@ test("lifecycle audit records carry authorization and artifact context", async (
     name: "Leave System",
     mode: "greenfield",
     profile: "standard",
-  });
+  }, "INIT-CLI-13");
 
   const [event] = (await readFile(join(root, ".agent-team/audit/events.jsonl"), "utf8"))
     .trim().split("\n").map(JSON.parse);
   assert.deepEqual(AuditEventSchema.parse(event), event);
   assert.equal(event.actor.type, "system");
-  assert.equal(event.authorization_source, "bootstrap");
+  assert.equal(event.actor.identifier, "system-design-team-api");
+  assert.equal(event.authorization_source, "api_invocation");
   assert.equal(event.permission_profile, "standard");
   assert.deepEqual(event.artifact_versions, {});
 });
@@ -675,7 +720,7 @@ test("init materializes complete workflow assets and Codex agent instructions", 
       name: `${mode} project`,
       mode,
       profile: "standard",
-    });
+    }, "INIT-CLI-14");
     const workflow = WorkflowDefinitionSchema.parse(
       parse(await readFile(join(repository, "workflows", workflowFile), "utf8")),
     );
@@ -720,7 +765,7 @@ test("artifact and trace read operations expose persisted integrity", async () =
     name: "Leave System",
     mode: "greenfield",
     profile: "standard",
-  });
+  }, "INIT-CLI-15");
 
   const artifacts = await artifactList(root);
   const projectCharter = await artifactInspect(root, "PROJECT-CHARTER");
@@ -757,7 +802,7 @@ test("change creation stales direct and downstream artifacts and invalidates the
     name: "Leave System",
     mode: "greenfield",
     profile: "standard",
-  });
+  }, "INIT-CLI-16");
   const store = ProjectStore.open(root);
   const state = await store.readWorkflowState();
   state.phases.intake = { status: "approved", approval_id: "APR-G0" };
@@ -828,7 +873,7 @@ test("required reapproval reopens its approved phase without staling unrelated a
     name: "Leave System",
     mode: "greenfield",
     profile: "standard",
-  });
+  }, "INIT-CLI-17");
   const store = ProjectStore.open(root);
   const state = await store.readWorkflowState();
   state.phases.intake = { status: "approved", approval_id: "APR-G0" };
@@ -863,7 +908,7 @@ test("checksum drift blocks review, approval, handover, and dependent dispatch",
     name: "Leave System",
     mode: "greenfield",
     profile: "standard",
-  });
+  }, "INIT-CLI-18");
   await enableAllPlugins(root);
   await setArtifactStatus(root, "PROJECT-CHARTER");
   await startPhase(root, "intake", "CHECKSUM-START");
@@ -907,7 +952,7 @@ test("init rejects partial state without touching existing project data", async 
     name: "Leave System",
     mode: "greenfield",
     profile: "standard",
-  }), /ALREADY_INITIALIZED/);
+  }, "INIT-CLI-19"), /ALREADY_INITIALIZED/);
 
   assert.equal(await readFile(join(root, ".agent-team/partial.txt"), "utf8"), "user data\n");
   assert.equal(await readFile(join(root, ".codex/generated/existing.txt"), "utf8"), "keep\n");
@@ -934,7 +979,7 @@ test("init rejects a linked state directory without writing through it", async (
     name: "Leave System",
     mode: "greenfield",
     profile: "standard",
-  }), /ALREADY_INITIALIZED/);
+  }, "INIT-CLI-20"), /ALREADY_INITIALIZED/);
   assert.deepEqual(await readdir(outside), ["sentinel.txt"]);
   assert.equal(await readFile(join(outside, "sentinel.txt"), "utf8"), "keep\n");
 });
@@ -960,7 +1005,7 @@ test("init rolls back new state when the existing Codex path is unsafe", async (
     name: "Leave System",
     mode: "greenfield",
     profile: "standard",
-  }), /PATH_OUTSIDE_PROJECT/);
+  }, "INIT-CLI-21"), /PATH_OUTSIDE_PROJECT/);
   await assert.rejects(() => lstat(join(root, ".agent-team")), { code: "ENOENT" });
   assert.deepEqual(await readdir(outside), ["sentinel.txt"]);
 });
@@ -1005,7 +1050,7 @@ test("start checks the phase owner plugin before changing state and replays safe
     name: "Leave System",
     mode: "greenfield",
     profile: "standard",
-  });
+  }, "INIT-CLI-22");
   const before = await ProjectStore.open(root).readWorkflowState();
 
   await assert.rejects(
@@ -1033,7 +1078,7 @@ test("validate checks registered artifacts before entering artifact validation",
     name: "Leave System",
     mode: "greenfield",
     profile: "standard",
-  });
+  }, "INIT-CLI-23");
   await setPluginStatus(
     root,
     pluginUri,
@@ -1061,7 +1106,7 @@ test("validate rejects draft registry and front-matter statuses", async () => {
     name: "Leave System",
     mode: "greenfield",
     profile: "standard",
-  });
+  }, "INIT-CLI-24");
   await setPluginStatus(root, pluginUri, "available", ["brainstorming", "writing-plans", "verification-before-completion"]);
   await startPhase(root, "intake", "OP-START");
 
@@ -1087,7 +1132,7 @@ test("scopes identical raw operation IDs to their action and target", async () =
     name: "Leave System",
     mode: "greenfield",
     profile: "standard",
-  });
+  }, "INIT-CLI-25");
   await setPluginStatus(root, pluginUri, "available", ["brainstorming", "writing-plans", "verification-before-completion"]);
   await setArtifactStatus(root, "PROJECT-CHARTER");
 
@@ -1109,7 +1154,7 @@ test("review records independent evidence and applies two idempotent state updat
     name: "Leave System",
     mode: "greenfield",
     profile: "standard",
-  });
+  }, "INIT-CLI-26");
   await setPluginStatus(root, pluginUri, "available", ["brainstorming", "writing-plans", "verification-before-completion"]);
   const validated = await enterArtifactValidation(root, "intake", "PROJECT-CHARTER", "REVIEW");
 
@@ -1167,7 +1212,7 @@ test("review can require revision without automated reviewer execution", async (
     name: "Leave System",
     mode: "greenfield",
     profile: "standard",
-  });
+  }, "INIT-CLI-27");
   await setPluginStatus(root, pluginUri, "available", ["brainstorming", "writing-plans", "verification-before-completion"]);
   const validated = await enterArtifactValidation(root, "intake", "PROJECT-CHARTER", "REVISION");
 
@@ -1189,7 +1234,7 @@ test("review checks the configured reviewer plugin before recording evidence", a
     name: "Leave System",
     mode: "greenfield",
     profile: "standard",
-  });
+  }, "INIT-CLI-28");
   await setArtifactStatus(root, "UX-HANDOFF");
   const store = ProjectStore.open(root);
   const state = await store.readWorkflowState();
@@ -1215,7 +1260,7 @@ test("approve persists registry-bound evidence and is idempotent", async () => {
     name: "Leave System",
     mode: "greenfield",
     profile: "standard",
-  });
+  }, "INIT-CLI-29");
   await setPluginStatus(root, pluginUri, "available", ["brainstorming", "writing-plans", "verification-before-completion"]);
   const awaiting = await requirementsAwaitingApproval(root, "APPROVAL");
 
@@ -1248,7 +1293,7 @@ test("approval rejects artifact versions that were not independently reviewed", 
     name: "Leave System",
     mode: "greenfield",
     profile: "standard",
-  });
+  }, "INIT-CLI-30");
   await setPluginStatus(root, pluginUri, "available", ["brainstorming", "writing-plans", "verification-before-completion"]);
   await requirementsAwaitingApproval(root, "VERSION-BINDING");
   await setArtifactStatus(root, "REQUIREMENTS", { version: 2 });
@@ -1272,7 +1317,7 @@ test("approval rejects non-ready artifacts and trimmed self-approval", async () 
     name: "Leave System",
     mode: "greenfield",
     profile: "standard",
-  });
+  }, "INIT-CLI-31");
   await setPluginStatus(root, pluginUri, "available", ["brainstorming", "writing-plans", "verification-before-completion"]);
   await requirementsAwaitingApproval(root, "REJECTION");
   await setArtifactStatus(root, "REQUIREMENTS", {
@@ -1303,7 +1348,7 @@ test("handover writes a valid record and advances each directly dependent phase 
     name: "Leave System",
     mode: "greenfield",
     profile: "standard",
-  });
+  }, "INIT-CLI-32");
   await setPluginStatus(root, pluginUri, "available", ["brainstorming", "writing-plans", "verification-before-completion"]);
   await requirementsAwaitingApproval(root, "HANDOVER");
   const approved = await approve(root, "G2", "project-owner", "OP-APPROVE-REQ");
@@ -1388,7 +1433,7 @@ test("handover lists only the target phase artifact as its expected output", asy
     name: "Leave System",
     mode: "greenfield",
     profile: "standard",
-  });
+  }, "INIT-CLI-33");
   await setArtifactStatus(root, "RELEASE-READINESS");
   const store = ProjectStore.open(root);
   const state = await store.readWorkflowState();
@@ -1418,7 +1463,7 @@ test("status and doctor return structured project diagnostics", async () => {
     name: "Leave System",
     mode: "greenfield",
     profile: "standard",
-  });
+  }, "INIT-CLI-34");
 
   const status = await getStatus(root);
   assert.equal(status.project.id, "leave-system");
@@ -1458,6 +1503,7 @@ test("CLI help lists the first-slice commands", async () => {
   }
   assert.match(stdout, /review <phase> --reviewer <id> --verdict <approved\|revision_required> --operation-id <id>/);
   assert.match(stdout, /repair --locks --yes/);
+  assert.match(stdout, /init .*--operation-id <id>/);
   assert.match(stdout, /adopt .*--operation-id <id>/);
   assert.match(stdout, /eject --operation-id <id>/);
   assert.match(stdout, /uninstall --operation-id <id>/);
@@ -1470,6 +1516,7 @@ test("CLI help lists the first-slice commands", async () => {
     "--name", "Leave System",
     "--mode", "greenfield",
     "--profile", "standard",
+    "--operation-id", "CLI-INIT",
     "--language", "en",
     "--cache", "none",
     "--adapter", "codex",
@@ -1569,7 +1616,7 @@ test("CLI help lists the first-slice commands", async () => {
   await assert.rejects(
     () => execFileAsync(process.execPath, [
       bin, "init", "--id", "bad-adapter", "--name", "Bad Adapter",
-      "--mode", "greenfield", "--profile", "standard", "--adapter", "other",
+      "--mode", "greenfield", "--profile", "standard", "--operation-id", "BAD-ADAPTER", "--adapter", "other",
     ], { cwd: badAdapterRoot }),
     /Invalid option|Invalid input|codex/,
   );
@@ -1586,6 +1633,14 @@ test("CLI help lists the first-slice commands", async () => {
     () => execFileAsync(process.execPath, [
       bin, "adopt", "--id", "missing-operation", "--name", "Missing Operation", "--profile", "standard",
     ], { cwd: missingAdoptOperationRoot }),
+    /--operation-id is required/,
+  );
+  const missingInitOperationRoot = await temporaryGitRepository();
+  await assert.rejects(
+    () => execFileAsync(process.execPath, [
+      bin, "init", "--id", "missing-init-operation", "--name", "Missing Init Operation",
+      "--mode", "greenfield", "--profile", "standard",
+    ], { cwd: missingInitOperationRoot }),
     /--operation-id is required/,
   );
   const removedCodexFlagRoot = await temporaryGitRepository();

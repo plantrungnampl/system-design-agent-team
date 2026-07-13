@@ -42,7 +42,7 @@ import {
 const usage = `Usage: system-design-team <command> [options]
 
 Commands:
-  init --id <id> --name <name> --mode <mode> --profile <profile> [--language <language>] [--cache <none|sqlite>] [--adapter <codex>]
+  init --id <id> --name <name> --mode <mode> --profile <profile> --operation-id <id> [--language <language>] [--cache <none|sqlite>] [--adapter <codex>]
   adopt --id <id> --name <name> --profile <profile> --operation-id <id> [--language <language>] [--cache <none|sqlite>] [--adapter <codex>]
   inspect [--environment <name>]
   status
@@ -71,7 +71,7 @@ Commands:
   uninstall --operation-id <id>`;
 
 const commandShape: Record<string, { positionals: number; options: string[] }> = {
-  init: { positionals: 1, options: ["id", "name", "mode", "profile", "language", "cache", "adapter"] },
+  init: { positionals: 1, options: ["id", "name", "mode", "profile", "language", "cache", "adapter", "operation-id"] },
   adopt: { positionals: 1, options: ["id", "name", "profile", "language", "cache", "adapter", "operation-id"] },
   inspect: { positionals: 1, options: ["environment"] },
   status: { positionals: 1, options: [] },
@@ -182,7 +182,7 @@ async function main(): Promise<void> {
         language: values.language,
         adapter: values.adapter ? AdapterIdSchema.parse(values.adapter) : undefined,
         cache: CacheProviderSchema.parse(values.cache ?? "none"),
-      });
+      }, required(values["operation-id"], "--operation-id"), cliAuthorization);
       break;
     case "adopt":
       result = await adoptProject(root, {

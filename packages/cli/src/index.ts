@@ -124,6 +124,13 @@ const apiAuthorization: LifecycleAuthorizationInput = {
   authorizationSource: "api_invocation",
 };
 
+function runGit(root: string, args: readonly string[]) {
+  return execFileAsync("git", [...args], {
+    cwd: root,
+    env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" },
+  });
+}
+
 function persistedAuthorization(input: LifecycleAuthorizationInput): LifecycleAuthorization {
   return {
     actor: input.actor,
@@ -351,7 +358,6 @@ async function bootstrapProject(
     ...(installation.inventory ? { inventory: installation.inventory } : {}),
   });
   if (await exists(join(projectRoot, ".agent-team"))) {
-    if (installation.action !== "adopt") throw new Error("ALREADY_INITIALIZED");
     let stored;
     try {
       stored = await store.readYaml(".agent-team/installation-operation.yaml", InstallationOperationSchema);
@@ -505,15 +511,19 @@ async function bootstrapProject(
   });
 }
 
-export async function initProject(root: string, options: InitOptions): Promise<ProjectConfig> {
+export async function initProject(
+  root: string,
+  options: InitOptions,
+  operationId: string,
+  authorization: LifecycleAuthorizationInput = apiAuthorization,
+  execution: BootstrapExecutionOptions = {},
+): Promise<ProjectConfig> {
+  requireOperationId(operationId);
   return (await bootstrapProject(root, options, {
     action: "init",
-    operationId: "bootstrap",
-    authorization: {
-      actor: { type: "system", identifier: "system-design-team" },
-      authorizationSource: "bootstrap",
-    },
-  })).project;
+    operationId,
+    authorization,
+  }, execution)).project;
 }
 
 const languageByExtension: Record<string, string> = {
@@ -539,18 +549,17 @@ async function repositoryInventory(root: string) {
   let tracked: string;
   try {
     [{ stdout: gitRoot }, { stdout: status }, { stdout: tracked }] = await Promise.all([
-      execFileAsync("git", ["rev-parse", "--show-toplevel"], { cwd: projectRoot }),
-      execFileAsync("git", ["status", "--porcelain=v1"], { cwd: projectRoot }),
-      execFileAsync("git", ["ls-files", "-z"], { cwd: projectRoot }),
+      runGit(projectRoot, ["rev-parse", "--show-toplevel"]),
+      runGit(projectRoot, ["status", "--porcelain=v1"]),
+      runGit(projectRoot, ["ls-files", "-z"]),
     ]);
   } catch {
     throw new Error("GIT_REQUIRED");
   }
   let branch: string | null = null;
   try {
-    branch = (await execFileAsync("git", ["symbolic-ref", "--quiet", "--short", "HEAD"], {
-      cwd: projectRoot,
-    })).stdout.trim() || null;
+    branch = (await runGit(projectRoot, ["symbolic-ref", "--quiet", "--short", "HEAD"]))
+      .stdout.trim() || null;
   } catch {
     branch = null;
   }
@@ -1638,6 +1647,13 @@ export async function planUpgrade(root: string, mode: UpgradeMode) {
   };
   const lockMatchesWorkflow = lock.workflow.id === project.workflow.id
     && lock.workflow.version === project.workflow.version;
+  const lockProposal = {
+    path: ".agent-team/overrides/upgrade/framework-lock.yaml",
+    content: stringify(FrameworkLockSchema.parse({
+      framework: { version: FRAMEWORK_VERSION },
+      workflow: project.workflow,
+    })),
+  };
   if (project.framework.management === "ejected") {
     return lockMatchesWorkflow
       ? { ...base, status: "ejected" as const, changes: [], conflicts: [], proposals: [] }
@@ -1649,7 +1665,7 @@ export async function planUpgrade(root: string, mode: UpgradeMode) {
           path: ".agent-team/framework-lock.yaml",
           proposal_path: ".agent-team/overrides/upgrade/framework-lock.yaml",
         }],
-        proposals: [],
+        proposals: [lockProposal],
       };
   }
   const changes: { path: string; action: "create" | "update" }[] = [];
@@ -1660,6 +1676,7 @@ export async function planUpgrade(root: string, mode: UpgradeMode) {
       path: ".agent-team/framework-lock.yaml",
       proposal_path: ".agent-team/overrides/upgrade/framework-lock.yaml",
     });
+    proposals.push(lockProposal);
   }
   for (const agent of catalogue) {
     const path = `.codex/agents/${agent.id}.md`;
@@ -2024,7 +2041,7 @@ export async function loadExecutionReceipt(root: string, reference: string): Pro
 export async function secretsScan(root: string) {
   let stdout = "";
   try {
-    ({ stdout } = await execFileAsync("git", ["ls-files", "-z"], { cwd: root }));
+    ({ stdout } = await runGit(root, ["ls-files", "-z"]));
   } catch {
     throw new Error("GIT_REQUIRED");
   }
@@ -2074,11 +2091,21 @@ export async function repair(
   const store = ProjectStore.open(root);
   const inspections = await Promise.all(GENERATED_LOCK_PATHS.map((path) => store.inspectLock(path)));
   if (inspections.some(({ status }) => status === "locked")) throw new Error("STATE_LOCKED");
-  const repaired = (await store.repairTransactions()).map((id) => `transaction:${id}`);
-  for (const { path, status } of inspections) {
+  const byPath = new Map(inspections.map((inspection) => [inspection.path, inspection]));
+  const lockOrder = [
+    ".agent-team/transactions.lock",
+    ".agent-team/audit/events.lock",
+    ".agent-team/workflow-state.lock",
+    ".agent-team/lifecycle.lock",
+    ".system-design-team-init.lock",
+  ] as const;
+  const repaired: string[] = [];
+  for (const path of lockOrder) {
+    const { status } = byPath.get(path)!;
     if (status === "missing") continue;
     if (await store.repairLock(path, { confirmedQuiescent: true })) repaired.push(path);
   }
+  repaired.push(...(await store.repairTransactions()).map((id) => `transaction:${id}`));
   return { repaired };
 }
 
@@ -2096,7 +2123,7 @@ export async function doctor(root: string) {
     checks.push({ name: "transactions", ok: false, detail: error instanceof Error ? error.message : String(error) });
   }
   try {
-    const { stdout } = await execFileAsync("git", ["rev-parse", "--is-inside-work-tree"], { cwd: root });
+    const { stdout } = await runGit(root, ["rev-parse", "--is-inside-work-tree"]);
     checks.push({ name: "git", ok: stdout.trim() === "true", detail: stdout.trim() });
   } catch (error) {
     checks.push({ name: "git", ok: false, detail: error instanceof Error ? error.message : String(error) });

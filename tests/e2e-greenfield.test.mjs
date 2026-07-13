@@ -77,7 +77,7 @@ test("greenfield requirements flow blocks missing plugins and reaches handover w
     name: "Leave System",
     mode: "greenfield",
     profile: "standard",
-  });
+  }, "INIT-E2E-1");
 
   await assert.rejects(
     () => startPhase(root, "intake", "OP-START-INTAKE", adapterWithStatus("unknown")),

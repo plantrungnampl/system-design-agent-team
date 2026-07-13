@@ -8,8 +8,10 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  readdir,
   rm,
   stat,
+  utimes,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -17,6 +19,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
 import {
+  adoptProject,
   approve,
   diagnostics,
   doctor,
@@ -43,6 +46,10 @@ import { parse } from "yaml";
 
 const execFileAsync = promisify(execFile);
 const pluginUri = "plugin://superpowers@openai-curated-remote";
+const lifecycleAuthorization = {
+  actor: { type: "human", identifier: "project-owner" },
+  authorizationSource: "test_authorization",
+};
 
 class FakePluginAdapter {
   async resolve(uri) {
@@ -73,6 +80,41 @@ async function temporaryDirectory(t, prefix) {
   const root = await mkdtemp(join(tmpdir(), prefix));
   t.after(() => rm(root, { recursive: true, force: true }));
   return root;
+}
+
+async function repositorySnapshot(root, excluded = []) {
+  const entries = [];
+  const walk = async (directory, relative = "") => {
+    const children = await readdir(directory, { withFileTypes: true });
+    children.sort((left, right) => left.name.localeCompare(right.name));
+    for (const child of children) {
+      if (relative === "" && excluded.includes(child.name)) continue;
+      const path = relative ? `${relative}/${child.name}` : child.name;
+      if (child.isDirectory()) {
+        entries.push({ path, type: "directory" });
+        await walk(join(directory, child.name), path);
+        continue;
+      }
+      const content = await readFile(join(directory, child.name));
+      entries.push({
+        path,
+        type: "file",
+        size: content.length,
+        digest: createHash("sha256").update(content).digest("hex"),
+      });
+    }
+  };
+  await walk(root);
+  const indexPath = join(root, ".git/index");
+  const [index, indexStat] = await Promise.all([readFile(indexPath), stat(indexPath)]);
+  return {
+    entries,
+    index: {
+      digest: createHash("sha256").update(index).digest("hex"),
+      mtimeMs: indexStat.mtimeMs,
+      size: indexStat.size,
+    },
+  };
 }
 
 function reviewerResult(overrides = {}) {
@@ -124,7 +166,7 @@ test("required CLI safety routes expose real project state", async (t) => {
     name: "Leave System",
     mode: "greenfield",
     profile: "standard",
-  });
+  }, "INIT-SECURITY-1");
 
   assert.deepEqual(await gateReadinessReport(root, "G0"), {
     gate: "G0",
@@ -143,25 +185,44 @@ test("required CLI safety routes expose real project state", async (t) => {
   assert(stdout.includes("--execution-receipt <id>"));
 });
 
-test("repository inspection does not write source and uses a read-only POSIX fixture", async (t) => {
+test("repository inspection preserves repository contents and Git index cross-platform", async (t) => {
   const root = await temporaryDirectory(t, "system-design-team-read-only-inspect-");
   await execFileAsync("git", ["init", "--quiet"], { cwd: root });
   const source = join(root, "source.txt");
   await writeFile(source, "immutable source\n");
   await execFileAsync("git", ["add", "source.txt"], { cwd: root });
+  await utimes(source, new Date("2030-01-01T00:00:00Z"), new Date("2030-01-01T00:00:00Z"));
   if (process.platform !== "win32") await chmod(source, 0o444);
-  const before = { content: await readFile(source, "utf8"), stat: await stat(source) };
+  const before = { repository: await repositorySnapshot(root), source: await stat(source) };
 
   const first = await inspectProject(root);
   const second = await inspectProject(root);
 
   assert.deepEqual(second, first);
-  const after = { content: await readFile(source, "utf8"), stat: await stat(source) };
-  assert.equal(after.content, before.content);
-  assert.equal(after.stat.mtimeMs, before.stat.mtimeMs);
-  assert.equal(after.stat.size, before.stat.size);
-  if (process.platform !== "win32") assert.equal(after.stat.mode & 0o777, 0o444);
+  assert.deepEqual(await repositorySnapshot(root), before.repository);
+  const afterSource = await stat(source);
+  assert.equal(afterSource.mtimeMs, before.source.mtimeMs);
+  assert.equal(afterSource.size, before.source.size);
+  if (process.platform !== "win32") assert.equal(afterSource.mode & 0o777, 0o444);
   await assert.rejects(() => access(join(root, ".agent-team")), { code: "ENOENT" });
+});
+
+test("adopt inventory preserves non-framework repository contents and Git index", async (t) => {
+  const root = await temporaryDirectory(t, "system-design-team-no-write-adopt-");
+  await execFileAsync("git", ["init", "--quiet"], { cwd: root });
+  const source = join(root, "source.ts");
+  await writeFile(source, "export const source = true;\n");
+  await execFileAsync("git", ["add", "source.ts"], { cwd: root });
+  await utimes(source, new Date("2030-01-01T00:00:00Z"), new Date("2030-01-01T00:00:00Z"));
+  const before = await repositorySnapshot(root, [".agent-team", ".codex"]);
+
+  await adoptProject(root, {
+    id: "no-write-adopt",
+    name: "No Write Adopt",
+    profile: "standard",
+  }, "ADOPT-NO-WRITE", lifecycleAuthorization);
+
+  assert.deepEqual(await repositorySnapshot(root, [".agent-team", ".codex"]), before);
 });
 
 test("secrets scan reports tracked credential material", async (t) => {
@@ -195,7 +256,7 @@ test("hand-written tracked execution result is not a trusted receipt", async (t)
     name: "Leave System",
     mode: "greenfield",
     profile: "standard",
-  });
+  }, "INIT-SECURITY-2");
   await writeFile(join(root, "g7-execution.yaml"), JSON.stringify(reviewerResult()));
   await execFileAsync("git", ["add", "g7-execution.yaml"], { cwd: root });
 
@@ -210,7 +271,7 @@ test("prepared execution requests persist with replay, conflict, and audit bindi
     name: "Leave System",
     mode: "greenfield",
     profile: "standard",
-  });
+  }, "INIT-SECURITY-3");
   const adapter = new ManualCodexAdapter(async () => ({
     artifacts: [], reviews: [], approvals: [], verified_checksums: {},
     workflow: {
@@ -252,7 +313,7 @@ test("only an adapter-collected result records an audited receipt with safe repl
     name: "Leave System",
     mode: "greenfield",
     profile: "standard",
-  });
+  }, "INIT-SECURITY-4");
   const adapter = new ManualCodexAdapter();
   const collected = await collectedReviewerResult(adapter);
 
@@ -299,7 +360,7 @@ test("gate readiness CLI accepts an audited execution receipt for G7 and G8", as
     name: "Leave System",
     mode: "greenfield",
     profile: "standard",
-  });
+  }, "INIT-SECURITY-5");
   const adapter = new ManualCodexAdapter();
   const collected = await collectedReviewerResult(adapter);
   const receipt = await recordExecutionReceipt(root, adapter, collected, "GATE-RECEIPT");
@@ -329,7 +390,7 @@ test("G7 review binds its receipt to reviewer identity, phase, and verdict", asy
     name: "Leave System",
     mode: "greenfield",
     profile: "standard",
-  });
+  }, "INIT-SECURITY-6");
   const store = ProjectStore.open(root);
   const state = await store.readWorkflowState();
   state.phases.implementation.status = "artifact_validation";
@@ -411,7 +472,7 @@ test("G8 approval persists an exact prepared request authorization and rejects r
     name: "Leave System",
     mode: "greenfield",
     profile: "standard",
-  });
+  }, "INIT-SECURITY-7");
   const store = ProjectStore.open(root);
   const state = await store.readWorkflowState();
   state.phases.deployment = {
@@ -546,7 +607,7 @@ test("existing-system G8 review and exact request approval progress without a pr
     name: "Existing System",
     mode: "existing_system",
     profile: "standard",
-  });
+  }, "INIT-SECURITY-8");
   const store = ProjectStore.open(root);
   const state = await store.readWorkflowState();
   state.phases.release.status = "artifact_validation";
@@ -657,7 +718,7 @@ test("G8 reviewer receipt does not require production pre-authorization", async 
     name: "Leave System",
     mode: "greenfield",
     profile: "standard",
-  });
+  }, "INIT-SECURITY-9");
   const store = ProjectStore.open(root);
   const state = await store.readWorkflowState();
   state.phases.deployment.status = "artifact_validation";
@@ -757,7 +818,7 @@ test("reject records a human decision and append-only audit event", async (t) =>
     name: "Leave System",
     mode: "greenfield",
     profile: "standard",
-  });
+  }, "INIT-SECURITY-10");
   await startPhase(root, "intake", "REJECT-START", pluginAdapter);
   const store = ProjectStore.open(root);
   const registry = parse(await readFile(join(root, ".agent-team/artifact-registry.yaml"), "utf8"));
@@ -810,7 +871,7 @@ test("plugin status cache cannot authorize phase start without a current adapter
     name: "Leave System",
     mode: "greenfield",
     profile: "standard",
-  });
+  }, "INIT-SECURITY-11");
   await setPluginStatus(root, pluginUri, "available", [
     "brainstorming",
     "writing-plans",
@@ -833,7 +894,7 @@ test("verified plugin invocation persists sanitized evidence", async (t) => {
     name: "Leave System",
     mode: "greenfield",
     profile: "standard",
-  });
+  }, "INIT-SECURITY-12");
 
   const adapter = new FakePluginAdapter();
   let runtimeRequest;
@@ -868,7 +929,7 @@ test("plugin invocation replay reuses persisted evidence without invoking twice"
     name: "Leave System",
     mode: "greenfield",
     profile: "standard",
-  });
+  }, "INIT-SECURITY-13");
   const adapter = new FakePluginAdapter();
   let invocationCount = 0;
   const invoke = adapter.invoke.bind(adapter);
@@ -909,7 +970,7 @@ test("failed plugin invocation appends a redacted failure audit without success 
     name: "Leave System",
     mode: "greenfield",
     profile: "standard",
-  });
+  }, "INIT-SECURITY-14");
   const adapter = new FakePluginAdapter();
   adapter.invoke = async () => { throw new Error("runtime secret"); };
 
@@ -939,7 +1000,7 @@ test("malformed plugin result appends a redacted failure audit without success e
     name: "Leave System",
     mode: "greenfield",
     profile: "standard",
-  });
+  }, "INIT-SECURITY-15");
   const adapter = new FakePluginAdapter();
   adapter.invoke = async (request) => ({
     plugin_uri: request.plugin_uri,
@@ -974,7 +1035,7 @@ test("lifecycle lock serializes plugin status and phase start", async (t) => {
     name: "Leave System",
     mode: "greenfield",
     profile: "standard",
-  });
+  }, "INIT-SECURITY-16");
   const store = ProjectStore.open(root);
   const beforeState = await store.readWorkflowState();
   const beforeStatus = await readFile(join(root, ".agent-team/plugin-status.yaml"), "utf8");
@@ -1001,7 +1062,7 @@ test("initialization check and creation share a root lock", async (t) => {
       name: "Leave System",
       mode: "greenfield",
       profile: "standard",
-    }), /STATE_LOCKED/);
+    }, "INIT-SECURITY-17"), /STATE_LOCKED/);
     await assert.rejects(() => access(join(root, ".agent-team")), { code: "ENOENT" });
   });
 });
@@ -1014,7 +1075,7 @@ test("doctor diagnoses and explicit repair clears an abandoned lifecycle lock", 
     name: "Leave System",
     mode: "greenfield",
     profile: "standard",
-  });
+  }, "INIT-SECURITY-18");
   const moduleUrl = new URL("../packages/project-store/dist/index.js", import.meta.url).href;
   const child = spawn(process.execPath, ["--input-type=module", "-e", [
     `import { ProjectStore } from ${JSON.stringify(moduleUrl)};`,
@@ -1046,6 +1107,44 @@ test("doctor diagnoses and explicit repair clears an abandoned lifecycle lock", 
   await ProjectStore.open(root).withLock(".agent-team/lifecycle.lock", async () => {});
 });
 
+test("repair clears abandoned dependency locks before recovering a crashed adoption", async (t) => {
+  const root = await temporaryDirectory(t, "system-design-team-adopt-crash-");
+  await execFileAsync("git", ["init", "--quiet"], { cwd: root });
+  await writeFile(join(root, "source.ts"), "export const source = true;\n");
+  await execFileAsync("git", ["add", "source.ts"], { cwd: root });
+  const moduleUrl = new URL("../packages/cli/dist/index.js", import.meta.url).href;
+  const options = { id: "crash-adopt", name: "Crash Adopt", profile: "standard" };
+  const child = spawn(process.execPath, ["--input-type=module", "-e", [
+    `import { adoptProject } from ${JSON.stringify(moduleUrl)};`,
+    `await adoptProject(${JSON.stringify(root)}, ${JSON.stringify(options)}, "ADOPT-CRASH", ${JSON.stringify(lifecycleAuthorization)}, {`,
+    `  transactionFault: (point) => { if (point === "after_evidence_write") process.exit(86); },`,
+    `});`,
+  ].join("\n")], { stdio: ["ignore", "pipe", "pipe"] });
+  t.after(() => child.kill());
+  const [code] = await once(child, "exit");
+  assert.equal(code, 86);
+  await access(join(root, ".system-design-team-init.lock"));
+  await access(join(root, ".agent-team/transactions.lock"));
+
+  const repaired = await repair(root, { locks: true, confirmedQuiescent: true });
+  assert(repaired.repaired.includes(".system-design-team-init.lock"));
+  assert(repaired.repaired.includes(".agent-team/transactions.lock"));
+  assert(repaired.repaired.some((item) => item.startsWith("transaction:")));
+  assert.deepEqual(await ProjectStore.open(root).inspectTransactions(), []);
+
+  const adopted = await adoptProject(
+    root,
+    options,
+    "ADOPT-CRASH",
+    lifecycleAuthorization,
+  );
+  assert.equal(adopted.project.project.id, "crash-adopt");
+  assert.deepEqual(parse(await readFile(join(root, ".agent-team/inventory.yaml"), "utf8")), adopted.inventory);
+  const events = (await readFile(join(root, ".agent-team/audit/events.jsonl"), "utf8"))
+    .trim().split(/\r?\n/).map(JSON.parse);
+  assert.equal(events.filter(({ action }) => action === "adopt").length, 1);
+});
+
 test("completed lifecycle replay repairs a missing audit event once", async (t) => {
   const root = await temporaryDirectory(t, "system-design-team-audit-recovery-");
   await execFileAsync("git", ["init", "--quiet"], { cwd: root });
@@ -1054,7 +1153,7 @@ test("completed lifecycle replay repairs a missing audit event once", async (t) 
     name: "Leave System",
     mode: "greenfield",
     profile: "standard",
-  });
+  }, "INIT-SECURITY-19");
   await setPluginStatus(root, pluginUri, "available", ["brainstorming", "writing-plans", "verification-before-completion"]);
   const started = await startPhase(root, "intake", "AUDIT-START", pluginAdapter);
   const store = ProjectStore.open(root);
@@ -1084,7 +1183,7 @@ test("initialization preserves source and AGENTS while lifecycle exclusion recov
     name: "Leave System",
     mode: "greenfield",
     profile: "standard",
-  });
+  }, "INIT-SECURITY-20");
   assert.equal(await readFile(join(root, "src/application.ts"), "utf8"), "export const untouched = true;\n");
   assert.equal(await readFile(join(root, "AGENTS.md"), "utf8"), "keep repository policy\n");
 
