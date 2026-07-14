@@ -206,7 +206,7 @@ test("fresh initialization persists complete profile-derived configuration", asy
     mode: "greenfield",
     profile: "regulated",
     environments: {
-      production: { security: { classification: "confidential" } },
+      production: { security: { classification: "restricted" } },
     },
   }, "INIT-CLI-2");
 
@@ -223,11 +223,11 @@ test("fresh initialization persists complete profile-derived configuration", asy
     classification: "restricted",
     secret_scan: "required",
   });
-  assert.equal(project.environments.production.security.classification, "confidential");
+  assert.equal(project.environments.production.security.classification, "restricted");
   assert.equal(project.framework.management, "managed");
 
   const inspected = await inspectProject(root, { environment: "production" });
-  assert.equal(inspected.configuration.security.classification, "confidential");
+  assert.equal(inspected.configuration.security.classification, "restricted");
   assert.equal(inspected.configuration.approvals.production_deployment, "human_required");
 });
 
@@ -247,12 +247,45 @@ test("explicit configuration overrides environment and clears superseded cache s
 
   const effective = resolveProjectConfig(project, "production", {
     cache: { provider: "none" },
-    security: { classification: "public" },
+    security: { classification: "restricted" },
   });
 
   assert.deepEqual(effective.cache, { provider: "none" });
-  assert.equal(effective.security.classification, "public");
+  assert.equal(effective.security.classification, "restricted");
   assert.equal(effective.approvals.production_deployment, "human_required");
+});
+
+test("classification overlays reject lowering and allow equal or stricter values", async () => {
+  const root = await temporaryGitRepository();
+  await initProject(root, {
+    id: "classification-system",
+    name: "Classification System",
+    mode: "greenfield",
+    profile: "standard",
+    environments: {
+      downgrade: { security: { classification: "public" } },
+    },
+  }, "INIT-CLI-CLASSIFICATION");
+  const project = await readYaml(root, ".agent-team/project.yaml");
+
+  assert.throws(
+    () => resolveProjectConfig(project, "downgrade"),
+    /CLASSIFICATION_DOWNGRADE_NOT_ALLOWED/,
+  );
+  assert.throws(
+    () => resolveProjectConfig(project, undefined, { security: { classification: "public" } }),
+    /CLASSIFICATION_DOWNGRADE_NOT_ALLOWED/,
+  );
+  assert.equal(
+    resolveProjectConfig(project, undefined, { security: { classification: "internal" } })
+      .security.classification,
+    "internal",
+  );
+  assert.equal(
+    resolveProjectConfig(project, undefined, { security: { classification: "restricted" } })
+      .security.classification,
+    "restricted",
+  );
 });
 
 test("adopt inventories an existing repository without mutating source", async () => {

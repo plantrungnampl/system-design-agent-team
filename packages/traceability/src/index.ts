@@ -60,30 +60,24 @@ export function propagateStaleness(
   links: readonly TraceLink[],
 ): Set<string> {
   const changed = new Set(changedIds);
-  const hardDependencies = new Map<string, string[]>();
+  const staleTargets = new Map<string, string[]>();
   for (const link of links) {
-    if (link.type !== "hard_dependency") continue;
-    const targets = hardDependencies.get(link.from) ?? [];
+    if (link.type !== "hard_dependency" && link.type !== "derived_from") continue;
+    const targets = staleTargets.get(link.from) ?? [];
     targets.push(link.to);
-    hardDependencies.set(link.from, targets);
+    staleTargets.set(link.from, targets);
   }
-  for (const targets of hardDependencies.values()) targets.sort();
+  for (const targets of staleTargets.values()) targets.sort();
 
   const stale = new Set<string>();
   const visited = new Set(changed);
   const queue = [...changed].sort();
   for (let index = 0; index < queue.length; index += 1) {
-    for (const target of hardDependencies.get(queue[index]!) ?? []) {
+    for (const target of staleTargets.get(queue[index]!) ?? []) {
       if (visited.has(target)) continue;
       visited.add(target);
       stale.add(target);
       queue.push(target);
-    }
-  }
-
-  for (const link of links) {
-    if (link.type === "derived_from" && changed.has(link.from) && !changed.has(link.to)) {
-      stale.add(link.to);
     }
   }
   return new Set([...stale].sort());

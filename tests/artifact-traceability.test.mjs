@@ -209,17 +209,22 @@ test("staleness follows hard dependencies but not reference-only links", () => {
   assert.deepEqual([...stale], ["BACKLOG"]);
 });
 
-test("staleness follows hard dependencies transitively and direct derivations", () => {
+test("staleness follows hard dependencies and derivations transitively", () => {
   const links = [
     { from: "BACKLOG", to: "PLAN", type: "hard_dependency" },
     { from: "SRS", to: "GENERATED", type: "derived_from" },
     { from: "GENERATED", to: "UNRELATED", type: "hard_dependency" },
+    { from: "UNRELATED", to: "REPORT", type: "derived_from" },
+    { from: "UNRELATED", to: "NOTES", type: "soft_dependency" },
     { from: "SRS", to: "BACKLOG", type: "hard_dependency" },
     { from: "SRS", to: "README", type: "reference_only" },
   ];
   const snapshot = structuredClone(links);
 
-  assert.deepEqual([...propagateStaleness(["SRS"], links)], ["BACKLOG", "GENERATED", "PLAN"]);
+  assert.deepEqual(
+    [...propagateStaleness(["SRS"], links)],
+    ["BACKLOG", "GENERATED", "PLAN", "REPORT", "UNRELATED"],
+  );
   assert.deepEqual(links, snapshot);
 });
 

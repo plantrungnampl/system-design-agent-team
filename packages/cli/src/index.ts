@@ -160,7 +160,14 @@ function profileSecurity(profile: ProjectProfile) {
   return "internal" as const;
 }
 
+const classificationLevel = { public: 0, internal: 1, confidential: 2, restricted: 3 } as const;
+
 function applyOverlay(config: ProjectConfig, overlay: EnvironmentOverlay): ProjectConfig {
+  if (overlay.security?.classification
+    && classificationLevel[overlay.security.classification]
+      < classificationLevel[config.security.classification]) {
+    throw new Error("CLASSIFICATION_DOWNGRADE_NOT_ALLOWED");
+  }
   return ProjectConfigSchema.parse({
     ...config,
     adapter: { ...config.adapter, ...overlay.adapter },
