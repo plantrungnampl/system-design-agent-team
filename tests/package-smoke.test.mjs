@@ -3,7 +3,7 @@ import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join, relative, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep, win32 } from "node:path";
 import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
@@ -15,6 +15,15 @@ const npm = process.platform === "win32"
   ? [process.execPath, join(dirname(process.execPath), "node_modules", "npm", "bin", "npm-cli.js")]
   : ["npm"];
 const execNpm = (args, options) => execFileAsync(npm[0], [...npm.slice(1), ...args], options);
+const isContained = (relativePath, isAbsolutePath, separator) =>
+  !isAbsolutePath(relativePath)
+  && relativePath !== ".."
+  && !relativePath.startsWith(`..${separator}`);
+
+test("package containment rejects Windows cross-volume paths", () => {
+  const relativePath = win32.relative("C:\\consumer", "D:\\package");
+  assert.equal(isContained(relativePath, win32.isAbsolute, win32.sep), false);
+});
 
 test("packed workspaces install cleanly and the packed CLI initializes a project", async () => {
   const root = await mkdtemp(join(tmpdir(), "system-design-team-pack-"));
@@ -51,7 +60,9 @@ test("packed workspaces install cleanly and the packed CLI initializes a project
     for (const name of await readdir(installedScope)) {
       const installed = join(installedScope, name);
       assert.equal((await lstat(installed)).isSymbolicLink(), false);
-      assert.equal(relative(canonicalConsumer, await realpath(installed)).startsWith(".."), false);
+      assert.equal(isContained(
+        relative(canonicalConsumer, await realpath(installed)), isAbsolute, sep,
+      ), true);
     }
 
     await execFileAsync("git", ["init", "--quiet"], { cwd: project });
