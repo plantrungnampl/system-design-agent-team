@@ -1212,17 +1212,113 @@ test("start checks the phase owner plugin before changing state and replays safe
   assert.equal(started.state_version, before.state_version + 1);
   assert.equal(invoked.length, 3);
   const evidence = await readYaml(root, ".agent-team/plugin-invocations.yaml");
+  const parentOperationId = operationKey("start", "intake", "OP-START-INTAKE");
   assert.deepEqual(evidence.invocations.map(({ agent_id, phase, operation_id }) => ({
     agent_id,
     phase,
     operation_id,
-  })), Array.from({ length: 3 }, () => ({
+  })), ["brainstorming", "writing-plans", "verification-before-completion"].map((skill) => ({
     agent_id: "lead-orchestrator",
     phase: "intake",
-    operation_id: operationKey("start", "intake", "OP-START-INTAKE"),
+    operation_id: operationKey(
+      "lifecycle-plugin",
+      pluginUri,
+      JSON.stringify([parentOperationId, "lead-orchestrator", "intake", skill]),
+    ),
   })));
   assert.deepEqual(await startPhase(root, "intake", "OP-START-INTAKE", invokingAdapter), started);
   assert.equal(invoked.length, 3);
+});
+
+test("lifecycle plugin invocations are valid audited evidence", async () => {
+  const root = await temporaryGitRepository();
+  await initProject(root, {
+    id: "leave-system",
+    name: "Leave System",
+    mode: "greenfield",
+    profile: "standard",
+  }, "INIT-LIFECYCLE-AUDIT");
+
+  await startPhase(root, "intake", "LIFECYCLE-AUDIT-START");
+
+  const report = await evidenceVerify(root);
+  assert.equal(report.valid, true, JSON.stringify(report.findings));
+  assert.equal(report.verified.plugin_invocations, 3);
+});
+
+test("completed start replay requires exact invocation evidence and audit", async () => {
+  const missingRoot = await temporaryGitRepository();
+  await initProject(missingRoot, {
+    id: "missing-evidence",
+    name: "Missing Evidence",
+    mode: "greenfield",
+    profile: "standard",
+  }, "INIT-MISSING-EVIDENCE");
+  await startPhase(missingRoot, "intake", "REPLAY-EVIDENCE-START");
+  const missing = await readYaml(missingRoot, ".agent-team/plugin-invocations.yaml");
+  missing.invocations.shift();
+  await ProjectStore.open(missingRoot).writeYamlAtomic(".agent-team/plugin-invocations.yaml", missing);
+  await assert.rejects(
+    () => startPhase(missingRoot, "intake", "REPLAY-EVIDENCE-START"),
+    /REQUIRED_PLUGIN_INVOCATION_MISSING/,
+  );
+
+  const auditRoot = await temporaryGitRepository();
+  await initProject(auditRoot, {
+    id: "missing-audit",
+    name: "Missing Audit",
+    mode: "greenfield",
+    profile: "standard",
+  }, "INIT-MISSING-AUDIT");
+  await startPhase(auditRoot, "intake", "REPLAY-AUDIT-START");
+  const auditPath = join(auditRoot, ".agent-team/audit/events.jsonl");
+  const audits = (await readFile(auditPath, "utf8")).trim().split(/\r?\n/).map(JSON.parse);
+  const invocationAudit = audits.find(({ action, result }) => action === "plugin-invocation" && result === "success");
+  invocationAudit.target = "plugin://mismatched@example";
+  await writeFile(auditPath, `${audits.map(JSON.stringify).join("\n")}\n`);
+  await assert.rejects(
+    () => startPhase(auditRoot, "intake", "REPLAY-AUDIT-START"),
+    /PLUGIN_INVOCATION_AUDIT_MISMATCH/,
+  );
+});
+
+test("partial required-plugin success is durable and replay-safe", async () => {
+  const root = await temporaryGitRepository();
+  await initProject(root, {
+    id: "partial-plugin",
+    name: "Partial Plugin",
+    mode: "greenfield",
+    profile: "standard",
+  }, "INIT-PARTIAL-PLUGIN");
+  const calls = [];
+  let failWritingPlans = true;
+  const adapter = {
+    ...pluginAdapter,
+    async invoke(request) {
+      calls.push(request.skill);
+      if (request.skill === "writing-plans" && failWritingPlans) {
+        failWritingPlans = false;
+        throw new Error("SECOND_SKILL_FAILED");
+      }
+      return pluginAdapter.invoke(request);
+    },
+  };
+
+  await assert.rejects(
+    () => startPhase(root, "intake", "PARTIAL-PLUGIN-START", adapter),
+    /PLUGIN_INVOCATION_FAILED/,
+  );
+  const partial = await readYaml(root, ".agent-team/plugin-invocations.yaml");
+  assert.deepEqual(partial.invocations.map(({ skill }) => skill), ["brainstorming"]);
+
+  const started = await startPhase(root, "intake", "PARTIAL-PLUGIN-START", adapter);
+  assert.equal(started.phases.intake.status, "in_progress");
+  assert.deepEqual(calls, [
+    "brainstorming",
+    "writing-plans",
+    "writing-plans",
+    "verification-before-completion",
+  ]);
 });
 
 test("validate checks registered artifacts before entering artifact validation", async () => {
@@ -1438,6 +1534,37 @@ test("review checks the configured reviewer plugin before recording evidence", a
 
   const reviewed = await reviewPhase(root, "ux", "ux-reviewer", "approved", "OP-UX-REVIEW");
   assert.equal(reviewed.phases.ux.status, "awaiting_approval");
+});
+
+test("completed review replay requires its exact audited plugin invocation", async () => {
+  const root = await temporaryGitRepository();
+  await initProject(root, {
+    id: "review-replay",
+    name: "Review Replay",
+    mode: "greenfield",
+    profile: "standard",
+  }, "INIT-REVIEW-REPLAY");
+  await setArtifactStatus(root, "UX-HANDOFF");
+  const store = ProjectStore.open(root);
+  const state = await store.readWorkflowState();
+  state.phases.ux.status = "artifact_validation";
+  state.current_phase = "ux";
+  await store.writeYamlAtomic(".agent-team/workflow-state.yaml", state);
+
+  const reviewed = await reviewPhase(root, "ux", "ux-reviewer", "approved", "REVIEW-REPLAY");
+  assert.equal(reviewed.phases.ux.status, "awaiting_approval");
+  const invocations = await readYaml(root, ".agent-team/plugin-invocations.yaml");
+  await store.writeYamlAtomic(".agent-team/plugin-invocations.yaml", {
+    invocations: invocations.invocations.filter(({ agent_id }) => agent_id !== "ux-reviewer"),
+  });
+  await assert.rejects(
+    () => reviewPhase(root, "ux", "ux-reviewer", "approved", "REVIEW-REPLAY"),
+    /REQUIRED_PLUGIN_INVOCATION_MISSING/,
+  );
+
+  await store.writeYamlAtomic(".agent-team/plugin-invocations.yaml", invocations);
+  const report = await evidenceVerify(root);
+  assert.equal(report.valid, true, JSON.stringify(report.findings));
 });
 
 test("approve persists registry-bound evidence and is idempotent", async () => {

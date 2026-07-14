@@ -1038,7 +1038,7 @@ test("verified plugin invocation persists sanitized evidence", async (t) => {
   assert(!evidenceText.includes("must never be stored"));
 });
 
-test("plugin invocation replay reuses persisted evidence without invoking twice", async (t) => {
+test("plugin invocation replay rejects missing audit without invoking twice", async (t) => {
   const root = await temporaryDirectory(t, "system-design-team-plugin-replay-");
   await execFileAsync("git", ["init", "--quiet"], { cwd: root });
   await initProject(root, {
@@ -1067,16 +1067,15 @@ test("plugin invocation replay reuses persisted evidence without invoking twice"
     auditPath,
     `${audit.filter(({ action }) => action !== "plugin-invocation").map(JSON.stringify).join("\n")}\n`,
   );
-  const replay = await invokePlugin(root, adapter, request, "PLUGIN-REPLAY");
+  await assert.rejects(
+    () => invokePlugin(root, adapter, request, "PLUGIN-REPLAY"),
+    /PLUGIN_INVOCATION_AUDIT_MISSING/,
+  );
   const evidence = parse(await readFile(join(root, ".agent-team/plugin-invocations.yaml"), "utf8"));
-  const repairedAudit = (await readFile(auditPath, "utf8")).trim().split("\n").map(JSON.parse);
 
   assert.equal(invocationCount, 1);
-  assert.deepEqual(replay.evidence, first.evidence);
-  assert.equal(replay.output, undefined);
+  assert.deepEqual(evidence.invocations, [first.evidence]);
   assert.equal(evidence.invocations.length, 1);
-  assert.equal(repairedAudit.filter(({ action, result }) =>
-    action === "plugin-invocation" && result === "success").length, 1);
 });
 
 test("failed plugin invocation appends a redacted failure audit without success evidence", async (t) => {

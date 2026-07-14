@@ -49,7 +49,6 @@ import {
   type GateId,
   type HandoverRecord,
   type PluginInvocationList,
-  type PluginInvocationRecord,
   type PluginStatusRecord,
   type ProjectConfig,
   type EnvironmentOverlay,
@@ -855,29 +854,111 @@ async function requireCurrentCapabilities(
 }
 
 async function invokeRequiredPlugins(
+  root: string,
   manifest: AgentManifest,
   phase: string,
   operationId: string,
   adapter?: PluginAdapter,
-): Promise<PluginInvocationRecord[]> {
+  invokeMissing = true,
+): Promise<void> {
   await requireCurrentCapabilities(manifest, adapter);
-  const registry = new PluginRegistry([]);
-  const invocations: PluginInvocationRecord[] = [];
+  const store = ProjectStore.open(root);
   for (const requirement of manifest.required_plugins) {
     const skills = requirement.required_skills.length > 0 ? requirement.required_skills : [undefined];
     for (const skill of skills) {
-      const { evidence } = await registry.invoke(adapter!, {
+      const childOperationId = operationKey(
+        "lifecycle-plugin",
+        requirement.uri,
+        JSON.stringify([operationId, manifest.id, phase, skill ?? null]),
+      );
+      await invokePluginLocked(root, store, adapter!, {
         plugin_uri: requirement.uri,
         ...(skill ? { skill } : {}),
-        input: { agent_id: manifest.id, phase },
-        operation_id: operationId,
+        input: { agent_id: manifest.id, phase, operation_id: operationId },
         agent_id: manifest.id,
         phase,
-      });
-      invocations.push(evidence);
+      }, childOperationId, invokeMissing);
     }
   }
-  return invocations;
+}
+
+async function requirePluginInvocationAudit(
+  root: string,
+  invocation: PluginInvocationList["invocations"][number],
+): Promise<void> {
+  const auditPath = join(resolve(root), ".agent-team/audit/events.jsonl");
+  const auditId = operationKey("plugin-invocation", invocation.plugin_uri, invocation.operation_id);
+  let audit: AuditEvent | undefined;
+  try {
+    const projectRoot = await realpath(root);
+    if (!inside(projectRoot, await realpath(auditPath))) throw new Error("PATH_OUTSIDE_PROJECT");
+    audit = (await readFile(auditPath, "utf8")).split(/\r?\n/).filter(Boolean)
+      .map((line) => AuditEventSchema.parse(JSON.parse(line)))
+      .find(({ id }) => id === auditId);
+  } catch (error) {
+    if (error instanceof Error && error.message === "PATH_OUTSIDE_PROJECT") throw error;
+    throw new Error("PLUGIN_INVOCATION_AUDIT_MISSING");
+  }
+  if (!audit) throw new Error("PLUGIN_INVOCATION_AUDIT_MISSING");
+  if (audit.action !== "plugin-invocation"
+    || audit.target !== invocation.plugin_uri
+    || audit.adapter_id !== invocation.plugin_uri
+    || audit.result !== "success") {
+    throw new Error("PLUGIN_INVOCATION_AUDIT_MISMATCH");
+  }
+}
+
+async function invokePluginLocked(
+  root: string,
+  store: ProjectStore,
+  adapter: PluginAdapter,
+  request: Omit<PluginInvocationRequest, "operation_id">,
+  operationId: string,
+  invokeMissing: boolean,
+): Promise<VerifiedPluginInvocation> {
+  const id = operationKey("plugin-invocation", request.plugin_uri, operationId);
+  const current = await pluginInvocations(store);
+  const existing = current.invocations.find((invocation) =>
+    invocation.plugin_uri === request.plugin_uri && invocation.operation_id === operationId);
+  if (existing) {
+    if (existing.skill !== request.skill
+      || existing.agent_id !== request.agent_id
+      || existing.phase !== request.phase
+      || existing.input_digest !== pluginInvocationDigest(request.input)) {
+      throw new Error("OPERATION_ID_CONFLICT");
+    }
+    await requirePluginInvocationAudit(root, existing);
+    return { evidence: existing, output: undefined };
+  }
+  if (!invokeMissing) throw new Error("REQUIRED_PLUGIN_INVOCATION_MISSING");
+  let result: VerifiedPluginInvocation;
+  try {
+    result = await new PluginRegistry([]).invoke(adapter, { ...request, operation_id: operationId });
+  } catch (error) {
+    await appendOperationAudit(
+      store,
+      operationKey("plugin-invocation-failure", request.plugin_uri, operationId),
+      "plugin-invocation",
+      request.plugin_uri,
+      {
+        authorizationSource: "runtime-adapter",
+        adapterId: request.plugin_uri,
+        result: "failure",
+      },
+    );
+    throw error;
+  }
+  const next = PluginInvocationListSchema.parse({
+    invocations: [...current.invocations, result.evidence],
+  });
+  const { project } = await projectConfig(store);
+  await store.transaction(id, [
+    { path: ".agent-team/plugin-invocations.yaml", content: stringify(next) },
+  ], makeAuditEvent(id, "plugin-invocation", request.plugin_uri, project.profile, {
+    authorizationSource: "runtime-adapter",
+    adapterId: request.plugin_uri,
+  }));
+  return result;
 }
 
 export async function invokePlugin(
@@ -888,51 +969,8 @@ export async function invokePlugin(
 ): Promise<VerifiedPluginInvocation> {
   requireOperationId(operationId);
   const store = ProjectStore.open(root);
-  return store.withLock(".agent-team/lifecycle.lock", async () => {
-    const id = operationKey("plugin-invocation", request.plugin_uri, operationId);
-    const current = await pluginInvocations(store);
-    const existing = current.invocations.find((invocation) =>
-      invocation.plugin_uri === request.plugin_uri && invocation.operation_id === operationId);
-    if (existing) {
-      if (existing.skill !== request.skill
-        || existing.input_digest !== pluginInvocationDigest(request.input)) {
-        throw new Error("OPERATION_ID_CONFLICT");
-      }
-      await appendOperationAudit(store, id, "plugin-invocation", request.plugin_uri, {
-        authorizationSource: "runtime-adapter",
-        adapterId: request.plugin_uri,
-      });
-      return { evidence: existing, output: undefined };
-    }
-    let result: VerifiedPluginInvocation;
-    try {
-      result = await new PluginRegistry([]).invoke(adapter, { ...request, operation_id: operationId });
-    } catch (error) {
-      await appendOperationAudit(
-        store,
-        operationKey("plugin-invocation-failure", request.plugin_uri, operationId),
-        "plugin-invocation",
-        request.plugin_uri,
-        {
-          authorizationSource: "runtime-adapter",
-          adapterId: request.plugin_uri,
-          result: "failure",
-        },
-      );
-      throw error;
-    }
-    const next = PluginInvocationListSchema.parse({
-      invocations: [...current.invocations, result.evidence],
-    });
-    const { project } = await projectConfig(store);
-    await store.transaction(id, [
-      { path: ".agent-team/plugin-invocations.yaml", content: stringify(next) },
-    ], makeAuditEvent(id, "plugin-invocation", request.plugin_uri, project.profile, {
-      authorizationSource: "runtime-adapter",
-      adapterId: request.plugin_uri,
-    }));
-    return result;
-  });
+  return store.withLock(".agent-team/lifecycle.lock", () =>
+    invokePluginLocked(root, store, adapter, request, operationId, true));
 }
 
 export async function startPhase(
@@ -959,11 +997,11 @@ export async function startPhase(
   const owner = (await configuredCatalogue(store)).find((agent) => agent.id === definition.owner);
   if (!owner) throw new Error(`AGENT_NOT_CONFIGURED: ${definition.owner}`);
   if (state.completed_operations.includes(scopedOperation)) {
-    await requireCurrentCapabilities(owner, adapter);
+    await invokeRequiredPlugins(root, owner, phase, scopedOperation, adapter, false);
     await appendOperationAudit(store, scopedOperation, "start", phase);
     return state;
   }
-  const invocations = await invokeRequiredPlugins(owner, phase, scopedOperation, adapter);
+  await invokeRequiredPlugins(root, owner, phase, scopedOperation, adapter);
 
   const next = transitionPhase(
     state,
@@ -971,22 +1009,9 @@ export async function startPhase(
     { phase, to: "in_progress", operation_id: scopedOperation },
   );
   const { project } = await projectConfig(store);
-  const currentInvocations = invocations.length > 0 ? await pluginInvocations(store) : undefined;
-  const writes: Parameters<ProjectStore["transaction"]>[1] = [
+  await ensureLifecycleTransaction(store, scopedOperation, [
     { path: ".agent-team/workflow-state.yaml", content: stringify(next), expectedStateVersion: state.state_version },
-    ...(currentInvocations ? [{
-      path: ".agent-team/plugin-invocations.yaml",
-      content: stringify(PluginInvocationListSchema.parse({
-        invocations: [...currentInvocations.invocations, ...invocations],
-      })),
-    }] : []),
-  ];
-  await ensureLifecycleTransaction(
-    store,
-    scopedOperation,
-    writes,
-    makeAuditEvent(scopedOperation, "start", phase, project.profile),
-  );
+  ], makeAuditEvent(scopedOperation, "start", phase, project.profile));
   return next;
   });
 }
@@ -1445,7 +1470,7 @@ export async function reviewPhase(
       || existing.execution_receipt_digest !== reviewReceipt.attestation_digest) {
       throw new Error("OPERATION_ID_CONFLICT");
     }
-    await requireCurrentCapabilities(reviewerManifest, adapter);
+    await invokeRequiredPlugins(root, reviewerManifest, phase, evidenceId, adapter, false);
     if (state.phases[phase]?.review_id !== existing.id) throw new Error("REVIEW_EVIDENCE_MISSING");
     await appendOperationAudit(store, evidenceId, "review", phase, {
       executionReceiptId: reviewReceipt.id,
@@ -1456,7 +1481,7 @@ export async function reviewPhase(
   if ((definition.gate === "G7" || definition.gate === "G8") && !(await secretsScan(root)).valid) {
     throw new Error("SECRET_SCAN_FAILED");
   }
-  const invocations = await invokeRequiredPlugins(reviewerManifest, phase, evidenceId, adapter);
+  await invokeRequiredPlugins(root, reviewerManifest, phase, evidenceId, adapter);
   const expected = {
     id: evidenceId,
     phase,
@@ -1504,22 +1529,14 @@ export async function reviewPhase(
     reviews: existing ? reviews.reviews : [...reviews.reviews, review],
   });
   const { project } = await projectConfig(store);
-  const currentInvocations = invocations.length > 0 ? await pluginInvocations(store) : undefined;
-  const writes: Parameters<ProjectStore["transaction"]>[1] = [
+  await store.transaction(evidenceId, [
     { path: ".agent-team/reviews.yaml", content: stringify(nextReviews) },
     {
       path: ".agent-team/workflow-state.yaml",
       content: stringify(preview),
       expectedStateVersion: state.state_version,
     },
-    ...(currentInvocations ? [{
-      path: ".agent-team/plugin-invocations.yaml",
-      content: stringify(PluginInvocationListSchema.parse({
-        invocations: [...currentInvocations.invocations, ...invocations],
-      })),
-    }] : []),
-  ];
-  await store.transaction(evidenceId, writes, makeAuditEvent(evidenceId, "review", phase, project.profile, {
+  ], makeAuditEvent(evidenceId, "review", phase, project.profile, {
     actor: { type: "agent", identifier: reviewerId },
     authorizationSource: "agent_manifest",
     artifactVersions: review.artifact_versions,
