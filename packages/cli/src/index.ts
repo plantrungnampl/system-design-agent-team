@@ -882,12 +882,27 @@ async function invokeRequiredPlugins(
   }
 }
 
+function pluginInvocationAuditId(invocation: PluginInvocationList["invocations"][number]): string {
+  const binding = artifactChecksum(JSON.stringify([
+    invocation.operation_id,
+    invocation.publisher_identity,
+    invocation.execution_reference,
+    invocation.status,
+    invocation.agent_id ?? null,
+    invocation.phase ?? null,
+    invocation.skill ?? null,
+    invocation.input_digest,
+    invocation.output_digest,
+  ]));
+  return operationKey("plugin-invocation", invocation.plugin_uri, binding);
+}
+
 async function requirePluginInvocationAudit(
   root: string,
   invocation: PluginInvocationList["invocations"][number],
 ): Promise<void> {
   const auditPath = join(resolve(root), ".agent-team/audit/events.jsonl");
-  const auditId = operationKey("plugin-invocation", invocation.plugin_uri, invocation.operation_id);
+  const auditId = pluginInvocationAuditId(invocation);
   let audit: AuditEvent | undefined;
   try {
     const projectRoot = await realpath(root);
@@ -903,6 +918,9 @@ async function requirePluginInvocationAudit(
   if (audit.action !== "plugin-invocation"
     || audit.target !== invocation.plugin_uri
     || audit.adapter_id !== invocation.plugin_uri
+    || audit.authorization_source !== "runtime-adapter"
+    || audit.actor.type !== "system"
+    || audit.actor.identifier !== "codex-runtime"
     || audit.result !== "success") {
     throw new Error("PLUGIN_INVOCATION_AUDIT_MISMATCH");
   }
@@ -921,6 +939,7 @@ async function invokePluginLocked(
   const existing = current.invocations.find((invocation) =>
     invocation.plugin_uri === request.plugin_uri && invocation.operation_id === operationId);
   if (existing) {
+    if (existing.status !== "success") throw new Error("PLUGIN_INVOCATION_STATUS_INVALID");
     if (existing.skill !== request.skill
       || existing.agent_id !== request.agent_id
       || existing.phase !== request.phase
@@ -952,9 +971,11 @@ async function invokePluginLocked(
     invocations: [...current.invocations, result.evidence],
   });
   const { project } = await projectConfig(store);
-  await store.transaction(id, [
+  const auditId = pluginInvocationAuditId(result.evidence);
+  await store.transaction(auditId, [
     { path: ".agent-team/plugin-invocations.yaml", content: stringify(next) },
-  ], makeAuditEvent(id, "plugin-invocation", request.plugin_uri, project.profile, {
+  ], makeAuditEvent(auditId, "plugin-invocation", request.plugin_uri, project.profile, {
+    actor: { type: "system", identifier: "codex-runtime" },
     authorizationSource: "runtime-adapter",
     adapterId: request.plugin_uri,
   }));
@@ -1183,8 +1204,14 @@ export async function evidenceVerify(root: string) {
       }
     }
     for (const invocation of invocations.invocations) {
-      const audit = audits.get(operationKey("plugin-invocation", invocation.plugin_uri, invocation.operation_id));
-      if (!audit) {
+      const audit = audits.get(pluginInvocationAuditId(invocation));
+      if (invocation.status !== "success") {
+        findings.push({
+          code: "PLUGIN_INVOCATION_STATUS_INVALID",
+          reference: invocation.operation_id,
+          message: `Plugin invocation did not succeed: ${invocation.plugin_uri}`,
+        });
+      } else if (!audit) {
         findings.push({
           code: "PLUGIN_INVOCATION_AUDIT_MISSING",
           reference: invocation.operation_id,
@@ -1193,6 +1220,9 @@ export async function evidenceVerify(root: string) {
       } else if (audit.action !== "plugin-invocation"
         || audit.target !== invocation.plugin_uri
         || audit.adapter_id !== invocation.plugin_uri
+        || audit.authorization_source !== "runtime-adapter"
+        || audit.actor.type !== "system"
+        || audit.actor.identifier !== "codex-runtime"
         || audit.result !== "success") {
         findings.push({
           code: "PLUGIN_INVOCATION_AUDIT_MISMATCH",

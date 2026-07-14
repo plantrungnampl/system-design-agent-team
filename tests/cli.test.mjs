@@ -1282,6 +1282,68 @@ test("completed start replay requires exact invocation evidence and audit", asyn
   );
 });
 
+test("completed lifecycle replay rejects non-success invocation evidence", async () => {
+  const root = await temporaryGitRepository();
+  await initProject(root, {
+    id: "failed-invocation",
+    name: "Failed Invocation",
+    mode: "greenfield",
+    profile: "standard",
+  }, "INIT-FAILED-INVOCATION");
+  await startPhase(root, "intake", "REPLAY-FAILED-INVOCATION");
+
+  const invocations = await readYaml(root, ".agent-team/plugin-invocations.yaml");
+  invocations.invocations[0].status = "failure";
+  await ProjectStore.open(root).writeYamlAtomic(".agent-team/plugin-invocations.yaml", invocations);
+
+  await assert.rejects(
+    () => startPhase(root, "intake", "REPLAY-FAILED-INVOCATION"),
+    /PLUGIN_INVOCATION_STATUS_INVALID/,
+  );
+});
+
+test("completed lifecycle replay requires runtime-adapter audit provenance", async () => {
+  const root = await temporaryGitRepository();
+  await initProject(root, {
+    id: "invalid-provenance",
+    name: "Invalid Provenance",
+    mode: "greenfield",
+    profile: "standard",
+  }, "INIT-INVALID-PROVENANCE");
+  await startPhase(root, "intake", "REPLAY-INVALID-PROVENANCE");
+
+  const auditPath = join(root, ".agent-team/audit/events.jsonl");
+  const audits = (await readFile(auditPath, "utf8")).trim().split(/\r?\n/).map(JSON.parse);
+  const invocationAudit = audits.find(({ action, result }) => action === "plugin-invocation" && result === "success");
+  invocationAudit.authorization_source = "workflow";
+  await writeFile(auditPath, `${audits.map(JSON.stringify).join("\n")}\n`);
+
+  await assert.rejects(
+    () => startPhase(root, "intake", "REPLAY-INVALID-PROVENANCE"),
+    /PLUGIN_INVOCATION_AUDIT_MISMATCH/,
+  );
+});
+
+test("completed lifecycle replay requires an audit bound to invocation digests", async () => {
+  const root = await temporaryGitRepository();
+  await initProject(root, {
+    id: "invalid-digest",
+    name: "Invalid Digest",
+    mode: "greenfield",
+    profile: "standard",
+  }, "INIT-INVALID-DIGEST");
+  await startPhase(root, "intake", "REPLAY-INVALID-DIGEST");
+
+  const invocations = await readYaml(root, ".agent-team/plugin-invocations.yaml");
+  invocations.invocations[0].output_digest = `sha256:${"0".repeat(64)}`;
+  await ProjectStore.open(root).writeYamlAtomic(".agent-team/plugin-invocations.yaml", invocations);
+
+  await assert.rejects(
+    () => startPhase(root, "intake", "REPLAY-INVALID-DIGEST"),
+    /PLUGIN_INVOCATION_AUDIT_MISSING/,
+  );
+});
+
 test("partial required-plugin success is durable and replay-safe", async () => {
   const root = await temporaryGitRepository();
   await initProject(root, {
