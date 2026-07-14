@@ -35,8 +35,8 @@ function helpCommands(help) {
 
 function documentedInvocations(text) {
   return [
-    ...text.matchAll(/^system-design-team ([^\r\n]+)$/gm),
-    ...text.matchAll(/`system-design-team ([^`]+)`/g),
+    ...text.matchAll(/^(?:npm exec -- )?system-design-team ([^\r\n]+)$/gm),
+    ...text.matchAll(/`(?:npm exec -- )?system-design-team ([^`]+)`/g),
   ];
 }
 
@@ -87,6 +87,11 @@ test("documentation links resolve and claims match V1 boundaries", async () => {
     }
   }
   const text = combined.join("\n");
+  assert.match(await readFile(join(repository, "README.md"), "utf8"),
+    /^npm exec -- system-design-team init /m);
+  assert.match(text,
+    /`--plugin-adapter` dynamically loads executable host code and must point only to a reviewed, trusted adapter\./);
+  assert.match(text, /V1 ships plugin contracts and identities, not plugin implementations\./);
   for (const staleClaim of [
     /first V1 vertical slice/i,
     /first slice/i,

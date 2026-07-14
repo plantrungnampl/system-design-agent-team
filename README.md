@@ -44,25 +44,25 @@ npm run check
 node packages/cli/dist/bin.js --help
 ```
 
-After installing the packed or published workspaces, initialize a project from its repository root:
+The repository install links the workspace CLI locally. Invoke it with `npm exec --` from the project repository root:
 
 ```bash
-system-design-team init --id leave-system --name "Leave System" --mode greenfield --profile standard --operation-id INIT-001
-system-design-team status
-system-design-team doctor
+npm exec -- system-design-team init --id leave-system --name "Leave System" --mode greenfield --profile standard --operation-id INIT-001
+npm exec -- system-design-team status
+npm exec -- system-design-team doctor
 ```
 
 A plugin-bound phase requires a host-provided adapter module:
 
 ```bash
-system-design-team start intake --operation-id INTAKE-START-001 --plugin-adapter ./codex-plugin-adapter.mjs
-system-design-team validate intake --operation-id INTAKE-VALIDATE-001
-system-design-team review intake --reviewer documentation-reviewer --verdict approved --operation-id INTAKE-REVIEW-001 --plugin-adapter ./codex-plugin-adapter.mjs
-system-design-team approve G0 --by project-owner --operation-id INTAKE-APPROVE-001
-system-design-team handover intake --operation-id INTAKE-HANDOVER-001
+npm exec -- system-design-team start intake --operation-id INTAKE-START-001 --plugin-adapter ./codex-plugin-adapter.mjs
+npm exec -- system-design-team validate intake --operation-id INTAKE-VALIDATE-001
+npm exec -- system-design-team review intake --reviewer documentation-reviewer --verdict approved --operation-id INTAKE-REVIEW-001 --execution-receipt "$INTAKE_REVIEW_RECEIPT_ID" --plugin-adapter ./codex-plugin-adapter.mjs
+npm exec -- system-design-team approve G0 --by project-owner --operation-id INTAKE-APPROVE-001
+npm exec -- system-design-team handover intake --operation-id INTAKE-HANDOVER-001
 ```
 
-The adapter must default-export the `resolve`, `verifySkill`, and `invoke` methods defined by `@system-design-team/plugin-registry`.
+`--plugin-adapter` dynamically loads executable host code and must point only to a reviewed, trusted adapter. The adapter must default-export the `resolve`, `verifySkill`, and `invoke` methods defined by `@system-design-team/plugin-registry`; `INTAKE_REVIEW_RECEIPT_ID` must name the host-recorded reviewer execution receipt.
 
 ## Workflow and approval gates
 
@@ -90,7 +90,7 @@ Profiles are `small`, `standard`, `enterprise`, and `regulated`.
 
 ## Plugin contracts
 
-The agent catalogue declares these trusted plugin identities:
+V1 ships plugin contracts and identities, not plugin implementations. The agent catalogue declares these trusted plugin identities:
 
 | Plugin | Primary roles |
 | --- | --- |
@@ -143,7 +143,7 @@ CI runs the full check on Node.js 20 and 22 across Linux, Windows, and macOS. Th
 
 ## Roadmap
 
-- **V1:** local Git-backed workflow engine, CLI, Codex adapter contracts, plugins, gates, and validation.
+- **V1:** local Git-backed workflow engine, CLI, Codex and plugin contracts, plugin identities, gates, and validation.
 - **V2 (planned):** richer parallel dispatch, council orchestration, GitHub integration, and project health views.
 - **V3 (planned):** optional hosted Python multi-agent runtime, durable queues, observability, and multi-project operation.
 

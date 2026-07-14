@@ -12,34 +12,34 @@ npm run check
 node packages/cli/dist/bin.js --help
 ```
 
-The package smoke test packs every internal workspace, installs the tarballs into a clean temporary package, and runs the installed CLI. A consumer may use the `system-design-team` executable after those packages are published or supplied as tarballs.
+The package smoke test packs every internal workspace, installs the tarballs into a clean temporary package, and runs the installed CLI. In this repository, use `npm exec -- system-design-team`; a consumer may use the `system-design-team` executable after the packages are published or supplied as tarballs.
 
 ## Choose a project mode
 
 Greenfield starts from a new business problem:
 
 ```bash
-system-design-team init --id leave-system --name "Leave System" --mode greenfield --profile standard --operation-id INIT-GREENFIELD-001
+npm exec -- system-design-team init --id leave-system --name "Leave System" --mode greenfield --profile standard --operation-id INIT-GREENFIELD-001
 ```
 
 Existing-system adoption inventories tracked source and documentation without changing application source:
 
 ```bash
-system-design-team adopt --id order-system --name "Order System" --profile standard --operation-id ADOPT-001
+npm exec -- system-design-team adopt --id order-system --name "Order System" --profile standard --operation-id ADOPT-001
 ```
 
 Migration starts with legacy assessment and continues through separately approved cutover, reconciliation, and decommission phases:
 
 ```bash
-system-design-team init --id order-migration --name "Order Migration" --mode migration --profile enterprise --operation-id INIT-MIGRATION-001
+npm exec -- system-design-team init --id order-migration --name "Order Migration" --mode migration --profile enterprise --operation-id INIT-MIGRATION-001
 ```
 
 Use `small`, `standard`, `enterprise`, or `regulated` profiles. Generated project artifacts are English. Inspect the effective installation and current state:
 
 ```bash
-system-design-team inspect
-system-design-team status
-system-design-team doctor
+npm exec -- system-design-team inspect
+npm exec -- system-design-team status
+npm exec -- system-design-team doctor
 ```
 
 ## Work through a phase
@@ -47,11 +47,11 @@ system-design-team doctor
 Every mutation needs a caller-supplied operation ID. A typical phase follows start, artifact work, validation, independent review, human approval where required, then handover:
 
 ```bash
-system-design-team start intake --operation-id INTAKE-START-001 --plugin-adapter ./codex-plugin-adapter.mjs
-system-design-team validate intake --operation-id INTAKE-VALIDATE-001
-system-design-team review intake --reviewer documentation-reviewer --verdict approved --operation-id INTAKE-REVIEW-001 --plugin-adapter ./codex-plugin-adapter.mjs
-system-design-team approve G0 --by project-owner --operation-id INTAKE-APPROVE-001
-system-design-team handover intake --operation-id INTAKE-HANDOVER-001
+npm exec -- system-design-team start intake --operation-id INTAKE-START-001 --plugin-adapter ./codex-plugin-adapter.mjs
+npm exec -- system-design-team validate intake --operation-id INTAKE-VALIDATE-001
+npm exec -- system-design-team review intake --reviewer documentation-reviewer --verdict approved --operation-id INTAKE-REVIEW-001 --execution-receipt "$INTAKE_REVIEW_RECEIPT_ID" --plugin-adapter ./codex-plugin-adapter.mjs
+npm exec -- system-design-team approve G0 --by project-owner --operation-id INTAKE-APPROVE-001
+npm exec -- system-design-team handover intake --operation-id INTAKE-HANDOVER-001
 ```
 
-Required-plugin phases need a host-provided execution adapter module. Pass its absolute or project-relative path with `--plugin-adapter`; the module must default-export the `resolve`, `verifySkill`, and `invoke` methods defined by `@system-design-team/plugin-registry`. The CLI verifies current plugin identity and skills through that adapter. Persisted plugin status remains diagnostic cache and cannot authorize lifecycle work. See [Security](security.md) for the plugin contract and [Operations](operations.md) for gate and recovery procedures.
+Required-plugin phases need a host-provided execution adapter module. V1 ships plugin contracts and identities, not plugin implementations. `--plugin-adapter` dynamically loads executable host code and must point only to a reviewed, trusted adapter. Pass its absolute or project-relative path; the module must default-export the `resolve`, `verifySkill`, and `invoke` methods defined by `@system-design-team/plugin-registry`. Set `INTAKE_REVIEW_RECEIPT_ID` to the host-recorded reviewer execution receipt. The CLI verifies current plugin identity and skills through that adapter. Persisted plugin status remains diagnostic cache and cannot authorize lifecycle work. See [Security](security.md) for the plugin contract and [Operations](operations.md) for gate and recovery procedures.
