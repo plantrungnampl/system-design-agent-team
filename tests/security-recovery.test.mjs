@@ -41,8 +41,9 @@ import {
   validatePhase,
 } from "@system-design-team/cli";
 import { ManualCodexAdapter } from "@system-design-team/codex-adapter";
+import { WorkflowStateSchema } from "@system-design-team/core";
 import { ProjectStore } from "@system-design-team/project-store";
-import { parse } from "yaml";
+import { parse, stringify } from "yaml";
 
 const execFileAsync = promisify(execFile);
 const pluginUri = "plugin://superpowers@openai-curated-remote";
@@ -897,6 +898,45 @@ test("plugin status cache cannot authorize phase start without a current adapter
   assert.deepEqual(await ProjectStore.open(root).readWorkflowState(), before);
 });
 
+test("phase start cannot overwrite a concurrent workflow-state update", async (t) => {
+  const root = await temporaryDirectory(t, "system-design-team-start-concurrency-");
+  await execFileAsync("git", ["init", "--quiet"], { cwd: root });
+  await initProject(root, {
+    id: "leave-system",
+    name: "Leave System",
+    mode: "greenfield",
+    profile: "standard",
+  }, "INIT-START-CONCURRENCY");
+  const store = ProjectStore.open(root);
+  let updated = false;
+  const concurrentAdapter = {
+    ...pluginAdapter,
+    async resolve(uri) {
+      if (!updated) {
+        updated = true;
+        const statePath = join(root, ".agent-team/workflow-state.yaml");
+        const current = parse(await readFile(statePath, "utf8"));
+        await writeFile(statePath, stringify(WorkflowStateSchema.parse({
+          ...current,
+          state_version: current.state_version + 1,
+          completed_operations: [...current.completed_operations, "CONCURRENT-UPDATE"],
+        })));
+      }
+      return { uri, publisher_identity: uri.split("@").at(-1), status: "available" };
+    },
+    async verifySkill() { return true; },
+    async invoke(request) { return pluginAdapter.invoke(request); },
+  };
+
+  await assert.rejects(
+    () => startPhase(root, "intake", "START-CONCURRENCY", concurrentAdapter),
+    /STATE_VERSION_CONFLICT/,
+  );
+  const state = await store.readWorkflowState();
+  assert.equal(state.phases.intake.status, "ready");
+  assert(state.completed_operations.includes("CONCURRENT-UPDATE"));
+});
+
 test("verified plugin invocation persists sanitized evidence", async (t) => {
   const root = await temporaryDirectory(t, "system-design-team-plugin-evidence-");
   await execFileAsync("git", ["init", "--quiet"], { cwd: root });
@@ -1181,6 +1221,66 @@ test("completed lifecycle replay repairs a missing audit event once", async (t) 
   assert.deepEqual(await startPhase(root, "intake", "AUDIT-START", pluginAdapter), started);
   const repaired = (await readFile(auditPath, "utf8")).trim().split("\n").map(JSON.parse);
   assert.equal(repaired.filter(({ id }) => id === startId).length, 1);
+});
+
+test("start and validate recover state and audit as one transaction", async (t) => {
+  const root = await temporaryDirectory(t, "system-design-team-state-audit-transaction-");
+  await execFileAsync("git", ["init", "--quiet"], { cwd: root });
+  await initProject(root, {
+    id: "leave-system",
+    name: "Leave System",
+    mode: "greenfield",
+    profile: "standard",
+  }, "INIT-STATE-AUDIT");
+
+  const failBeforeAudit = {
+    transactionFault(point) {
+      if (point === "before_audit_append") throw new Error("INTERRUPTED_BEFORE_AUDIT");
+    },
+  };
+  await assert.rejects(
+    () => startPhase(root, "intake", "TX-START", pluginAdapter, failBeforeAudit),
+    /INTERRUPTED_BEFORE_AUDIT/,
+  );
+  assert.deepEqual(await ProjectStore.open(root).inspectTransactions(), [
+    JSON.stringify(["start", "intake", "TX-START"]),
+  ]);
+  await ProjectStore.open(root).repairTransactions();
+
+  const store = ProjectStore.open(root);
+  const registry = parse(await readFile(join(root, ".agent-team/artifact-registry.yaml"), "utf8"));
+  const artifact = registry.artifacts.find(({ id }) => id === "PROJECT-CHARTER");
+  artifact.status = "in_review";
+  const text = [
+    "---",
+    "artifact_id: PROJECT-CHARTER",
+    "version: 1",
+    "status: in_review",
+    "owner: lead-orchestrator",
+    "reviewer: documentation-reviewer",
+    "---",
+    "# Project Charter",
+    "Ready for review.",
+  ].join("\n");
+  artifact.checksum = `sha256:${createHash("sha256").update(text).digest("hex")}`;
+  await store.writeYamlAtomic(".agent-team/artifact-registry.yaml", registry);
+  await store.writeTextAtomic(`.agent-team/${artifact.path}`, text);
+
+  await assert.rejects(
+    () => validatePhase(root, "intake", "TX-VALIDATE", failBeforeAudit),
+    /INTERRUPTED_BEFORE_AUDIT/,
+  );
+  assert.deepEqual(await store.inspectTransactions(), [
+    JSON.stringify(["validate", "intake", "TX-VALIDATE"]),
+  ]);
+  await store.repairTransactions();
+
+  const state = await store.readWorkflowState();
+  assert.equal(state.phases.intake.status, "artifact_validation");
+  const events = (await readFile(join(root, ".agent-team/audit/events.jsonl"), "utf8"))
+    .trim().split(/\r?\n/).map(JSON.parse);
+  assert.equal(events.filter(({ action }) => action === "start").length, 1);
+  assert.equal(events.filter(({ action }) => action === "validate").length, 1);
 });
 
 test("initialization preserves source and AGENTS while lifecycle exclusion recovers without losing evidence", async (t) => {

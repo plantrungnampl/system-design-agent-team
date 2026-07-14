@@ -43,12 +43,19 @@ phases:
     gate: G4
     depends_on: [updated-requirements]
     required_plugins: [plugin://ux-design@wondelai-skills]
-    artifact: { id: DELTA-DESIGN, path: ux/delta-design.md, title: UX and Architecture Delta }
+    artifact: { id: DELTA-DESIGN, path: ux/delta-design.md, title: UX Delta Design }
+  - id: architecture-delta
+    owner: solution-architect
+    reviewer: architecture-reviewer
+    gate: G5
+    depends_on: [ux-architecture-delta]
+    required_plugins: [plugin://systems-architecture@wondelai-skills]
+    artifact: { id: ARCHITECTURE-DELTA, path: architecture/delta-design.md, title: Architecture Delta Design }
   - id: implementation-planning
     owner: developer-lead
     reviewer: code-reviewer
     gate: G6
-    depends_on: [ux-architecture-delta]
+    depends_on: [architecture-delta]
     required_plugins: [plugin://code-craftsmanship@wondelai-skills, plugin://superpowers@openai-curated-remote]
     artifact: { id: IMPLEMENTATION-PLAN, path: implementation/implementation-plan.md, title: Implementation Plan }
   - id: implementation

@@ -122,12 +122,15 @@ function capabilityReport(input: CapabilityRequirements): CapabilityReport {
   const writesOutsideProfile = requirements.authorized_paths.write.length > 0
     && (requirements.permission_profile === "read_only_assessment"
       || requirements.permission_profile === "test_execution");
+  const documentationWriteEscapesProjectMemory = requirements.permission_profile === "documentation_write"
+    && requirements.authorized_paths.write.some((path) =>
+      path !== ".agent-team" && !path.startsWith(".agent-team/"));
   const commandsOutsideProfile = requirements.authorized_paths.execute.length > 0
     && (requirements.permission_profile === "read_only_assessment"
       || requirements.permission_profile === "documentation_write");
   const allowed = (allowedClasses[requirements.permission_profile] as readonly string[])
     .includes(requirements.command_class);
-  const blockers = !allowed || writesOutsideProfile || commandsOutsideProfile
+  const blockers = !allowed || writesOutsideProfile || documentationWriteEscapesProjectMemory || commandsOutsideProfile
     ? ["PERMISSION_PROFILE_ESCALATION"]
     : [];
   return { allowed: blockers.length === 0, blockers };

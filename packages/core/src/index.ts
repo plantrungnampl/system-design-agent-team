@@ -261,6 +261,13 @@ export const AgentManifestSchema = z.object({
   }
 });
 
+export const AgentReviewChecklistSchema = z.object({
+  agent: z.string().min(1),
+  reviewer: z.string().min(1),
+  checks: z.array(z.string().min(1)).min(1),
+  verdicts: z.array(z.enum(["approved", "revision_required"])).length(2),
+});
+
 export const PluginStatusSchema = z.enum([
   "available",
   "unavailable",
@@ -377,6 +384,19 @@ export const CapabilityRequirementsSchema = z.object({
   command_class: CommandClassSchema,
 });
 
+export const AgentInputContractSchema = z.object({
+  execution_id: z.string().min(1),
+  project_id: z.string().min(1),
+  objective: z.string().min(1),
+  authorized_scope: AuthorizedPathsSchema,
+  prohibited_scope: z.array(z.string().min(1)).default([]),
+  required_inputs: z.array(z.string().min(1)),
+  required_outputs: z.array(z.string().min(1)),
+  completion_conditions: z.array(z.string().min(1)).min(1),
+});
+
+export const AgentInputContractJsonSchema = z.toJSONSchema(AgentInputContractSchema);
+
 export const CapabilityReportSchema = z.object({
   allowed: z.boolean(),
   blockers: z.array(z.string().min(1)),
@@ -441,6 +461,8 @@ export const AgentExecutionResultSchema = z.object({
   evidence: ExecutionEvidenceSchema,
   output: z.unknown().optional(),
 });
+
+export const AgentOutputContractJsonSchema = z.toJSONSchema(AgentExecutionResultSchema);
 
 export const ExecutionReceiptSchema = z.object({
   id: z.string().min(1),

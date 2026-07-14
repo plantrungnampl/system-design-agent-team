@@ -6,7 +6,10 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { parseArtifact, validateReviewReadyArtifact } from "@system-design-team/artifact-validator";
 import {
+  AgentInputContractJsonSchema,
   AgentManifestSchema,
+  AgentOutputContractJsonSchema,
+  AgentReviewChecklistSchema,
   AuditEventSchema,
   ApprovalListSchema,
   ApprovalRecordSchema,
@@ -321,6 +324,34 @@ function renderAgentInstruction(agent: AgentManifest): string {
   ].join("\n");
 }
 
+function renderAgentContractFiles(agent: AgentManifest) {
+  const base = `.codex/agents/${agent.id}`;
+  const checklist = AgentReviewChecklistSchema.parse({
+    agent: agent.id,
+    reviewer: agent.reviewer,
+    checks: [
+      `Verify the result satisfies the ${agent.display_name} mission.`,
+      ...agent.outputs.map((output) => `Verify required output: ${output}.`),
+      ...agent.authority.may_not.map((boundary) => `Verify prohibited action was not taken: ${boundary}.`),
+      ...agent.required_plugins.map((plugin) => `Verify runtime evidence for ${plugin.uri}.`),
+    ],
+    verdicts: ["approved", "revision_required"],
+  });
+  return [
+    { path: `${base}/agent.yaml`, content: stringify(agent) },
+    { path: `${base}/instructions.md`, content: renderAgentInstruction(agent) },
+    {
+      path: `${base}/input-contract.schema.json`,
+      content: `${JSON.stringify(AgentInputContractJsonSchema, null, 2)}\n`,
+    },
+    {
+      path: `${base}/output-contract.schema.json`,
+      content: `${JSON.stringify(AgentOutputContractJsonSchema, null, 2)}\n`,
+    },
+    { path: `${base}/review-checklist.yaml`, content: stringify(checklist) },
+  ];
+}
+
 async function bootstrapProject(
   root: string,
   options: InitOptions,
@@ -440,7 +471,11 @@ async function bootstrapProject(
     const [realRoot, realKeep] = await Promise.all([realpath(projectRoot), realpath(codexKeep)]);
     if (!inside(realRoot, realKeep)) throw new Error("PATH_OUTSIDE_PROJECT");
   }
-  const codexAgentPaths = catalogue.map((agent) => `.codex/agents/${agent.id}.md`);
+  const contractWrites = catalogue.flatMap(renderAgentContractFiles);
+  const codexAgentPaths = [
+    ...catalogue.map((agent) => `.codex/agents/${agent.id}.md`),
+    ...contractWrites.map(({ path }) => path),
+  ];
   for (const path of codexAgentPaths) {
     if (await exists(join(projectRoot, path))) throw new Error(`CODEX_AGENT_ALREADY_EXISTS: ${path}`);
   }
@@ -449,8 +484,13 @@ async function bootstrapProject(
     path: `.codex/agents/${agent.id}.md`,
     content: renderAgentInstruction(agent),
   }));
+  const newAgentDirectories = (await Promise.all(catalogue.map(async (agent) => {
+    const path = `.codex/agents/${agent.id}`;
+    return { path, exists: await exists(join(projectRoot, path)) };
+  }))).filter(({ exists }) => !exists).map(({ path }) => path);
   const generatedFiles = [
     ...agentWrites,
+    ...contractWrites,
     ...(preserveCodexKeep ? [] : [{ path: ".codex/generated/.gitkeep", content: "" }]),
   ];
   const manifest = InstallationManifestSchema.parse({
@@ -463,6 +503,7 @@ async function bootstrapProject(
     directories_created: [
       ...(!preserveCodexRoot ? [".codex"] : []),
       ...(!preserveCodexAgents ? [".codex/agents"] : []),
+      ...newAgentDirectories,
       ...(!preserveCodexGenerated ? [".codex/generated"] : []),
     ],
   });
@@ -493,6 +534,7 @@ async function bootstrapProject(
       })),
       { path: ".agent-team/handovers/.gitkeep", content: "" },
       ...agentWrites,
+      ...contractWrites,
       ...(preserveCodexKeep ? [] : [{ path: ".codex/generated/.gitkeep", content: "" }]),
     ], makeAuditEvent(id, installation.action, options.id, options.profile, {
       actor: installation.authorization.actor,
@@ -505,6 +547,9 @@ async function bootstrapProject(
       ...codexAgentPaths,
       ...(preserveCodexKeep ? [] : [".codex/generated/.gitkeep"]),
     ]);
+    for (const path of [...newAgentDirectories].reverse()) {
+      await removeEmptyGeneratedDirectory(projectRoot, path);
+    }
     if (!preserveCodexAgents) await removeEmptyGeneratedDirectory(projectRoot, ".codex/agents");
     if (!preserveCodexGenerated) await removeEmptyGeneratedDirectory(projectRoot, ".codex/generated");
     if (!preserveCodexRoot) await removeEmptyGeneratedDirectory(projectRoot, ".codex");
@@ -861,10 +906,11 @@ export async function startPhase(
   phase: string,
   operationId: string,
   adapter?: PluginAdapter,
+  execution: BootstrapExecutionOptions = {},
 ): Promise<WorkflowState> {
   requireOperationId(operationId);
   const scopedOperation = operationKey("start", phase, operationId);
-  const store = ProjectStore.open(root);
+  const store = ProjectStore.open(root, execution);
   return store.withLock(".agent-team/lifecycle.lock", async () => {
   const state = await store.readWorkflowState();
   const workflow = await configuredWorkflow(store);
@@ -884,12 +930,15 @@ export async function startPhase(
     return state;
   }
 
-  const next = await store.updateWorkflowState(state.state_version, (current) => transitionPhase(
-    current,
+  const next = transitionPhase(
+    state,
     workflow,
     { phase, to: "in_progress", operation_id: scopedOperation },
-  ));
-  await appendOperationAudit(store, scopedOperation, "start", phase);
+  );
+  const { project } = await projectConfig(store);
+  await ensureLifecycleTransaction(store, scopedOperation, [
+    { path: ".agent-team/workflow-state.yaml", content: stringify(next), expectedStateVersion: state.state_version },
+  ], makeAuditEvent(scopedOperation, "start", phase, project.profile));
   return next;
   });
 }
@@ -1191,7 +1240,11 @@ export async function createChange(
       { path: ".agent-team/artifact-registry.yaml", content: stringify(nextRegistry) },
       { path: ".agent-team/approvals.yaml", content: stringify(nextApprovals) },
       { path: ".agent-team/traceability.yaml", content: stringify(nextTraceability) },
-      { path: ".agent-team/workflow-state.yaml", content: stringify(nextState) },
+      {
+        path: ".agent-team/workflow-state.yaml",
+        content: stringify(nextState),
+        expectedStateVersion: state.state_version,
+      },
     ], makeAuditEvent(scopedOperation, "change", change.id, project.profile, {
       actor: { type: "human", identifier: change.requested_by },
       authorizationSource: "change_request",
@@ -1202,10 +1255,16 @@ export async function createChange(
   });
 }
 
-export async function validatePhase(root: string, phase: string, operationId: string) {
+export async function validatePhase(
+  root: string,
+  phase: string,
+  operationId: string,
+  execution: BootstrapExecutionOptions = {},
+) {
   requireOperationId(operationId);
   const scopedOperation = operationKey("validate", phase, operationId);
-  const store = ProjectStore.open(root);
+  const store = ProjectStore.open(root, execution);
+  return store.withLock(".agent-team/lifecycle.lock", async () => {
   const state = await store.readWorkflowState();
   if (state.completed_operations.includes(scopedOperation)) {
     await appendOperationAudit(store, scopedOperation, "validate", phase);
@@ -1223,13 +1282,17 @@ export async function validatePhase(root: string, phase: string, operationId: st
   }
   if (findings.length > 0) return { valid: false, phase, findings, state };
 
-  const next = await store.updateWorkflowState(state.state_version, (current) => transitionPhase(
-    current,
+  const next = transitionPhase(
+    state,
     workflow,
     { phase, to: "artifact_validation", operation_id: scopedOperation },
-  ));
-  await appendOperationAudit(store, scopedOperation, "validate", phase);
+  );
+  const { project } = await projectConfig(store);
+  await ensureLifecycleTransaction(store, scopedOperation, [
+    { path: ".agent-team/workflow-state.yaml", content: stringify(next), expectedStateVersion: state.state_version },
+  ], makeAuditEvent(scopedOperation, "validate", phase, project.profile));
   return { valid: true, phase, findings, state: next };
+  });
 }
 
 function artifactVersions(artifacts: readonly ArtifactRecord[]): Record<string, number> {
@@ -1393,7 +1456,11 @@ export async function reviewPhase(
   const { project } = await projectConfig(store);
   await store.transaction(evidenceId, [
     { path: ".agent-team/reviews.yaml", content: stringify(nextReviews) },
-    { path: ".agent-team/workflow-state.yaml", content: stringify(preview) },
+    {
+      path: ".agent-team/workflow-state.yaml",
+      content: stringify(preview),
+      expectedStateVersion: state.state_version,
+    },
   ], makeAuditEvent(evidenceId, "review", phase, project.profile, {
     actor: { type: "agent", identifier: reviewerId },
     authorizationSource: "agent_manifest",
@@ -1515,7 +1582,11 @@ export async function approve(
   const { project } = await projectConfig(store);
   await store.transaction(scopedOperation, [
     { path: ".agent-team/approvals.yaml", content: stringify(nextApprovals) },
-    { path: ".agent-team/workflow-state.yaml", content: stringify(nextState) },
+    {
+      path: ".agent-team/workflow-state.yaml",
+      content: stringify(nextState),
+      expectedStateVersion: state.state_version,
+    },
   ], makeAuditEvent(scopedOperation, "approve", gate, project.profile, {
     actor: { type: "human", identifier: approver },
     authorizationSource: "gate_policy",
@@ -1572,7 +1643,11 @@ export async function rejectGate(
     const { project } = await projectConfig(store);
     await store.transaction(scopedOperation, [
       { path: ".agent-team/approvals.yaml", content: stringify(nextApprovals) },
-      { path: ".agent-team/workflow-state.yaml", content: stringify(nextState) },
+      {
+        path: ".agent-team/workflow-state.yaml",
+        content: stringify(nextState),
+        expectedStateVersion: state.state_version,
+      },
     ], makeAuditEvent(scopedOperation, "reject", gate, project.profile, {
       actor: { type: "human", identifier: actor },
       authorizationSource: "gate_policy",
@@ -1694,7 +1769,11 @@ export async function handover(
     const { project } = await projectConfig(store);
     await store.transaction(scopedOperation, [
       { path: relativeRecord, content: stringify(proposed) },
-      { path: ".agent-team/workflow-state.yaml", content: stringify(state) },
+      {
+        path: ".agent-team/workflow-state.yaml",
+        content: stringify(state),
+        expectedStateVersion: initialState.state_version,
+      },
     ], makeAuditEvent(scopedOperation, "handover", phase, project.profile, {
       actor: { type: "agent", identifier: definition.owner },
       authorizationSource: "approved_gate",
@@ -1785,19 +1864,23 @@ export async function planUpgrade(root: string, mode: UpgradeMode) {
     proposals.push(lockProposal);
   }
   for (const agent of catalogue) {
-    const path = `.codex/agents/${agent.id}.md`;
-    const proposalPath = `.agent-team/overrides/upgrade/${agent.id}.md`;
-    const expected = renderAgentInstruction(agent);
-    try {
-      const target = join(projectRoot, path);
-      if (!inside(await realpath(projectRoot), await realpath(target))) throw new Error("PATH_OUTSIDE_PROJECT");
-      if (await readFile(target, "utf8") !== expected) {
-        conflicts.push({ path, proposal_path: proposalPath });
-        proposals.push({ path: proposalPath, content: expected });
+    const managedFiles = [
+      { path: `.codex/agents/${agent.id}.md`, content: renderAgentInstruction(agent) },
+      ...renderAgentContractFiles(agent),
+    ];
+    for (const { path, content } of managedFiles) {
+      const proposalPath = `.agent-team/overrides/upgrade/${path.slice(".codex/agents/".length)}`;
+      try {
+        const target = join(projectRoot, path);
+        if (!inside(await realpath(projectRoot), await realpath(target))) throw new Error("PATH_OUTSIDE_PROJECT");
+        if (await readFile(target, "utf8") !== content) {
+          conflicts.push({ path, proposal_path: proposalPath });
+          proposals.push({ path: proposalPath, content });
+        }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") changes.push({ path, action: "create" });
+        else throw error;
       }
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") changes.push({ path, action: "create" });
-      else throw error;
     }
   }
   if (lock.framework.version !== FRAMEWORK_VERSION || !lockMatchesWorkflow) {
@@ -1932,12 +2015,19 @@ export async function uninstallProject(
     }], startedAudit());
 
     const removed = new Set(plan.removed);
+    const preserved = new Set(plan.preserved);
     const realRoot = await realpath(projectRoot);
     for (const file of plan.files) {
       try {
         const target = join(projectRoot, file.path);
-        if (!inside(realRoot, await realpath(target))) continue;
-        if (artifactChecksum(await readFile(target, "utf8")) !== file.checksum) continue;
+        if (!inside(realRoot, await realpath(target))) {
+          preserved.add(file.path);
+          continue;
+        }
+        if (artifactChecksum(await readFile(target, "utf8")) !== file.checksum) {
+          preserved.add(file.path);
+          continue;
+        }
         await rm(target);
         removed.add(file.path);
       } catch (error) {
@@ -1955,6 +2045,7 @@ export async function uninstallProject(
       ...plan,
       status: "completed",
       removed: [...removed].sort(),
+      preserved: [...preserved].sort(),
     });
     await ensureLifecycleTransaction(store, completionId, [{
       path: ".agent-team/uninstall-plan.yaml",

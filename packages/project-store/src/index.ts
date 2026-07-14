@@ -59,6 +59,7 @@ export interface TransactionWrite {
   path: string;
   content: string;
   role?: "evidence" | "state";
+  expectedStateVersion?: number;
 }
 
 export type TransactionFaultPoint =
@@ -70,8 +71,15 @@ export type TransactionFaultPoint =
 interface TransactionJournal {
   version: 1;
   operationId: string;
-  writes: Array<Required<TransactionWrite> & { beforeDigest: string | null }>;
+  writes: TransactionJournalWrite[];
   auditEvent: AuditEvent;
+}
+
+interface TransactionJournalWrite {
+  path: string;
+  content: string;
+  role: "evidence" | "state";
+  beforeDigest: string | null;
 }
 
 interface TransactionReceipt {
@@ -266,7 +274,7 @@ export class ProjectStore {
           content: write.content,
           role: write.role,
           beforeDigest: write.beforeDigest,
-        } as Required<TransactionWrite> & { beforeDigest: string | null };
+        } as TransactionJournalWrite;
       });
       return { version: 1, operationId: raw.operationId, writes, auditEvent };
     } catch {
@@ -315,12 +323,25 @@ export class ProjectStore {
       await this.assertNoPendingTransactions();
       const validatedAudit = AuditEventSchema.parse(auditEvent);
       if (validatedAudit.id !== operationId) throw new Error("AUDIT_ID_MISMATCH");
-      const transactionWrites = await Promise.all(writes.map(async ({ path, content, role }) => ({
-        path,
-        content,
-        role: role ?? (path === ".agent-team/workflow-state.yaml" ? "state" as const : "evidence" as const),
-        beforeDigest: await this.fileDigest(path),
-      })));
+      const transactionWrites = await Promise.all(writes.map(async ({
+        path, content, role, expectedStateVersion,
+      }) => {
+        if (expectedStateVersion !== undefined) {
+          if (path !== ".agent-team/workflow-state.yaml") {
+            throw new ProjectStoreError("STATE_VERSION_INVALID");
+          }
+          const current = await this.readWorkflowState();
+          if (current.state_version !== expectedStateVersion) {
+            throw new ProjectStoreError("STATE_VERSION_CONFLICT");
+          }
+        }
+        return {
+          path,
+          content,
+          role: role ?? (path === ".agent-team/workflow-state.yaml" ? "state" as const : "evidence" as const),
+          beforeDigest: await this.fileDigest(path),
+        };
+      }));
       const journal: TransactionJournal = {
         version: 1,
         operationId,

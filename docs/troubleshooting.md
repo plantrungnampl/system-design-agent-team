@@ -35,9 +35,9 @@ system-design-team diagnostics
 
 Stop every framework process and use `system-design-team doctor` to confirm that the same-host owner PID is dead. Then follow the explicit repair procedure in [Operations](operations.md). Never delete unknown lock files while another process may be active.
 
-## Upgrade or uninstall is blocked
+## Upgrade or uninstall reports a conflict
 
-Use `system-design-team upgrade --dry-run` to inspect workflow-lock, generated-file, or override conflicts. Uninstall refuses altered generated files because the installation manifest no longer matches; preserve the file, decide whether it is a local customization, and resolve that conflict deliberately.
+Use `system-design-team upgrade --dry-run` to inspect workflow-lock, generated-file, or override conflicts. Uninstall preserves altered generated files and reports their paths in `preserved`; decide whether each file is a local customization, then resolve it deliberately.
 
 ## A command is missing
 

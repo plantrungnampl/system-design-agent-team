@@ -64,6 +64,7 @@ test("existing-system performs scoped discovery, modifies existing authorization
     ["impact-analysis", "Delta is limited to AdminPage and its regression test; no rewrite or duplicate page is approved."],
     ["updated-requirements", "The server shall reject DeleteOrder unless the authenticated user has the Administrator role."],
     ["ux-architecture-delta", "The UI may hide the action, but the server-side role check remains authoritative."],
+    ["architecture-delta", "Add the server-side role guard to the existing code-behind; no system rewrite or parallel page is approved."],
     ["implementation-planning", "Modify the existing code-behind and regression test after G6; do not create Fixed or V2 files."],
   ]) {
     phase = await reviewReadyPhase(root, mode, id, body);

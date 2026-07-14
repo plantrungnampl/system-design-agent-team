@@ -80,7 +80,7 @@ test("END2END workflow assets use configured agents, ordered dependencies, and p
     ]],
     ["existing-system.yaml", [
       "repository-discovery", "current-system-analysis", "change-request-analysis",
-      "impact-analysis", "updated-requirements", "ux-architecture-delta",
+      "impact-analysis", "updated-requirements", "ux-architecture-delta", "architecture-delta",
       "implementation-planning", "implementation", "regression-security-testing", "security-review",
       "release", "operational-validation",
     ]],
@@ -112,6 +112,8 @@ test("END2END workflow assets use configured agents, ordered dependencies, and p
     }
     if (file === "existing-system.yaml") {
       assert.equal(workflow.phases.find(({ id }) => id === "security-review").owner, "security-reviewer");
+      assert.equal(workflow.phases.find(({ id }) => id === "architecture-delta").owner, "solution-architect");
+      assert.equal(workflow.phases.find(({ id }) => id === "architecture-delta").reviewer, "architecture-reviewer");
     }
     if (file === "migration.yaml") {
       assert.equal(workflow.phases.find(({ id }) => id === "data-mapping").reviewer, "data-reviewer");

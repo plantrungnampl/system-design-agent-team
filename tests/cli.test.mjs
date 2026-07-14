@@ -356,6 +356,7 @@ test("adopt bootstrap is one recoverable transaction under fault injection", asy
     { transactionFault: (point) => { if (point === "before_audit_append") throw new Error("adopt fault"); } },
   ), /adopt fault/);
   await assert.rejects(() => access(join(root, ".agent-team")), { code: "ENOENT" });
+  await assert.rejects(() => access(join(root, ".codex")), { code: "ENOENT" });
 
   const adopted = await adoptProject(root, options, "ADOPT-FAULT", lifecycleAuthorization);
   assert.equal(adopted.project.project.id, "adopt-fault");
@@ -399,8 +400,10 @@ test("upgrade check and dry-run preserve overrides and approved content", async 
     profile: "standard",
   }, "INIT-CLI-4");
   const agentPath = join(root, ".codex/agents/lead-orchestrator.md");
+  const missingContract = ".codex/agents/lead-orchestrator/output-contract.schema.json";
   const overriddenAgent = `${await readFile(agentPath, "utf8")}\nLocal override.\n`;
   await writeFile(agentPath, overriddenAgent);
+  await rm(join(root, missingContract));
   const approvalsBefore = await readFile(join(root, ".agent-team/approvals.yaml"), "utf8");
   const artifactBefore = await readFile(join(root, ".agent-team/context/project-charter.md"), "utf8");
   const lock = await readYaml(root, ".agent-team/framework-lock.yaml");
@@ -412,6 +415,7 @@ test("upgrade check and dry-run preserve overrides and approved content", async 
   assert.equal(check.conflicts[0].path, ".codex/agents/lead-orchestrator.md");
   assert.equal(check.conflicts[0].proposal_path, ".agent-team/overrides/upgrade/lead-orchestrator.md");
   assert.equal(check.current_version, "0.0.0");
+  assert(check.changes.some(({ path, action }) => path === missingContract && action === "create"));
   assert(check.changes.some(({ path, action }) => path === ".agent-team/framework-lock.yaml" && action === "update"));
   assert.deepEqual(dryRun, { ...check, mode: "dry-run" });
   assert.equal(await readFile(agentPath, "utf8"), overriddenAgent);
@@ -535,6 +539,7 @@ test("init records exact generated ownership and uninstall preserves non-owned p
 
   const result = await uninstallProject(root, "UNINSTALL-MANIFEST", lifecycleAuthorization);
   assert(!result.removed.includes(modified.path));
+  assert(result.preserved.includes(modified.path));
   assert.equal(await readFile(join(root, modified.path), "utf8"), "local override\n");
   assert.equal(await readFile(join(root, ".codex/agents/user.md"), "utf8"), "user-owned\n");
   assert.equal(await readFile(join(root, ".codex/user.txt"), "utf8"), "user-owned\n");
@@ -757,6 +762,28 @@ test("init materializes complete workflow assets and Codex agent instructions", 
       assert.match(text, /^## Required outputs$/m);
       assert.match(text, /^## Independent reviewer$/m);
       assert.match(text, /^## Required plugins$/m);
+    }
+
+    const catalogue = AgentManifestSchema.array().parse(
+      parse(await readFile(join(repository, "agents/catalogue.yaml"), "utf8")),
+    );
+    for (const agent of catalogue) {
+      const directory = join(root, ".codex/agents", agent.id);
+      assert.deepEqual(
+        AgentManifestSchema.parse(parse(await readFile(join(directory, "agent.yaml"), "utf8"))),
+        agent,
+      );
+      assert.match(await readFile(join(directory, "instructions.md"), "utf8"), /^## Mission$/m);
+      const inputContract = JSON.parse(await readFile(join(directory, "input-contract.schema.json"), "utf8"));
+      const outputContract = JSON.parse(await readFile(join(directory, "output-contract.schema.json"), "utf8"));
+      assert.equal(inputContract.type, "object");
+      assert(inputContract.required.includes("objective"));
+      assert.equal(outputContract.type, "object");
+      assert(outputContract.required.includes("execution_id"));
+      const checklist = parse(await readFile(join(directory, "review-checklist.yaml"), "utf8"));
+      assert.equal(checklist.agent, agent.id);
+      assert.equal(checklist.reviewer, agent.reviewer);
+      assert(checklist.checks.length > 0);
     }
   }
 });

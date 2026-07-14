@@ -528,6 +528,16 @@ test("prepareExecution blocks code write without authoritative G6 approval", asy
   }), /G6_APPROVAL_REQUIRED/);
 });
 
+test("documentation-write profile cannot be used to modify source code", async () => {
+  const adapter = new ManualCodexAdapter();
+  await assert.rejects(() => adapter.prepareExecution({
+    ...dispatch,
+    permission_profile: "documentation_write",
+    command_class: "mutating_local",
+    authorized_scope: { ...dispatch.authorized_scope, write: ["src/**"] },
+  }), /PERMISSION_PROFILE_ESCALATION/);
+});
+
 test("execute blocks production impact without authoritative G8 safety evidence", async () => {
   const adapter = new ManualCodexAdapter(async () => emptyEvidenceContext);
   const prepared = await adapter.prepareExecution({

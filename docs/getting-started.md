@@ -47,11 +47,11 @@ system-design-team doctor
 Every mutation needs a caller-supplied operation ID. A typical phase follows start, artifact work, validation, independent review, human approval where required, then handover:
 
 ```bash
-system-design-team start intake --operation-id INTAKE-START-001
+system-design-team start intake --operation-id INTAKE-START-001 --plugin-adapter ./codex-plugin-adapter.mjs
 system-design-team validate intake --operation-id INTAKE-VALIDATE-001
-system-design-team review intake --reviewer documentation-reviewer --verdict approved --operation-id INTAKE-REVIEW-001
+system-design-team review intake --reviewer documentation-reviewer --verdict approved --operation-id INTAKE-REVIEW-001 --plugin-adapter ./codex-plugin-adapter.mjs
 system-design-team approve G0 --by project-owner --operation-id INTAKE-APPROVE-001
 system-design-team handover intake --operation-id INTAKE-HANDOVER-001
 ```
 
-Required-plugin phases need a host-provided execution adapter. The standalone CLI checks persisted status and evidence but does not invoke third-party capabilities by itself. See [Security](security.md) for the plugin contract and [Operations](operations.md) for gate and recovery procedures.
+Required-plugin phases need a host-provided execution adapter module. Pass its absolute or project-relative path with `--plugin-adapter`; the module must default-export the `resolve`, `verifySkill`, and `invoke` methods defined by `@system-design-team/plugin-registry`. The CLI verifies current plugin identity and skills through that adapter. Persisted plugin status remains diagnostic cache and cannot authorize lifecycle work. See [Security](security.md) for the plugin contract and [Operations](operations.md) for gate and recovery procedures.

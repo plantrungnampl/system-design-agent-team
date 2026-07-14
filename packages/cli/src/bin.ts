@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 
 import process from "node:process";
+import { resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
 import {
   AdapterIdSchema,
@@ -41,6 +43,7 @@ import {
   uninstallProject,
   validatePhase,
 } from "./index.js";
+import type { PluginAdapter } from "@system-design-team/plugin-registry";
 
 const usage = `Usage: system-design-team <command> [options]
 
@@ -49,9 +52,9 @@ Commands:
   adopt --id <id> --name <name> --profile <profile> --operation-id <id> [--language <language>] [--cache <none|sqlite>] [--adapter <codex>]
   inspect [--environment <name>]
   status
-  start <phase> --operation-id <id>
+  start <phase> --operation-id <id> [--plugin-adapter <module>]
   validate <phase> --operation-id <id>
-  review <phase> --reviewer <id> --verdict <approved|revision_required> --operation-id <id> [--execution-receipt <id>]
+  review <phase> --reviewer <id> --verdict <approved|revision_required> --operation-id <id> [--execution-receipt <id>] [--plugin-adapter <module>]
   approve <gate> --by <id> --operation-id <id> [--execution-receipt <id>] [--execution-request <id>]
   reject <gate> --by <id> --operation-id <id>
   handover <phase> --operation-id <id>
@@ -81,9 +84,9 @@ const commandShape: Record<string, { positionals: number; options: string[] }> =
   adopt: { positionals: 1, options: ["id", "name", "profile", "language", "cache", "adapter", "operation-id"] },
   inspect: { positionals: 1, options: ["environment"] },
   status: { positionals: 1, options: [] },
-  start: { positionals: 2, options: ["operation-id"] },
+  start: { positionals: 2, options: ["operation-id", "plugin-adapter"] },
   validate: { positionals: 2, options: ["operation-id"] },
-  review: { positionals: 2, options: ["reviewer", "verdict", "operation-id", "execution-receipt"] },
+  review: { positionals: 2, options: ["reviewer", "verdict", "operation-id", "execution-receipt", "plugin-adapter"] },
   approve: { positionals: 2, options: ["by", "operation-id", "execution-receipt", "execution-request"] },
   reject: { positionals: 2, options: ["by", "operation-id"] },
   handover: { positionals: 2, options: ["operation-id"] },
@@ -111,6 +114,17 @@ const commandShape: Record<string, { positionals: number; options: string[] }> =
 function required(value: string | undefined, option: string): string {
   if (!value) throw new Error(`${option} is required`);
   return value;
+}
+
+async function loadPluginAdapter(modulePath: string | undefined, root: string): Promise<PluginAdapter | undefined> {
+  if (!modulePath) return undefined;
+  const loaded = await import(pathToFileURL(resolve(root, modulePath)).href);
+  const adapter = loaded.default ?? loaded.pluginAdapter;
+  if (!adapter || typeof adapter.resolve !== "function"
+    || typeof adapter.verifySkill !== "function" || typeof adapter.invoke !== "function") {
+    throw new Error("PLUGIN_ADAPTER_INVALID");
+  }
+  return adapter as PluginAdapter;
 }
 
 function validateInvocation(
@@ -152,6 +166,7 @@ async function main(): Promise<void> {
       "operation-id": { type: "string" },
       "execution-receipt": { type: "string" },
       "execution-request": { type: "string" },
+      "plugin-adapter": { type: "string" },
       artifacts: { type: "string" },
       reason: { type: "string" },
       impact: { type: "string" },
@@ -176,6 +191,7 @@ async function main(): Promise<void> {
 
   const root = process.cwd();
   const receiptId = values["execution-receipt"];
+  const pluginAdapter = await loadPluginAdapter(values["plugin-adapter"], root);
   const cliAuthorization = {
     actor: { type: "system" as const, identifier: "system-design-team-cli" },
     authorizationSource: "cli_invocation",
@@ -214,6 +230,7 @@ async function main(): Promise<void> {
         root,
         required(positionals[1], "phase"),
         required(values["operation-id"], "--operation-id"),
+        pluginAdapter,
       );
       break;
     case "approve":
@@ -241,7 +258,7 @@ async function main(): Promise<void> {
         required(values.reviewer, "--reviewer"),
         ReviewVerdictSchema.parse(required(values.verdict, "--verdict")),
         required(values["operation-id"], "--operation-id"),
-        undefined,
+        pluginAdapter,
         receiptId,
       );
       break;

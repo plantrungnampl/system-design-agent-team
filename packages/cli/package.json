@@ -13,8 +13,14 @@
   "bin": {
     "system-design-team": "./dist/bin.js"
   },
-  "files": ["dist/*.js", "dist/*.d.ts", "dist/assets"],
-  "engines": { "node": ">=20" },
+  "files": [
+    "dist/*.js",
+    "dist/*.d.ts",
+    "dist/assets"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
   "dependencies": {
     "@system-design-team/artifact-validator": "0.1.0",
     "@system-design-team/codex-adapter": "0.1.0",
@@ -25,5 +31,8 @@
     "@system-design-team/traceability": "0.1.0",
     "@system-design-team/workflow-engine": "0.1.0",
     "yaml": "^2.8.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.43"
   }
 }

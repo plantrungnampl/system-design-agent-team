@@ -354,6 +354,20 @@ test("transaction replay is idempotent", async (t) => {
   assert.deepEqual(events, [event]);
 });
 
+test("transaction rejects a stale expected workflow-state version", async (t) => {
+  const root = await projectWithState(t);
+  const store = ProjectStore.open(root);
+  await assert.rejects(
+    () => store.transaction("OP-STALE-TRANSACTION", [{
+      path: ".agent-team/workflow-state.yaml",
+      content: workflowStateYaml,
+      expectedStateVersion: 0,
+    }], auditEvent("OP-STALE-TRANSACTION")),
+    /STATE_VERSION_CONFLICT/,
+  );
+  assert.equal(await readFile(join(root, ".agent-team/workflow-state.yaml"), "utf8"), workflowStateYaml);
+});
+
 test("completed operation ids are bound to the original payload", async (t) => {
   const root = await temporaryDirectory(t, "project-store-receipt-");
   const store = ProjectStore.open(root);
