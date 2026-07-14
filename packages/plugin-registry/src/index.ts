@@ -23,9 +23,11 @@ export interface PluginResolution {
 
 export interface PluginInvocationRequest {
   plugin_uri: string;
-  skill: string;
+  skill?: string;
   input: unknown;
   operation_id: string;
+  agent_id?: string;
+  phase?: string;
 }
 
 export interface PluginAdapter {
@@ -179,7 +181,7 @@ export class PluginRegistry {
       reviewer: "runtime",
       required_plugins: [{
         uri: request.plugin_uri,
-        required_skills: [request.skill],
+        required_skills: request.skill ? [request.skill] : [],
         fallback_policy: "block",
       }],
     }, adapter);
@@ -203,7 +205,9 @@ export class PluginRegistry {
       evidence: PluginInvocationRecordSchema.parse({
         ...result,
         operation_id: request.operation_id,
-        skill: request.skill,
+        ...(request.agent_id ? { agent_id: request.agent_id } : {}),
+        ...(request.phase ? { phase: request.phase } : {}),
+        ...(request.skill ? { skill: request.skill } : {}),
         input_digest: pluginInvocationDigest(request.input),
         output_digest: pluginInvocationDigest(result.output),
       }),

@@ -49,6 +49,7 @@ import {
   type GateId,
   type HandoverRecord,
   type PluginInvocationList,
+  type PluginInvocationRecord,
   type PluginStatusRecord,
   type ProjectConfig,
   type EnvironmentOverlay,
@@ -853,6 +854,32 @@ async function requireCurrentCapabilities(
   if (error) throw error;
 }
 
+async function invokeRequiredPlugins(
+  manifest: AgentManifest,
+  phase: string,
+  operationId: string,
+  adapter?: PluginAdapter,
+): Promise<PluginInvocationRecord[]> {
+  await requireCurrentCapabilities(manifest, adapter);
+  const registry = new PluginRegistry([]);
+  const invocations: PluginInvocationRecord[] = [];
+  for (const requirement of manifest.required_plugins) {
+    const skills = requirement.required_skills.length > 0 ? requirement.required_skills : [undefined];
+    for (const skill of skills) {
+      const { evidence } = await registry.invoke(adapter!, {
+        plugin_uri: requirement.uri,
+        ...(skill ? { skill } : {}),
+        input: { agent_id: manifest.id, phase },
+        operation_id: operationId,
+        agent_id: manifest.id,
+        phase,
+      });
+      invocations.push(evidence);
+    }
+  }
+  return invocations;
+}
+
 export async function invokePlugin(
   root: string,
   adapter: PluginAdapter,
@@ -931,11 +958,12 @@ export async function startPhase(
   }
   const owner = (await configuredCatalogue(store)).find((agent) => agent.id === definition.owner);
   if (!owner) throw new Error(`AGENT_NOT_CONFIGURED: ${definition.owner}`);
-  await requireCurrentCapabilities(owner, adapter);
   if (state.completed_operations.includes(scopedOperation)) {
+    await requireCurrentCapabilities(owner, adapter);
     await appendOperationAudit(store, scopedOperation, "start", phase);
     return state;
   }
+  const invocations = await invokeRequiredPlugins(owner, phase, scopedOperation, adapter);
 
   const next = transitionPhase(
     state,
@@ -943,9 +971,22 @@ export async function startPhase(
     { phase, to: "in_progress", operation_id: scopedOperation },
   );
   const { project } = await projectConfig(store);
-  await ensureLifecycleTransaction(store, scopedOperation, [
+  const currentInvocations = invocations.length > 0 ? await pluginInvocations(store) : undefined;
+  const writes: Parameters<ProjectStore["transaction"]>[1] = [
     { path: ".agent-team/workflow-state.yaml", content: stringify(next), expectedStateVersion: state.state_version },
-  ], makeAuditEvent(scopedOperation, "start", phase, project.profile));
+    ...(currentInvocations ? [{
+      path: ".agent-team/plugin-invocations.yaml",
+      content: stringify(PluginInvocationListSchema.parse({
+        invocations: [...currentInvocations.invocations, ...invocations],
+      })),
+    }] : []),
+  ];
+  await ensureLifecycleTransaction(
+    store,
+    scopedOperation,
+    writes,
+    makeAuditEvent(scopedOperation, "start", phase, project.profile),
+  );
   return next;
   });
 }
@@ -1309,11 +1350,18 @@ function artifactVersions(artifacts: readonly ArtifactRecord[]): Record<string, 
   );
 }
 
-function sameArtifactVersions(
-  left: Record<string, number>,
-  right: Record<string, number>,
+function artifactChecksums(artifacts: readonly ArtifactRecord[]): Record<string, string> {
+  return Object.fromEntries(
+    [...artifacts].sort((left, right) => left.id.localeCompare(right.id))
+      .map((artifact) => [artifact.id, artifact.checksum]),
+  );
+}
+
+function sameRecord(
+  left: Record<string, unknown>,
+  right: Record<string, unknown>,
 ): boolean {
-  const entries = (value: Record<string, number>) => Object.entries(value)
+  const entries = (value: Record<string, unknown>) => Object.entries(value)
     .sort(([leftId], [rightId]) => leftId.localeCompare(rightId));
   return JSON.stringify(entries(left)) === JSON.stringify(entries(right));
 }
@@ -1354,74 +1402,69 @@ export async function reviewPhase(
   ]);
   const definition = workflow.phases.find((candidate) => candidate.id === phase);
   if (!definition) throw new Error("PHASE_NOT_CONFIGURED");
-  let reviewReceipt: ExecutionReceipt | undefined;
-  if (definition.gate === "G7" || definition.gate === "G8") {
-    if (!receiptId) throw new Error("REVIEW_EXECUTION_RECEIPT_REQUIRED");
-    const receipt = await loadExecutionReceipt(root, receiptId);
-    reviewReceipt = receipt;
-    if (receipt.agent_id !== reviewerId || receipt.agent_id === definition.owner) {
-      throw new Error("REVIEWER_EXECUTION_IDENTITY_MISMATCH");
-    }
-    if (receipt.phase !== phase) throw new Error("REVIEWER_EXECUTION_PHASE_MISMATCH");
-    if (receipt.review_verdict !== verdict) throw new Error("REVIEWER_EXECUTION_VERDICT_MISMATCH");
-    if (receipt.result.status !== "completed"
-      || receipt.result.checkpoints.some(({ status }) => status !== "completed")) {
-      throw new Error("REVIEW_EXECUTION_NOT_COMPLETED");
-    }
-    const report = evaluateReviewExecutionResult(
-      receipt.result,
-      await executionEvidenceContext(root, store),
-      definition.id,
-    );
-    if (!report.allowed) throw new Error(report.blockers[0]);
+  if (!receiptId) throw new Error("REVIEW_EXECUTION_RECEIPT_REQUIRED");
+  const reviewReceipt = await loadExecutionReceipt(root, receiptId);
+  if (reviewReceipt.agent_id !== reviewerId || reviewReceipt.agent_id === definition.owner) {
+    throw new Error("REVIEWER_EXECUTION_IDENTITY_MISMATCH");
   }
-  const existing = reviews.reviews.find((review) => review.id === evidenceId);
-  if (state.completed_operations.includes(verdictId)) {
-    if (!existing) throw new Error("REVIEW_EVIDENCE_MISSING");
-    if (existing.phase !== phase || existing.reviewer !== reviewerId || existing.verdict !== verdict
-      || existing.execution_receipt_id !== reviewReceipt?.id
-      || existing.execution_receipt_digest !== reviewReceipt?.attestation_digest) {
-      throw new Error("OPERATION_ID_CONFLICT");
-    }
-    const reviewerManifest = (await configuredCatalogue(store)).find((agent) => agent.id === reviewerId);
-    if (!reviewerManifest) throw new Error("REVIEWER_NOT_CONFIGURED");
-    await requireCurrentCapabilities(reviewerManifest, adapter);
-    if (state.phases[phase]?.review_id !== existing.id) throw new Error("REVIEW_EVIDENCE_MISSING");
-    const replayDefinition = workflow.phases.find((candidate) => candidate.id === phase);
-    const [finding] = await inspectArtifacts(root, registry.artifacts.filter((artifact) =>
-      artifact.owner === replayDefinition?.owner && artifact.required_gate === replayDefinition.gate));
-    if (finding) throw new Error(`${finding.code}: ${finding.message}`);
-    await appendOperationAudit(store, evidenceId, "review", phase, {
-      executionReceiptId: reviewReceipt?.id,
-      executionReceiptDigest: reviewReceipt?.attestation_digest,
-    });
-    return state;
-  }
-  if ((definition.gate === "G7" || definition.gate === "G8") && !(await secretsScan(root)).valid) {
-    throw new Error("SECRET_SCAN_FAILED");
+  if (reviewReceipt.phase !== phase) throw new Error("REVIEWER_EXECUTION_PHASE_MISMATCH");
+  if (reviewReceipt.review_verdict !== verdict) throw new Error("REVIEWER_EXECUTION_VERDICT_MISMATCH");
+  if (reviewReceipt.result.status !== "completed"
+    || reviewReceipt.result.checkpoints.some(({ status }) => status !== "completed")) {
+    throw new Error("REVIEW_EXECUTION_NOT_COMPLETED");
   }
   if (!reviewerId || reviewerId !== definition.reviewer || reviewerId === definition.owner) {
     throw new Error("REVIEWER_NOT_CONFIGURED");
   }
   const reviewerManifest = (await configuredCatalogue(store)).find((agent) => agent.id === reviewerId);
   if (!reviewerManifest) throw new Error("REVIEWER_NOT_CONFIGURED");
-  await requireCurrentCapabilities(reviewerManifest, adapter);
   const artifacts = registry.artifacts.filter(
     (artifact) => artifact.owner === definition.owner && artifact.required_gate === definition.gate,
   );
   if (artifacts.length === 0) throw new Error("REVIEW_ARTIFACTS_REQUIRED");
   const [finding] = await inspectArtifacts(root, artifacts);
   if (finding) throw new Error(`${finding.code}: ${finding.message}`);
+  const versions = artifactVersions(artifacts);
+  const checksums = artifactChecksums(artifacts);
+  if (!reviewReceipt.artifact_versions || !reviewReceipt.artifact_checksums
+    || !sameRecord(reviewReceipt.artifact_versions, versions)
+    || !sameRecord(reviewReceipt.artifact_checksums, checksums)) {
+    throw new Error("REVIEWER_EXECUTION_ARTIFACT_MISMATCH");
+  }
+  const report = evaluateReviewExecutionResult(
+    reviewReceipt.result,
+    await executionEvidenceContext(root, store),
+    definition.id,
+  );
+  if (!report.allowed) throw new Error(report.blockers[0]);
+  const existing = reviews.reviews.find((review) => review.id === evidenceId);
+  if (state.completed_operations.includes(verdictId)) {
+    if (!existing) throw new Error("REVIEW_EVIDENCE_MISSING");
+    if (existing.phase !== phase || existing.reviewer !== reviewerId || existing.verdict !== verdict
+      || existing.execution_receipt_id !== reviewReceipt.id
+      || existing.execution_receipt_digest !== reviewReceipt.attestation_digest) {
+      throw new Error("OPERATION_ID_CONFLICT");
+    }
+    await requireCurrentCapabilities(reviewerManifest, adapter);
+    if (state.phases[phase]?.review_id !== existing.id) throw new Error("REVIEW_EVIDENCE_MISSING");
+    await appendOperationAudit(store, evidenceId, "review", phase, {
+      executionReceiptId: reviewReceipt.id,
+      executionReceiptDigest: reviewReceipt.attestation_digest,
+    });
+    return state;
+  }
+  if ((definition.gate === "G7" || definition.gate === "G8") && !(await secretsScan(root)).valid) {
+    throw new Error("SECRET_SCAN_FAILED");
+  }
+  const invocations = await invokeRequiredPlugins(reviewerManifest, phase, evidenceId, adapter);
   const expected = {
     id: evidenceId,
     phase,
     reviewer: reviewerId,
     verdict,
-    artifact_versions: artifactVersions(artifacts),
-    ...(reviewReceipt ? {
-      execution_receipt_id: reviewReceipt.id,
-      execution_receipt_digest: reviewReceipt.attestation_digest,
-    } : {}),
+    artifact_versions: versions,
+    execution_receipt_id: reviewReceipt.id,
+    execution_receipt_digest: reviewReceipt.attestation_digest,
   };
   const review = existing ?? ReviewRecordSchema.parse({
     ...expected,
@@ -1461,19 +1504,27 @@ export async function reviewPhase(
     reviews: existing ? reviews.reviews : [...reviews.reviews, review],
   });
   const { project } = await projectConfig(store);
-  await store.transaction(evidenceId, [
+  const currentInvocations = invocations.length > 0 ? await pluginInvocations(store) : undefined;
+  const writes: Parameters<ProjectStore["transaction"]>[1] = [
     { path: ".agent-team/reviews.yaml", content: stringify(nextReviews) },
     {
       path: ".agent-team/workflow-state.yaml",
       content: stringify(preview),
       expectedStateVersion: state.state_version,
     },
-  ], makeAuditEvent(evidenceId, "review", phase, project.profile, {
+    ...(currentInvocations ? [{
+      path: ".agent-team/plugin-invocations.yaml",
+      content: stringify(PluginInvocationListSchema.parse({
+        invocations: [...currentInvocations.invocations, ...invocations],
+      })),
+    }] : []),
+  ];
+  await store.transaction(evidenceId, writes, makeAuditEvent(evidenceId, "review", phase, project.profile, {
     actor: { type: "agent", identifier: reviewerId },
     authorizationSource: "agent_manifest",
     artifactVersions: review.artifact_versions,
-    executionReceiptId: reviewReceipt?.id,
-    executionReceiptDigest: reviewReceipt?.attestation_digest,
+    executionReceiptId: reviewReceipt.id,
+    executionReceiptDigest: reviewReceipt.attestation_digest,
   }));
   return preview;
   });
@@ -1546,7 +1597,7 @@ export async function approve(
   if (!reviewId || !review) throw new Error("REVIEW_EVIDENCE_MISSING");
   if (review.phase !== definition.id
     || review.verdict !== "approved"
-    || !sameArtifactVersions(review.artifact_versions, versions)) {
+    || !sameRecord(review.artifact_versions, versions)) {
     throw new Error("REVIEW_VERSION_MISMATCH");
   }
   const expected = {
@@ -1729,7 +1780,7 @@ export async function handover(
     const [staleFinding] = await inspectArtifacts(root, approvedArtifacts);
     if (staleFinding
       || Object.keys(approval.artifact_versions).length === 0
-      || !sameArtifactVersions(approval.artifact_versions, artifactVersions(approvedArtifacts))) {
+      || !sameRecord(approval.artifact_versions, artifactVersions(approvedArtifacts))) {
       throw new Error("APPROVED_INPUT_STALE");
     }
     const proposed = HandoverRecordSchema.parse({
@@ -2074,12 +2125,15 @@ export async function gateReadinessReport(root: string, gate: GateId, receiptId?
 }
 
 function attestationDigest(receipt: Pick<ExecutionReceipt,
-  "adapter_id" | "agent_id" | "phase" | "review_verdict" | "result">): `sha256:${string}` {
+  "adapter_id" | "agent_id" | "phase" | "review_verdict" | "artifact_versions"
+  | "artifact_checksums" | "result">): `sha256:${string}` {
   const binding = {
     adapter_id: receipt.adapter_id,
     ...(receipt.agent_id ? { agent_id: receipt.agent_id } : {}),
     ...(receipt.phase ? { phase: receipt.phase } : {}),
     ...(receipt.review_verdict ? { review_verdict: receipt.review_verdict } : {}),
+    ...(receipt.artifact_versions ? { artifact_versions: receipt.artifact_versions } : {}),
+    ...(receipt.artifact_checksums ? { artifact_checksums: receipt.artifact_checksums } : {}),
     result: receipt.result,
   };
   return `sha256:${createHash("sha256").update(JSON.stringify(binding)).digest("hex")}`;

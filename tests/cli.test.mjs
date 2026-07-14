@@ -34,6 +34,7 @@ import {
   initProject,
   inspectProject,
   planUpgrade,
+  recordExecutionReceipt,
   resolveProjectConfig,
   reviewPhase as reviewPhaseWithAdapter,
   setPluginStatus,
@@ -44,6 +45,7 @@ import {
   uninstallProject,
   validatePhase,
 } from "@system-design-team/cli";
+import { ManualCodexAdapter } from "@system-design-team/codex-adapter";
 import {
   AgentManifestSchema,
   AuditEventSchema,
@@ -64,20 +66,34 @@ const adapterWithStatus = (status) => ({
   async verifySkill() {
     return true;
   },
-  async invoke() {
-    throw new Error("TEST_INVOCATION_NOT_CONFIGURED");
+  async invoke(request) {
+    return {
+      plugin_uri: request.plugin_uri,
+      publisher_identity: request.plugin_uri.split("@").at(-1),
+      status: "success",
+      output: { ok: true },
+      execution_reference: `test-${request.operation_id}`,
+      started_at: "2026-07-14T00:00:00.000Z",
+      completed_at: "2026-07-14T00:00:01.000Z",
+    };
   },
 });
 const pluginAdapter = adapterWithStatus("available");
 const unavailablePluginAdapter = adapterWithStatus("unknown");
+const availabilityOnlyPluginAdapter = {
+  ...pluginAdapter,
+  async invoke() { throw new Error("TEST_INVOCATION_NOT_CONFIGURED"); },
+};
 const lifecycleAuthorization = {
   actor: { type: "human", identifier: "project-owner" },
   authorizationSource: "test_authorization",
 };
 const startPhase = (root, phase, operationId, adapter = pluginAdapter) =>
   startPhaseWithAdapter(root, phase, operationId, adapter);
-const reviewPhase = (root, phase, reviewer, verdict, operationId, adapter = pluginAdapter) =>
-  reviewPhaseWithAdapter(root, phase, reviewer, verdict, operationId, adapter);
+const reviewPhase = async (root, phase, reviewer, verdict, operationId, adapter = pluginAdapter) => {
+  const receipt = await reviewerReceipt(root, phase, reviewer, verdict, operationId);
+  return reviewPhaseWithAdapter(root, phase, reviewer, verdict, operationId, adapter, receipt.id);
+};
 
 async function temporaryGitRepository() {
   const root = await mkdtemp(join(tmpdir(), "system-design-team-cli-"));
@@ -87,6 +103,47 @@ async function temporaryGitRepository() {
 
 async function readYaml(root, path) {
   return parse(await readFile(join(root, path), "utf8"));
+}
+
+async function reviewerReceipt(root, phase, reviewer, verdict, operationId) {
+  const project = await readYaml(root, ".agent-team/project.yaml");
+  const workflow = project.framework.management === "ejected"
+    ? await readYaml(root, ".agent-team/overrides/workflow.yaml")
+    : parse(await readFile(join(repository, "workflows", `${project.project.mode.replace("_", "-")}.yaml`), "utf8"));
+  const definition = workflow.phases.find(({ id }) => id === phase);
+  const registry = await readYaml(root, ".agent-team/artifact-registry.yaml");
+  const artifacts = registry.artifacts.filter(({ owner, required_gate }) =>
+    owner === definition.owner && required_gate === definition.gate);
+  const dispatch = {
+    execution_id: `EXEC-${operationId}`,
+    agent_id: reviewer,
+    phase,
+    review_verdict: verdict,
+    artifact_versions: Object.fromEntries(artifacts.map(({ id, version }) => [id, version])),
+    artifact_checksums: Object.fromEntries(artifacts.map(({ id, checksum }) => [id, checksum])),
+    authorized_scope: { read: [".agent-team/**"], write: [], execute: [] },
+    required_inputs: [],
+    permission_profile: "read_only_assessment",
+    command_class: "safe_read",
+  };
+  const executionAdapter = new ManualCodexAdapter();
+  const prepared = await executionAdapter.prepareExecution(dispatch);
+  const result = await executionAdapter.collectResult(await executionAdapter.execute(prepared), {
+    execution_id: dispatch.execution_id,
+    dispatch_digest: prepared.digest,
+    status: "completed",
+    permission_profile: dispatch.permission_profile,
+    authorized_paths: dispatch.authorized_scope,
+    command_class: dispatch.command_class,
+    checkpoints: [{
+      id: `review-${phase}`,
+      status: "completed",
+      timestamp: "2026-07-14T00:00:00.000Z",
+      evidence: [`sha256:${"a".repeat(64)}`],
+    }],
+    evidence: { gate_approvals: [] },
+  });
+  return recordExecutionReceipt(root, executionAdapter, result, `RECEIPT-${operationId}`);
 }
 
 async function enableAllPlugins(root) {
@@ -536,7 +593,7 @@ test("ejected agent catalogue is authoritative for start, review, and doctor", a
   await startPhaseWithAdapter(root, "intake", "EJECTED-START", unavailablePluginAdapter);
   await setArtifactStatus(root, "PROJECT-CHARTER");
   await validatePhase(root, "intake", "EJECTED-VALIDATE");
-  const reviewed = await reviewPhaseWithAdapter(
+  const reviewed = await reviewPhase(
     root, "intake", "documentation-reviewer", "approved", "EJECTED-REVIEW",
     unavailablePluginAdapter,
   );
@@ -1128,10 +1185,44 @@ test("start checks the phase owner plugin before changing state and replays safe
     "available",
     ["brainstorming", "writing-plans", "verification-before-completion"],
   );
-  const started = await startPhase(root, "intake", "OP-START-INTAKE");
+  await assert.rejects(
+    startPhase(root, "intake", "OP-START-INTAKE", availabilityOnlyPluginAdapter),
+    /PLUGIN_INVOCATION_FAILED/,
+  );
+  assert.deepEqual(await ProjectStore.open(root).readWorkflowState(), before);
+
+  const invoked = [];
+  const invokingAdapter = {
+    ...pluginAdapter,
+    async invoke(request) {
+      invoked.push(request);
+      return {
+        plugin_uri: request.plugin_uri,
+        publisher_identity: "openai-curated-remote",
+        status: "success",
+        output: { ok: true },
+        execution_reference: `runtime-${invoked.length}`,
+        started_at: "2026-07-14T00:00:00.000Z",
+        completed_at: "2026-07-14T00:00:01.000Z",
+      };
+    },
+  };
+  const started = await startPhase(root, "intake", "OP-START-INTAKE", invokingAdapter);
   assert.equal(started.phases.intake.status, "in_progress");
   assert.equal(started.state_version, before.state_version + 1);
-  assert.deepEqual(await startPhase(root, "intake", "OP-START-INTAKE"), started);
+  assert.equal(invoked.length, 3);
+  const evidence = await readYaml(root, ".agent-team/plugin-invocations.yaml");
+  assert.deepEqual(evidence.invocations.map(({ agent_id, phase, operation_id }) => ({
+    agent_id,
+    phase,
+    operation_id,
+  })), Array.from({ length: 3 }, () => ({
+    agent_id: "lead-orchestrator",
+    phase: "intake",
+    operation_id: operationKey("start", "intake", "OP-START-INTAKE"),
+  })));
+  assert.deepEqual(await startPhase(root, "intake", "OP-START-INTAKE", invokingAdapter), started);
+  assert.equal(invoked.length, 3);
 });
 
 test("validate checks registered artifacts before entering artifact validation", async () => {
@@ -1210,6 +1301,32 @@ test("scopes identical raw operation IDs to their action and target", async () =
   ));
 });
 
+test("every reviewed phase requires an adapter-collected execution receipt", async () => {
+  const root = await temporaryGitRepository();
+  await initProject(root, {
+    id: "leave-system",
+    name: "Leave System",
+    mode: "greenfield",
+    profile: "standard",
+  }, "INIT-CLI-REVIEW-RECEIPT");
+  await setPluginStatus(root, pluginUri, "available", [
+    "brainstorming",
+    "writing-plans",
+    "verification-before-completion",
+  ]);
+  await enterArtifactValidation(root, "intake", "PROJECT-CHARTER", "RECEIPT-REQUIRED");
+
+  await assert.rejects(() => reviewPhaseWithAdapter(
+    root,
+    "intake",
+    "documentation-reviewer",
+    "approved",
+    "OP-RECEIPT-REQUIRED",
+    pluginAdapter,
+  ), /REVIEW_EXECUTION_RECEIPT_REQUIRED/);
+  assert.deepEqual((await readYaml(root, ".agent-team/reviews.yaml")).reviews, []);
+});
+
 test("review records independent evidence and applies two idempotent state updates", async () => {
   const root = await temporaryGitRepository();
   await initProject(root, {
@@ -1226,8 +1343,8 @@ test("review records independent evidence and applies two idempotent state updat
     "intake",
     "lead-orchestrator",
     "approved",
-    "OP-REVIEW",
-  ), /REVIEWER_NOT_CONFIGURED/);
+    "OP-INVALID-REVIEW",
+  ), /REVIEWER_EXECUTION_IDENTITY_MISMATCH/);
   assert.deepEqual((await readYaml(root, ".agent-team/reviews.yaml")).reviews, []);
 
   const reviewed = await reviewPhase(
@@ -1243,7 +1360,6 @@ test("review records independent evidence and applies two idempotent state updat
   assert.equal(reviewed.state_version, validated.state.state_version + 2);
   assert.equal(evidence.reviews[0].id, operationKey("review", "intake", "OP-REVIEW"));
   assert.deepEqual(evidence.reviews[0].artifact_versions, { "PROJECT-CHARTER": 1 });
-  await setArtifactStatus(root, "PROJECT-CHARTER", { version: 2 });
   assert.deepEqual(await reviewPhase(
     root,
     "intake",
@@ -1251,6 +1367,14 @@ test("review records independent evidence and applies two idempotent state updat
     "approved",
     "OP-REVIEW",
   ), reviewed);
+  await setArtifactStatus(root, "PROJECT-CHARTER", { version: 2 });
+  await assert.rejects(() => reviewPhase(
+    root,
+    "intake",
+    "documentation-reviewer",
+    "approved",
+    "OP-REVIEW",
+  ), /OPERATION_ID_CONFLICT/);
   assert.equal((await readYaml(root, ".agent-team/reviews.yaml")).reviews.length, 1);
   await assert.rejects(() => reviewPhase(
     root,
@@ -1644,6 +1768,7 @@ test("CLI help lists the implemented commands", async () => {
     assert.match(stdout, new RegExp(`\\b${command}\\b`));
   }
   assert.match(stdout, /review <phase> --reviewer <id> --verdict <approved\|revision_required> --operation-id <id>/);
+  assert.match(stdout, /review .*--execution-receipt <id>/);
   assert.match(stdout, /repair --locks --yes/);
   assert.match(stdout, /init .*--operation-id <id>/);
   assert.match(stdout, /adopt .*--operation-id <id>/);
@@ -1718,7 +1843,7 @@ test("CLI help lists the implemented commands", async () => {
       "--verdict", "approved",
       "--operation-id", "CLI-REVIEW",
     ], { cwd: root }),
-    /PLUGIN_ADAPTER_REQUIRED/,
+    /--execution-receipt is required/,
   );
   const reviewed = await reviewPhase(
     root,

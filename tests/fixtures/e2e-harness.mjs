@@ -32,7 +32,17 @@ export const pluginAdapter = {
     return { uri, publisher_identity: uri.split("@").at(-1), status: "available" };
   },
   async verifySkill() { return true; },
-  async invoke() { throw new Error("TEST_INVOCATION_NOT_CONFIGURED"); },
+  async invoke(request) {
+    return {
+      plugin_uri: request.plugin_uri,
+      publisher_identity: request.plugin_uri.split("@").at(-1),
+      status: "success",
+      output: { ok: true },
+      execution_reference: `e2e-${request.operation_id}`,
+      started_at: "2026-07-14T00:00:00.000Z",
+      completed_at: "2026-07-14T00:00:01.000Z",
+    };
+  },
 };
 
 export async function temporaryRepository(t, prefix, fixture) {
@@ -114,11 +124,15 @@ export async function artifactReference(root, mode, artifactId, includeApproval 
   };
 }
 
-export async function reviewerReceipt(root, mode, phase, evidence, suffix = "1", verification) {
+export async function reviewerReceipt(
+  root, mode, phase, evidence, suffix = "1", verification, verdict = "approved",
+) {
   const workflow = await loadWorkflow(mode);
   const definition = workflow.phases.find(({ id }) => id === phase);
   const registry = await readYaml(root, ".agent-team/artifact-registry.yaml");
   const artifact = registry.artifacts.find(({ id }) => id === definition.artifact.id);
+  const reviewedArtifacts = registry.artifacts.filter(({ owner, required_gate }) =>
+    owner === definition.owner && required_gate === definition.gate);
   const artifactContent = await readFile(join(root, ".agent-team", artifact.path), "utf8");
   const reviewedEvidence = `${artifactContent}\n${verification?.stdout ?? ""}`;
   const adapter = new ManualCodexAdapter(() => executionContext(root, mode));
@@ -126,7 +140,9 @@ export async function reviewerReceipt(root, mode, phase, evidence, suffix = "1",
     execution_id: `EXEC-REVIEW-${phase}-${suffix}`,
     agent_id: definition.reviewer,
     phase,
-    review_verdict: "approved",
+    review_verdict: verdict,
+    artifact_versions: Object.fromEntries(reviewedArtifacts.map(({ id, version }) => [id, version])),
+    artifact_checksums: Object.fromEntries(reviewedArtifacts.map(({ id, checksum }) => [id, checksum])),
     authorized_scope: { read: [".agent-team/**"], write: [], execute: [] },
     required_inputs: [],
     permission_profile: "read_only_assessment",
@@ -161,11 +177,11 @@ export async function reviewReadyPhase(root, mode, phase, body, options = {}) {
   await writePhaseArtifact(root, mode, phase, body, options.incrementVersion);
   const validation = await validatePhase(root, phase, `VALIDATE-${phase}-${suffix}`);
   assert.equal(validation.valid, true, JSON.stringify(validation.findings));
-  const receipt = definition.gate === "G7" || definition.gate === "G8"
-    ? await reviewerReceipt(root, mode, phase, options.evidence, suffix)
-    : undefined;
+  const receipt = await reviewerReceipt(
+    root, mode, phase, options.evidence, suffix, undefined, options.verdict ?? "approved",
+  );
   await reviewPhase(root, phase, definition.reviewer, options.verdict ?? "approved",
-    `REVIEW-${phase}-${suffix}`, options.pluginAdapter ?? pluginAdapter, receipt?.id);
+    `REVIEW-${phase}-${suffix}`, options.pluginAdapter ?? pluginAdapter, receipt.id);
   return { definition, receipt };
 }
 

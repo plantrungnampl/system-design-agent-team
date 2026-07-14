@@ -33,15 +33,29 @@ const adapterWithStatus = (status) => ({
   async verifySkill() {
     return true;
   },
-  async invoke() {
-    throw new Error("TEST_INVOCATION_NOT_CONFIGURED");
+  async invoke(request) {
+    return {
+      plugin_uri: request.plugin_uri,
+      publisher_identity: request.plugin_uri.split("@").at(-1),
+      status: "success",
+      output: { ok: true },
+      execution_reference: `greenfield-${request.operation_id}`,
+      started_at: "2026-07-14T00:00:00.000Z",
+      completed_at: "2026-07-14T00:00:01.000Z",
+    };
   },
 });
 const pluginAdapter = adapterWithStatus("available");
 const startPhase = (root, phase, operationId, adapter = pluginAdapter) =>
   startPhaseWithAdapter(root, phase, operationId, adapter);
-const reviewPhase = (root, phase, reviewer, verdict, operationId, adapter = pluginAdapter, receiptId) =>
-  reviewPhaseWithAdapter(root, phase, reviewer, verdict, operationId, adapter, receiptId);
+const reviewPhase = async (
+  root, phase, reviewer, verdict, operationId, adapter = pluginAdapter, receiptId,
+) => {
+  const receipt = receiptId ?? (await reviewerReceipt(
+    root, phase, { gate_approvals: [] }, operationId, verdict,
+  )).receipt.id;
+  return reviewPhaseWithAdapter(root, phase, reviewer, verdict, operationId, adapter, receipt);
+};
 
 async function temporaryGitRepository(t) {
   const root = await mkdtemp(join(tmpdir(), "system-design-team-e2e-"));
@@ -139,18 +153,24 @@ async function artifactReference(root, artifactId, includeApproval = true) {
   };
 }
 
-async function reviewerReceipt(root, phase, evidence = { gate_approvals: [] }) {
+async function reviewerReceipt(
+  root, phase, evidence = { gate_approvals: [] }, suffix = "1", verdict = "approved",
+) {
   const workflow = await workflowFixture();
   const definition = workflow.phases.find(({ id }) => id === phase);
   const registry = await readYaml(root, ".agent-team/artifact-registry.yaml");
   const artifact = registry.artifacts.find(({ id }) => id === definition.artifact.id);
+  const reviewedArtifacts = registry.artifacts.filter(({ owner, required_gate }) =>
+    owner === definition.owner && required_gate === definition.gate);
   const artifactContent = await readFile(join(root, ".agent-team", artifact.path), "utf8");
   const adapter = new ManualCodexAdapter(() => executionContext(root));
   const dispatch = {
-    execution_id: `EXEC-REVIEW-${phase}`,
+    execution_id: `EXEC-REVIEW-${phase}-${suffix}`,
     agent_id: definition.reviewer,
     phase,
-    review_verdict: "approved",
+    review_verdict: verdict,
+    artifact_versions: Object.fromEntries(reviewedArtifacts.map(({ id, version }) => [id, version])),
+    artifact_checksums: Object.fromEntries(reviewedArtifacts.map(({ id, checksum }) => [id, checksum])),
     authorized_scope: { read: [".agent-team/**"], write: [], execute: [] },
     required_inputs: [],
     permission_profile: "read_only_assessment",
@@ -175,7 +195,7 @@ async function reviewerReceipt(root, phase, evidence = { gate_approvals: [] }) {
   });
   return {
     adapter,
-    receipt: await recordExecutionReceipt(root, adapter, result, `RECEIPT-REVIEW-${phase}`),
+    receipt: await recordExecutionReceipt(root, adapter, result, `RECEIPT-REVIEW-${phase}-${suffix}`),
   };
 }
 
@@ -186,11 +206,11 @@ async function reviewReadyPhase(root, phase, body, evidence, options = {}) {
   await startPhase(root, phase, `START-${phase}-${round}`);
   await writePhaseArtifact(root, phase, body, options.incrementVersion);
   assert.equal((await validatePhase(root, phase, `VALIDATE-${phase}-${round}`)).valid, true);
-  const receipt = definition.gate === "G7" || definition.gate === "G8"
-    ? (await reviewerReceipt(root, phase, evidence)).receipt
-    : undefined;
+  const receipt = (await reviewerReceipt(
+    root, phase, evidence, round, options.verdict ?? "approved",
+  )).receipt;
   await reviewPhase(root, phase, definition.reviewer, options.verdict ?? "approved",
-    `REVIEW-${phase}-${round}`, pluginAdapter, receipt?.id);
+    `REVIEW-${phase}-${round}`, pluginAdapter, receipt.id);
   return { definition, receipt };
 }
 
@@ -318,7 +338,9 @@ test("greenfield reaches G9 with revision, attested implementation, release, and
     `Vertical slice implemented. Command: ${implementationCommand}. Exit: 0. Tests: 2 passed, 0 failed. Receipt: ${implementationReceipt.id}.`);
   assert.equal((await validatePhase(root, "implementation", "VALIDATE-implementation-1")).valid, true);
   await assert.rejects(
-    () => reviewPhase(root, "implementation", "code-reviewer", "approved", "REVIEW-implementation-missing", pluginAdapter),
+    () => reviewPhaseWithAdapter(
+      root, "implementation", "code-reviewer", "approved", "REVIEW-implementation-missing", pluginAdapter,
+    ),
     /REVIEW_EXECUTION_RECEIPT_REQUIRED/,
   );
   const implementationReview = await reviewerReceipt(root, "implementation");

@@ -471,6 +471,8 @@ export const ExecutionReceiptSchema = z.object({
   agent_id: z.string().min(1).optional(),
   phase: z.string().min(1).optional(),
   review_verdict: z.enum(["approved", "revision_required"]).optional(),
+  artifact_versions: z.record(z.string().min(1), z.number().int().positive()).optional(),
+  artifact_checksums: z.record(z.string().min(1), Sha256DigestSchema).optional(),
   result: AgentExecutionResultSchema,
   attestation_digest: Sha256DigestSchema,
   recorded_at: z.string().datetime(),
@@ -517,7 +519,9 @@ export const PluginInvocationResultSchema = PluginInvocationResultFieldsSchema.s
 
 export const PluginInvocationRecordSchema = PluginInvocationResultFieldsSchema.omit({ output: true }).extend({
   operation_id: z.string().min(1),
-  skill: z.string().min(1),
+  agent_id: z.string().min(1).optional(),
+  phase: z.string().min(1).optional(),
+  skill: z.string().min(1).optional(),
   input_digest: Sha256DigestSchema,
   output_digest: Sha256DigestSchema,
 }).superRefine((record, context) => {

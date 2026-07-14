@@ -64,7 +64,7 @@ class FakePluginAdapter {
   async invoke(request) {
     return {
       plugin_uri: request.plugin_uri,
-      publisher_identity: "openai-curated-remote",
+      publisher_identity: request.plugin_uri.split("@").at(-1),
       status: "success",
       output: { artifact: "requirements", secret: "runtime-only" },
       execution_reference: "fake-execution-persisted",
@@ -157,6 +157,33 @@ async function collectedReviewerResult(adapter, dispatchOverrides = {}, resultOv
     authorized_paths: dispatch.authorized_scope,
     ...resultOverrides,
   }));
+}
+
+async function reviewArtifactBinding(root, phase) {
+  const project = parse(await readFile(join(root, ".agent-team/project.yaml"), "utf8"));
+  const workflowFile = project.project.mode === "existing_system" ? "existing-system.yaml"
+    : `${project.project.mode}.yaml`;
+  const workflow = parse(await readFile(join(import.meta.dirname, "../workflows", workflowFile), "utf8"));
+  const definition = workflow.phases.find(({ id }) => id === phase);
+  const registry = parse(await readFile(join(root, ".agent-team/artifact-registry.yaml"), "utf8"));
+  const artifacts = registry.artifacts.filter(({ owner, required_gate }) =>
+    owner === definition.owner && required_gate === definition.gate);
+  return {
+    artifact_versions: Object.fromEntries(artifacts.map(({ id, version }) => [id, version])),
+    artifact_checksums: Object.fromEntries(artifacts.map(({ id, checksum }) => [id, checksum])),
+  };
+}
+
+async function recordReviewerReceipt(root, phase, reviewer, verdict, operationId) {
+  const adapter = new ManualCodexAdapter();
+  const result = await collectedReviewerResult(adapter, {
+    execution_id: `EXEC-${operationId}`,
+    agent_id: reviewer,
+    phase,
+    review_verdict: verdict,
+    ...await reviewArtifactBinding(root, phase),
+  });
+  return recordExecutionReceipt(root, adapter, result, `RECEIPT-${operationId}`);
 }
 
 test("required CLI safety routes expose real project state", async (t) => {
@@ -425,6 +452,10 @@ test("G7 review binds its receipt to reviewer identity, phase, and verdict", asy
   artifact.checksum = `sha256:${createHash("sha256").update(content).digest("hex")}`;
   await store.writeYamlAtomic(".agent-team/artifact-registry.yaml", registry);
   await store.writeTextAtomic(`.agent-team/${artifact.path}`, content);
+  const artifactBinding = {
+    artifact_versions: { "IMPLEMENTATION-EVIDENCE": 1 },
+    artifact_checksums: { "IMPLEMENTATION-EVIDENCE": artifact.checksum },
+  };
 
   await assert.rejects(() => reviewPhase(
     root,
@@ -436,6 +467,27 @@ test("G7 review binds its receipt to reviewer identity, phase, and verdict", asy
   ), /REVIEW_EXECUTION_RECEIPT_REQUIRED/);
 
   const adapter = new ManualCodexAdapter();
+  const wrongArtifactResult = await collectedReviewerResult(adapter, {
+    execution_id: "EXEC-WRONG-ARTIFACT",
+    ...artifactBinding,
+    artifact_checksums: { "IMPLEMENTATION-EVIDENCE": `sha256:${"0".repeat(64)}` },
+  });
+  const wrongArtifactReceipt = await recordExecutionReceipt(
+    root,
+    adapter,
+    wrongArtifactResult,
+    "RECEIPT-WRONG-ARTIFACT",
+  );
+  await assert.rejects(() => reviewPhase(
+    root,
+    "implementation",
+    "code-reviewer",
+    "approved",
+    "G7-REVIEW",
+    pluginAdapter,
+    wrongArtifactReceipt.id,
+  ), /REVIEWER_EXECUTION_ARTIFACT_MISMATCH/);
+
   for (const [dispatchOverride, expected] of [
     [{ agent_id: "wrong-reviewer" }, /REVIEWER_EXECUTION_IDENTITY_MISMATCH/],
     [{ phase: "verification" }, /REVIEWER_EXECUTION_PHASE_MISMATCH/],
@@ -443,6 +495,7 @@ test("G7 review binds its receipt to reviewer identity, phase, and verdict", asy
   ]) {
     const collected = await collectedReviewerResult(adapter, {
       execution_id: `EXEC-${Object.keys(dispatchOverride)[0]}`,
+      ...artifactBinding,
       ...dispatchOverride,
     });
     const receipt = await recordExecutionReceipt(
@@ -462,7 +515,10 @@ test("G7 review binds its receipt to reviewer identity, phase, and verdict", asy
     ), expected);
   }
 
-  const collected = await collectedReviewerResult(adapter, { execution_id: "EXEC-MATCHING" });
+  const collected = await collectedReviewerResult(adapter, {
+    execution_id: "EXEC-MATCHING",
+    ...artifactBinding,
+  });
   const receipt = await recordExecutionReceipt(root, adapter, collected, "RECEIPT-MATCHING");
   const reviewed = await reviewPhase(
     root,
@@ -574,6 +630,7 @@ test("G8 approval persists an exact prepared request authorization and rejects r
     execution_id: "EXEC-G8-APPROVAL-REVIEW",
     agent_id: "operations-reviewer",
     phase: "deployment",
+    ...await reviewArtifactBinding(root, "deployment"),
   }, { evidence: { gate_approvals: [], qa, security, backup: deployment, rollback: deployment } });
   const receipt = await recordExecutionReceipt(root, adapter, approvalResult, "RECEIPT-G8-APPROVAL");
   const reviewed = await reviewPhase(
@@ -697,6 +754,7 @@ test("existing-system G8 review and exact request approval progress without a pr
     execution_id: "EXEC-EXISTING-G8-REVIEW",
     agent_id: "operations-reviewer",
     phase: "release",
+    ...await reviewArtifactBinding(root, "release"),
   }, { evidence: releaseEvidence });
   const receipt = await recordExecutionReceipt(root, adapter, reviewResult, "RECEIPT-EXISTING-G8");
   const reviewed = await reviewPhase(
@@ -758,6 +816,7 @@ test("G8 reviewer receipt does not require production pre-authorization", async 
     execution_id: "EXEC-G8-REVIEW",
     agent_id: "operations-reviewer",
     phase: "deployment",
+    ...await reviewArtifactBinding(root, "deployment"),
   });
   const receipt = await recordExecutionReceipt(root, adapter, collected, "RECEIPT-G8-REVIEW");
 
@@ -781,6 +840,7 @@ test("G8 reviewer receipt does not require production pre-authorization", async 
     agent_id: "operations-reviewer",
     phase: "deployment",
     review_verdict: "revision_required",
+    ...await reviewArtifactBinding(root, "deployment"),
   });
   const revisionReceipt = await recordExecutionReceipt(
     root, adapter, revisionResult, "RECEIPT-G8-REVISION",
@@ -807,6 +867,7 @@ test("G8 reviewer receipt does not require production pre-authorization", async 
     agent_id: "operations-reviewer",
     phase: "deployment",
     review_verdict: "revision_required",
+    ...await reviewArtifactBinding(root, "deployment"),
   });
   const conflictingReceipt = await recordExecutionReceipt(
     root, adapter, conflictingResult, "RECEIPT-G8-REVISION-CONFLICT",
@@ -851,7 +912,12 @@ test("reject records a human decision and append-only audit event", async (t) =>
   await store.writeYamlAtomic(".agent-team/artifact-registry.yaml", registry);
   await store.writeTextAtomic(`.agent-team/${artifact.path}`, text);
   await validatePhase(root, "intake", "REJECT-VALIDATE");
-  await reviewPhase(root, "intake", "documentation-reviewer", "approved", "REJECT-REVIEW", pluginAdapter);
+  const reviewReceipt = await recordReviewerReceipt(
+    root, "intake", "documentation-reviewer", "approved", "REJECT-REVIEW",
+  );
+  await reviewPhase(
+    root, "intake", "documentation-reviewer", "approved", "REJECT-REVIEW", pluginAdapter, reviewReceipt.id,
+  );
 
   const rejected = await rejectGate(root, "G0", "project-owner", "REJECT-G0");
   const approvals = parse(await readFile(join(root, ".agent-team/approvals.yaml"), "utf8"));
@@ -1319,14 +1385,21 @@ test("initialization preserves source and AGENTS while lifecycle exclusion recov
   await store.writeYamlAtomic(".agent-team/artifact-registry.yaml", registry);
   await store.writeTextAtomic(`.agent-team/${artifact.path}`, text);
   assert.equal((await validatePhase(root, "intake", "OP-VALIDATE")).valid, true);
+  const reviewReceipt = await recordReviewerReceipt(
+    root, "intake", "documentation-reviewer", "approved", "OP-REVIEW",
+  );
 
   await store.withLock(".agent-team/lifecycle.lock", async () => {
     await assert.rejects(
-      () => reviewPhase(root, "intake", "documentation-reviewer", "approved", "OP-REVIEW"),
+      () => reviewPhase(
+        root, "intake", "documentation-reviewer", "approved", "OP-REVIEW", undefined, reviewReceipt.id,
+      ),
       /STATE_LOCKED/,
     );
   });
-  await reviewPhase(root, "intake", "documentation-reviewer", "approved", "OP-REVIEW", pluginAdapter);
+  await reviewPhase(
+    root, "intake", "documentation-reviewer", "approved", "OP-REVIEW", pluginAdapter, reviewReceipt.id,
+  );
 
   const state = await store.readWorkflowState();
   const { reviews } = parse(await readFile(join(root, ".agent-team/reviews.yaml"), "utf8"));

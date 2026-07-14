@@ -54,7 +54,7 @@ Commands:
   status
   start <phase> --operation-id <id> [--plugin-adapter <module>]
   validate <phase> --operation-id <id>
-  review <phase> --reviewer <id> --verdict <approved|revision_required> --operation-id <id> [--execution-receipt <id>] [--plugin-adapter <module>]
+  review <phase> --reviewer <id> --verdict <approved|revision_required> --operation-id <id> --execution-receipt <id> [--plugin-adapter <module>]
   approve <gate> --by <id> --operation-id <id> [--execution-receipt <id>] [--execution-request <id>]
   reject <gate> --by <id> --operation-id <id>
   handover <phase> --operation-id <id>
@@ -259,7 +259,7 @@ async function main(): Promise<void> {
         ReviewVerdictSchema.parse(required(values.verdict, "--verdict")),
         required(values["operation-id"], "--operation-id"),
         pluginAdapter,
-        receiptId,
+        required(receiptId, "--execution-receipt"),
       );
       break;
     case "handover":

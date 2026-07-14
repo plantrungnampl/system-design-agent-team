@@ -65,6 +65,8 @@ export interface AttestedExecutionReceipt {
   agent_id?: string;
   phase?: string;
   review_verdict?: "approved" | "revision_required";
+  artifact_versions?: Record<string, number>;
+  artifact_checksums?: Record<string, `sha256:${string}`>;
   result: AgentExecutionResult;
   attestation_digest: `sha256:${string}`;
 }
@@ -362,6 +364,12 @@ export class ManualCodexAdapter implements PluginAdapter, AgentExecutionAdapter 
       ...(optionalString(state.dispatch.agent_id) ? { agent_id: String(state.dispatch.agent_id) } : {}),
       ...(optionalString(state.dispatch.phase) ? { phase: String(state.dispatch.phase) } : {}),
       ...(reviewVerdict ? { review_verdict: reviewVerdict } : {}),
+      ...(state.dispatch.artifact_versions && typeof state.dispatch.artifact_versions === "object"
+        ? { artifact_versions: state.dispatch.artifact_versions as Record<string, number> }
+        : {}),
+      ...(state.dispatch.artifact_checksums && typeof state.dispatch.artifact_checksums === "object"
+        ? { artifact_checksums: state.dispatch.artifact_checksums as Record<string, `sha256:${string}`> }
+        : {}),
       result,
     };
     return freezeRecursively({

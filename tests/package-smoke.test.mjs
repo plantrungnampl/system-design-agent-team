@@ -5,7 +5,7 @@ import { lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } fro
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { parse, stringify } from "yaml";
 
@@ -80,7 +80,17 @@ test("packed workspaces install cleanly and the packed CLI initializes a project
     return { uri, publisher_identity: uri.slice(uri.lastIndexOf("@") + 1), status: "available" };
   },
   async verifySkill() { return true; },
-  async invoke() { throw new Error("not used by lifecycle capability checks"); },
+  async invoke(request) {
+    return {
+      plugin_uri: request.plugin_uri,
+      publisher_identity: request.plugin_uri.slice(request.plugin_uri.lastIndexOf("@") + 1),
+      status: "success",
+      output: { ok: true },
+      execution_reference: request.operation_id,
+      started_at: "2026-07-14T00:00:00.000Z",
+      completed_at: "2026-07-14T00:00:01.000Z",
+    };
+  },
 };\n`);
     await execFileAsync(process.execPath, [
       bin,
@@ -113,12 +123,51 @@ test("packed workspaces install cleanly and the packed CLI initializes a project
     await execFileAsync(process.execPath, [
       bin, "validate", "legacy-assessment", "--operation-id", "PACKED-SMOKE-VALIDATE",
     ], { cwd: project });
+    const { recordExecutionReceipt } = await import(pathToFileURL(
+      join(installedScope, "cli", "dist", "index.js"),
+    ).href);
+    const { ManualCodexAdapter } = await import(pathToFileURL(
+      join(installedScope, "codex-adapter", "dist", "index.js"),
+    ).href);
+    const executionAdapter = new ManualCodexAdapter();
+    const dispatch = {
+      execution_id: "EXEC-PACKED-SMOKE-REVIEW",
+      agent_id: "architecture-reviewer",
+      phase: "legacy-assessment",
+      review_verdict: "approved",
+      artifact_versions: { "LEGACY-ASSESSMENT": artifact.version },
+      artifact_checksums: { "LEGACY-ASSESSMENT": artifact.checksum },
+      authorized_scope: { read: [".agent-team/**"], write: [], execute: [] },
+      required_inputs: [],
+      permission_profile: "read_only_assessment",
+      command_class: "safe_read",
+    };
+    const prepared = await executionAdapter.prepareExecution(dispatch);
+    const result = await executionAdapter.collectResult(await executionAdapter.execute(prepared), {
+      execution_id: dispatch.execution_id,
+      dispatch_digest: prepared.digest,
+      status: "completed",
+      permission_profile: dispatch.permission_profile,
+      authorized_paths: dispatch.authorized_scope,
+      command_class: dispatch.command_class,
+      checkpoints: [{
+        id: "review-legacy-assessment",
+        status: "completed",
+        timestamp: "2026-07-14T00:00:00.000Z",
+        evidence: [`sha256:${"a".repeat(64)}`],
+      }],
+      evidence: { gate_approvals: [] },
+    });
+    const receipt = await recordExecutionReceipt(
+      project, executionAdapter, result, "RECEIPT-PACKED-SMOKE-REVIEW",
+    );
     await execFileAsync(process.execPath, [
       bin,
       "review", "legacy-assessment",
       "--reviewer", "architecture-reviewer",
       "--verdict", "approved",
       "--operation-id", "PACKED-SMOKE-REVIEW",
+      "--execution-receipt", receipt.id,
       "--plugin-adapter", pluginAdapter,
     ], { cwd: project });
     await execFileAsync(process.execPath, [
