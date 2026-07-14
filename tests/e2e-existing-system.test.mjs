@@ -81,11 +81,14 @@ test("existing-system performs scoped discovery, modifies existing authorization
     }),
     ({ stdout, stderr }) => /server-side administrator guard is missing/.test(`${stdout}\n${stderr}`),
   );
-  const source = await readFile(sourcePath, "utf8");
-  await writeFile(sourcePath, source.replace(
-    "    {\n        OrderService.Delete(orderId);",
-    "    {\n        Authorization.RequireRole(\"Administrator\");\n        OrderService.Delete(orderId);",
-  ));
+  const source = (await readFile(sourcePath, "utf8")).replace(/\r?\n/g, "\r\n");
+  await writeFile(sourcePath, source);
+  const updatedSource = source.replace(
+    /    \{(\r?\n)        OrderService\.Delete\(orderId\);/,
+    "    {$1        Authorization.RequireRole(\"Administrator\");$1        OrderService.Delete(orderId);",
+  );
+  assert.notEqual(updatedSource, source, "authorization source edit did not match");
+  await writeFile(sourcePath, updatedSource);
   const { stdout: verificationOutput } = await execFileAsync(
     process.execPath,
     ["--test", "tests/verify-admin-authorization.mjs"],

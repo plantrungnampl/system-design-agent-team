@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import test from "node:test";
@@ -19,11 +19,13 @@ const execNpm = (args, options) => execFileAsync(npm[0], [...npm.slice(1), ...ar
 test("packed workspaces install cleanly and the packed CLI initializes a project", async () => {
   const root = await mkdtemp(join(tmpdir(), "system-design-team-pack-"));
   const tarballs = join(root, "tarballs");
+  const consumerTarget = join(root, "canonical-consumer");
   const consumer = join(root, "consumer");
   const project = join(root, "project");
 
   try {
-    await Promise.all([tarballs, consumer, project].map((path) => mkdir(path)));
+    await Promise.all([tarballs, consumerTarget, project].map((path) => mkdir(path)));
+    await symlink(consumerTarget, consumer, "junction");
     const workspaceDirectories = (await readdir(join(repository, "packages"), { withFileTypes: true }))
       .filter((entry) => entry.isDirectory())
       .map((entry) => join(repository, "packages", entry.name))
@@ -44,11 +46,12 @@ test("packed workspaces install cleanly and the packed CLI initializes a project
     ], { cwd: consumer, timeout: 180_000 });
 
     const installedScope = join(consumer, "node_modules", "@system-design-team");
+    const canonicalConsumer = await realpath(consumer);
     assert.equal((await readdir(installedScope)).length, workspaceDirectories.length);
     for (const name of await readdir(installedScope)) {
       const installed = join(installedScope, name);
       assert.equal((await lstat(installed)).isSymbolicLink(), false);
-      assert.equal(relative(consumer, await realpath(installed)).startsWith(".."), false);
+      assert.equal(relative(canonicalConsumer, await realpath(installed)).startsWith(".."), false);
     }
 
     await execFileAsync("git", ["init", "--quiet"], { cwd: project });
