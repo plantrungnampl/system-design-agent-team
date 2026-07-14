@@ -1,0 +1,19 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist",
+    "tsBuildInfoFile": "dist/.tsbuildinfo"
+  },
+  "include": ["src/**/*.ts"],
+  "references": [
+    { "path": "../core" },
+    { "path": "../codex-adapter" },
+    { "path": "../workflow-engine" },
+    { "path": "../project-store" },
+    { "path": "../sqlite-cache" },
+    { "path": "../artifact-validator" },
+    { "path": "../traceability" },
+    { "path": "../plugin-registry" }
+  ]
+}

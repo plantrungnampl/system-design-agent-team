@@ -1,0 +1,81 @@
+id: migration-standard
+version: 1.0.0
+mode: migration
+phases:
+  - id: legacy-assessment
+    owner: system-analyst
+    reviewer: architecture-reviewer
+    gate: G0
+    depends_on: []
+    required_plugins: [plugin://systems-architecture@wondelai-skills]
+    artifact: { id: LEGACY-ASSESSMENT, path: context/legacy-assessment.md, title: Legacy Assessment }
+  - id: business-continuity
+    owner: customer-proxy
+    reviewer: business-analyst
+    gate: G1
+    depends_on: [legacy-assessment]
+    required_plugins: []
+    artifact: { id: BUSINESS-CONTINUITY, path: requirements/business-continuity.md, title: Business Continuity Analysis }
+  - id: target-state
+    owner: solution-architect
+    reviewer: architecture-reviewer
+    gate: G5
+    depends_on: [business-continuity]
+    required_plugins: [plugin://systems-architecture@wondelai-skills]
+    artifact: { id: TARGET-STATE, path: architecture/target-state.md, title: Target State }
+  - id: data-mapping
+    owner: system-analyst
+    reviewer: data-reviewer
+    gate: G5
+    depends_on: [target-state]
+    required_plugins: [plugin://systems-architecture@wondelai-skills]
+    artifact: { id: DATA-MAPPING, path: data/data-mapping.md, title: Data Mapping and Reconciliation }
+  - id: transition-architecture
+    owner: data-reviewer
+    reviewer: architecture-reviewer
+    gate: G5
+    depends_on: [data-mapping]
+    required_plugins: [plugin://systems-architecture@wondelai-skills]
+    artifact: { id: TRANSITION-ARCHITECTURE, path: architecture/transition-architecture.md, title: Transition Architecture }
+  - id: migration-waves
+    owner: project-manager
+    reviewer: documentation-reviewer
+    gate: G6
+    depends_on: [transition-architecture]
+    required_plugins: [plugin://superpowers@openai-curated-remote]
+    artifact: { id: MIGRATION-WAVES, path: implementation/migration-waves.md, title: Migration Waves }
+  - id: parallel-validation
+    owner: qa-lead
+    reviewer: tester
+    gate: G7
+    depends_on: [migration-waves]
+    required_plugins: [plugin://code-craftsmanship@wondelai-skills, plugin://superpowers@openai-curated-remote]
+    artifact: { id: PARALLEL-VALIDATION, path: testing/parallel-validation.md, title: Parallel Validation }
+  - id: cutover-readiness
+    owner: devops-lead
+    reviewer: operations-reviewer
+    gate: G7
+    depends_on: [parallel-validation]
+    required_plugins: [plugin://systems-architecture@wondelai-skills, plugin://superpowers@openai-curated-remote]
+    artifact: { id: CUTOVER-READINESS, path: release/cutover-readiness.md, title: Cutover Readiness }
+  - id: cutover
+    owner: devops-lead
+    reviewer: operations-reviewer
+    gate: G8
+    depends_on: [cutover-readiness]
+    required_plugins: [plugin://systems-architecture@wondelai-skills, plugin://superpowers@openai-curated-remote]
+    artifact: { id: CUTOVER-PLAN, path: release/cutover-plan.md, title: Cutover Plan }
+  - id: post-migration-reconciliation
+    owner: tester
+    reviewer: data-reviewer
+    gate: G9
+    depends_on: [cutover]
+    required_plugins: [plugin://code-craftsmanship@wondelai-skills, plugin://superpowers@openai-curated-remote]
+    artifact: { id: RECONCILIATION-RESULT, path: data/reconciliation-result.md, title: Post-migration Reconciliation }
+  - id: legacy-decommission
+    owner: operations-reviewer
+    reviewer: documentation-reviewer
+    gate: G9
+    depends_on: [post-migration-reconciliation]
+    required_plugins: [plugin://superpowers@openai-curated-remote]
+    artifact: { id: LEGACY-DECOMMISSION, path: operations/legacy-decommission.md, title: Legacy Decommission Approval }
