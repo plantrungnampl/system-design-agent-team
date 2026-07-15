@@ -1,0 +1,693 @@
+# Instincts generated from https://github.com/plantrungnampl/system-design-agent-team
+# Generated: 2026-07-14T03:00:58.754Z
+# Version: 2.0
+# NOTE: This file supplements (does not replace) any existing curated instincts.
+# High-confidence manually curated instincts should be preserved alongside these.
+
+---
+id: system-design-agent-team-commit-conventional
+trigger: "when writing a commit message"
+confidence: 0.85
+domain: git
+source: repo-analysis
+source_repo: https://github.com/plantrungnampl/system-design-agent-team
+---
+
+# System Design Agent Team Commit Conventional
+
+## Action
+
+Use conventional commit format with prefixes: fix, feat, docs, test
+
+## Evidence
+
+- 52 commits analyzed
+- Detected conventional commit pattern
+- Examples: docs: add V1 vertical slice implementation plan, feat(core): add framework domain contracts
+
+---
+id: system-design-agent-team-commit-length
+trigger: "when writing a commit message"
+confidence: 0.6
+domain: git
+source: repo-analysis
+source_repo: https://github.com/plantrungnampl/system-design-agent-team
+---
+
+# System Design Agent Team Commit Length
+
+## Action
+
+Keep commit messages concise (~44 characters)
+
+## Evidence
+
+- Average commit message length: 44 chars
+- Based on 52 commits
+
+---
+id: system-design-agent-team-naming-files
+trigger: "when creating a new file"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/plantrungnampl/system-design-agent-team
+---
+
+# System Design Agent Team Naming Files
+
+## Action
+
+Use camelCase naming convention
+
+## Evidence
+
+- Analyzed file naming patterns in repository
+- Dominant pattern: camelCase
+
+---
+id: system-design-agent-team-export-style
+trigger: "when exporting from a module"
+confidence: 0.7
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/plantrungnampl/system-design-agent-team
+---
+
+# System Design Agent Team Export Style
+
+## Action
+
+Prefer named exports
+
+## Evidence
+
+- Export pattern analysis
+- Dominant style: named
+
+---
+id: system-design-agent-team-test-separate
+trigger: "when writing tests"
+confidence: 0.8
+domain: testing
+source: repo-analysis
+source_repo: https://github.com/plantrungnampl/system-design-agent-team
+---
+
+# System Design Agent Team Test Separate
+
+## Action
+
+Place tests in the tests/ or __tests__/ directory, mirroring src structure
+
+## Evidence
+
+- Separate test directory pattern detected
+- Tests live in dedicated test folders
+
+---
+id: system-design-agent-team-test-naming
+trigger: "when creating a test file"
+confidence: 0.85
+domain: testing
+source: repo-analysis
+source_repo: https://github.com/plantrungnampl/system-design-agent-team
+---
+
+# System Design Agent Team Test Naming
+
+## Action
+
+Name test files using the pattern: *Tests.cs
+
+## Evidence
+
+- File pattern: *Tests.cs
+- Consistent across test files
+
+---
+id: system-design-agent-team-test-types
+trigger: "when planning tests for a feature"
+confidence: 0.7
+domain: testing
+source: repo-analysis
+source_repo: https://github.com/plantrungnampl/system-design-agent-team
+---
+
+# System Design Agent Team Test Types
+
+## Action
+
+Write unit, e2e tests to match project standards
+
+## Evidence
+
+- Test types detected: unit, e2e
+- Coverage config: no
+
+---
+id: system-design-agent-team-workflow-database-migration
+trigger: "when modifying the database schema or adding tables"
+confidence: 0.6
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/plantrungnampl/system-design-agent-team
+---
+
+# System Design Agent Team Workflow Database Migration
+
+## Action
+
+Follow the database-migration workflow:
+1. Create migration file
+2. Update schema definitions
+3. Generate/update types
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~2x per month
+- Files: migrations/*, **/schema.*
+
+---
+id: system-design-agent-team-workflow-feature-development
+trigger: "when implementing a new feature"
+confidence: 0.9
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/plantrungnampl/system-design-agent-team
+---
+
+# System Design Agent Team Workflow Feature Development
+
+## Action
+
+Follow the feature-development workflow:
+1. Add feature implementation
+2. Add tests for feature
+3. Update documentation
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~10x per month
+- Files: packages/core/src/*, packages/workflow-engine/src/*, packages/project-store/src/*
+
+---
+id: system-design-agent-team-workflow-add-new-package-module
+trigger: "when doing add new package module"
+confidence: 0.75
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/plantrungnampl/system-design-agent-team
+---
+
+# System Design Agent Team Workflow Add New Package Module
+
+## Action
+
+Follow the add-new-package-module workflow:
+1. Create new package directory under packages/
+2. Add package.json and tsconfig.json for the new package
+3. Implement initial logic in src/index.ts
+4. Add or update root-level tsconfig.json
+5. Add or update package-lock.json
+6. Add initial test file in tests/
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~5x per month
+- Files: packages/*/package.json, packages/*/tsconfig.json, packages/*/src/index.ts
+
+---
+id: system-design-agent-team-workflow-feature-or-fix-in-existing-package
+trigger: "when doing feature or fix in existing package"
+confidence: 0.9
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/plantrungnampl/system-design-agent-team
+---
+
+# System Design Agent Team Workflow Feature Or Fix In Existing Package
+
+## Action
+
+Follow the feature-or-fix-in-existing-package workflow:
+1. Edit src/index.ts in the relevant package
+2. Update or add tests in tests/
+3. Optionally update related files (e.g., bin.ts for CLI, or multiple packages if cross-cutting)
+4. Commit with a feat: or fix: message
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~15x per month
+- Files: packages/*/src/index.ts, tests/*.test.mjs
+
+---
+id: system-design-agent-team-workflow-cross-package-feature-or-fix
+trigger: "when doing cross package feature or fix"
+confidence: 0.9
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/plantrungnampl/system-design-agent-team
+---
+
+# System Design Agent Team Workflow Cross Package Feature Or Fix
+
+## Action
+
+Follow the cross-package-feature-or-fix workflow:
+1. Edit src/index.ts in several packages
+2. Update or add tests for each affected package
+3. Optionally update bin.ts or other entrypoints
+4. Commit with a feat: or fix: message
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~8x per month
+- Files: packages/*/src/index.ts, tests/*.test.mjs
+
+---
+id: system-design-agent-team-workflow-add-or-update-e2e-test-fixtures
+trigger: "when doing add or update e2e test fixtures"
+confidence: 0.65
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/plantrungnampl/system-design-agent-team
+---
+
+# System Design Agent Team Workflow Add Or Update E2e Test Fixtures
+
+## Action
+
+Follow the add-or-update-e2e-test-fixtures workflow:
+1. Add or update tests/e2e-*.test.mjs files
+2. Add or update files in tests/fixtures/
+3. Optionally update implementation files if needed for E2E
+4. Commit with test(e2e): or fix: message
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~3x per month
+- Files: tests/e2e-*.test.mjs, tests/fixtures/**/*
+
+---
+id: system-design-agent-team-workflow-documentation-or-plan-update
+trigger: "when doing documentation or plan update"
+confidence: 0.75
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/plantrungnampl/system-design-agent-team
+---
+
+# System Design Agent Team Workflow Documentation Or Plan Update
+
+## Action
+
+Follow the documentation-or-plan-update workflow:
+1. Edit or add files in docs/
+2. Optionally update README.md
+3. Commit with docs: message
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~5x per month
+- Files: docs/**/*.md, README.md
+
+---
+id: system-design-agent-team-workflow-test-driven-fix-or-hardening
+trigger: "when doing test driven fix or hardening"
+confidence: 0.9
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/plantrungnampl/system-design-agent-team
+---
+
+# System Design Agent Team Workflow Test Driven Fix Or Hardening
+
+## Action
+
+Follow the test-driven-fix-or-hardening workflow:
+1. Edit src/index.ts in the affected package
+2. Edit or add relevant test files
+3. Commit with fix: message
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~10x per month
+- Files: packages/*/src/index.ts, tests/*.test.mjs
+
+---
+id: system-design-agent-team-instinct-file-naming
+trigger: "When creating or renaming a file"
+confidence: 0.85
+domain: code-style
+source: repo-analysis
+source_repo: plantrungnampl/system-design-agent-team
+---
+
+# System Design Agent Team Instinct File Naming
+
+## Action
+
+Use camelCase for file names
+
+## Evidence
+
+- Naming convention: files use camelCase
+- Pattern in codeStyle.namingConventions.files
+
+---
+id: system-design-agent-team-instinct-function-naming
+trigger: "When defining a function"
+confidence: 0.9
+domain: code-style
+source: repo-analysis
+source_repo: plantrungnampl/system-design-agent-team
+---
+
+# System Design Agent Team Instinct Function Naming
+
+## Action
+
+Name the function using camelCase
+
+## Evidence
+
+- Naming convention: functions use camelCase
+- Pattern in codeStyle.namingConventions.functions
+
+---
+id: system-design-agent-team-instinct-class-naming
+trigger: "When defining a class"
+confidence: 0.9
+domain: code-style
+source: repo-analysis
+source_repo: plantrungnampl/system-design-agent-team
+---
+
+# System Design Agent Team Instinct Class Naming
+
+## Action
+
+Name the class using PascalCase
+
+## Evidence
+
+- Naming convention: classes use PascalCase
+- Pattern in codeStyle.namingConventions.classes
+
+---
+id: system-design-agent-team-instinct-constant-naming
+trigger: "When defining a constant"
+confidence: 0.85
+domain: code-style
+source: repo-analysis
+source_repo: plantrungnampl/system-design-agent-team
+---
+
+# System Design Agent Team Instinct Constant Naming
+
+## Action
+
+Name the constant using SCREAMING_SNAKE_CASE
+
+## Evidence
+
+- Naming convention: constants use SCREAMING_SNAKE_CASE
+- Pattern in codeStyle.namingConventions.constants
+
+---
+id: system-design-agent-team-instinct-import-style
+trigger: "When importing modules"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: plantrungnampl/system-design-agent-team
+---
+
+# System Design Agent Team Instinct Import Style
+
+## Action
+
+Use absolute import paths
+
+## Evidence
+
+- Import style: absolute
+- Pattern in codeStyle.importStyle
+
+---
+id: system-design-agent-team-instinct-export-style
+trigger: "When exporting modules or functions"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: plantrungnampl/system-design-agent-team
+---
+
+# System Design Agent Team Instinct Export Style
+
+## Action
+
+Use named exports
+
+## Evidence
+
+- Export style: named
+- Pattern in codeStyle.exportStyle
+
+---
+id: system-design-agent-team-instinct-test-file-pattern
+trigger: "When creating a test file"
+confidence: 0.85
+domain: testing
+source: repo-analysis
+source_repo: plantrungnampl/system-design-agent-team
+---
+
+# System Design Agent Team Instinct Test File Pattern
+
+## Action
+
+Name test files using *.test.mjs for JavaScript/TypeScript and *Tests.cs for C#
+
+## Evidence
+
+- Testing filePattern: *Tests.cs
+- Pattern in testing.filePattern
+- tests/*.test.mjs in workflows
+
+---
+id: system-design-agent-team-instinct-test-types
+trigger: "When writing tests"
+confidence: 0.8
+domain: testing
+source: repo-analysis
+source_repo: plantrungnampl/system-design-agent-team
+---
+
+# System Design Agent Team Instinct Test Types
+
+## Action
+
+Include both unit and end-to-end (E2E) tests as appropriate
+
+## Evidence
+
+- testTypes: unit, e2e
+- Pattern in testing.testTypes
+- Presence of tests/e2e-*.test.mjs
+
+---
+id: system-design-agent-team-instinct-test-location
+trigger: "When adding or updating tests"
+confidence: 0.8
+domain: testing
+source: repo-analysis
+source_repo: plantrungnampl/system-design-agent-team
+---
+
+# System Design Agent Team Instinct Test Location
+
+## Action
+
+Place tests in the separate tests/ directory
+
+## Evidence
+
+- testLocation: separate
+- Pattern in architecture.folderStructure.testLocation
+- tests/ folder in repo
+
+---
+id: system-design-agent-team-instinct-git-commit-format
+trigger: "When making a commit"
+confidence: 0.9
+domain: git
+source: repo-analysis
+source_repo: plantrungnampl/system-design-agent-team
+---
+
+# System Design Agent Team Instinct Git Commit Format
+
+## Action
+
+Use conventional commit format: <type>(<scope>): <description>
+
+## Evidence
+
+- Conventional commit examples: 'feat(core): ...', 'fix(store): ...'
+- Pattern in commits.prefixes
+
+---
+id: system-design-agent-team-instinct-git-commit-types
+trigger: "When describing a commit"
+confidence: 0.9
+domain: git
+source: repo-analysis
+source_repo: plantrungnampl/system-design-agent-team
+---
+
+# System Design Agent Team Instinct Git Commit Types
+
+## Action
+
+Use one of the prefixes: feat, fix, docs, test, chore
+
+## Evidence
+
+- Commit prefixes: feat, fix, docs, test, chore
+- Pattern in commits.prefixes
+
+---
+id: system-design-agent-team-instinct-add-new-package-module
+trigger: "When introducing a new logical component or service as a package"
+confidence: 0.95
+domain: workflow
+source: repo-analysis
+source_repo: plantrungnampl/system-design-agent-team
+---
+
+# System Design Agent Team Instinct Add New Package Module
+
+## Action
+
+Create new package under packages/, add package.json and tsconfig.json, implement src/index.ts, update root tsconfig.json and package-lock.json, and add initial test in tests/
+
+## Evidence
+
+- Workflow: add-new-package-module
+- Pattern in workflows[add-new-package-module].steps
+- Example commits for new package creation
+
+---
+id: system-design-agent-team-instinct-feature-or-fix-in-existing-package
+trigger: "When adding a feature or fixing a bug in an existing package"
+confidence: 0.98
+domain: workflow
+source: repo-analysis
+source_repo: plantrungnampl/system-design-agent-team
+---
+
+# System Design Agent Team Instinct Feature Or Fix In Existing Package
+
+## Action
+
+Edit src/index.ts in the relevant package, update or add tests in tests/, optionally update related files, and commit with feat: or fix: message
+
+## Evidence
+
+- Workflow: feature-or-fix-in-existing-package
+- Pattern in workflows[feature-or-fix-in-existing-package].steps
+- Example: 'feat(core): add framework domain contracts'
+
+---
+id: system-design-agent-team-instinct-cross-package-feature-or-fix
+trigger: "When implementing or fixing a feature that affects multiple packages and their tests"
+confidence: 0.92
+domain: workflow
+source: repo-analysis
+source_repo: plantrungnampl/system-design-agent-team
+---
+
+# System Design Agent Team Instinct Cross Package Feature Or Fix
+
+## Action
+
+Edit src/index.ts in several packages, update or add tests for each, optionally update entrypoints, and commit with feat: or fix: message
+
+## Evidence
+
+- Workflow: cross-package-feature-or-fix
+- Pattern in workflows[cross-package-feature-or-fix].steps
+
+---
+id: system-design-agent-team-instinct-add-or-update-e2e-test-fixtures
+trigger: "When verifying or expanding E2E coverage for workflows"
+confidence: 0.87
+domain: workflow
+source: repo-analysis
+source_repo: plantrungnampl/system-design-agent-team
+---
+
+# System Design Agent Team Instinct Add Or Update E2e Test Fixtures
+
+## Action
+
+Add or update tests/e2e-*.test.mjs and tests/fixtures/, optionally update implementation files, and commit with test(e2e): or fix: message
+
+## Evidence
+
+- Workflow: add-or-update-e2e-test-fixtures
+- Pattern in workflows[add-or-update-e2e-test-fixtures].steps
+- Example: 'test(e2e): verify the first END2END agent flow'
+
+---
+id: system-design-agent-team-instinct-documentation-or-plan-update
+trigger: "When documenting plans, decisions, or updating user/developer docs"
+confidence: 0.9
+domain: workflow
+source: repo-analysis
+source_repo: plantrungnampl/system-design-agent-team
+---
+
+# System Design Agent Team Instinct Documentation Or Plan Update
+
+## Action
+
+Edit or add files in docs/, optionally update README.md, and commit with docs: message
+
+## Evidence
+
+- Workflow: documentation-or-plan-update
+- Pattern in workflows[documentation-or-plan-update].steps
+- Example: 'docs: add V1 vertical slice implementation plan'
+
+---
+id: system-design-agent-team-instinct-test-driven-fix-or-hardening
+trigger: "When addressing a bug or hardening logic, ensuring tests reflect the change"
+confidence: 0.97
+domain: workflow
+source: repo-analysis
+source_repo: plantrungnampl/system-design-agent-team
+---
+
+# System Design Agent Team Instinct Test Driven Fix Or Hardening
+
+## Action
+
+Edit src/index.ts in the affected package, edit or add relevant test files, and commit with fix: message
+
+## Evidence
+
+- Workflow: test-driven-fix-or-hardening
+- Pattern in workflows[test-driven-fix-or-hardening].steps
+- Example: 'fix(store): harden atomic state updates'
+
